@@ -4,9 +4,11 @@
 //! Methods operate on [`super::world::EntityWorld`]; anything visual is
 //! recorded there and picked up by the Bevy presentation layer.
 
-use super::host::{num, self_id, truthy, vec3_from, vec3_out, Ctx};
-use super::world::{angles_from_quat, quat_from_angles, PhysKind, Slot, SlotKind};
-use mlua::{Lua, Result, Table, Value};
+use super::host::{num, self_id, truthy, value_to_id, vec3_from, vec3_out, Ctx};
+use super::world::{
+    angles_from_quat, quat_from_angles, AnimState, FlowOutput, FlowValue, PhysKind, PhysParams, Slot, SlotKind,
+};
+use mlua::{Lua, Result, Table, Value, Variadic};
 
 /// Resolve a slot argument (`-1`/nil = first free slot).
 fn slot_index(v: &Value, free: usize) -> usize {
@@ -14,6 +16,59 @@ fn slot_index(v: &Value, free: usize) -> usize {
         Some(n) if n >= 0.0 => n as usize,
         _ => free,
     }
+}
+
+fn value_str(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.to_string_lossy().to_string()),
+        _ => None,
+    }
+}
+
+/// `ActivateOutput`/`ProcessBroadcastEvent` value -> typed flow value.
+fn flow_value(v: &Value) -> FlowValue {
+    match v {
+        Value::Nil => FlowValue::Nil,
+        Value::Boolean(b) => FlowValue::Bool(*b),
+        Value::Integer(i) => FlowValue::Num(*i as f64),
+        Value::Number(n) => FlowValue::Num(*n),
+        Value::String(s) => FlowValue::Str(s.to_string_lossy().to_string()),
+        Value::LightUserData(p) => FlowValue::Id(p.0 as usize as super::world::EntityId),
+        Value::Table(_) => value_to_id(v).map(FlowValue::Id).unwrap_or(FlowValue::Nil),
+        _ => FlowValue::Nil,
+    }
+}
+
+/// Best-effort clip length: if `name` is a real `.caf` path (or a file stem
+/// that matches exactly one `.caf` in the mounted paks) parse its duration via
+/// [`crate::anim::Caf`]; otherwise 0.0.
+///
+/// TODO: symbolic animation names (`"Default"`, `"weaponRecoil"`) are resolved
+/// through the character's animation set / CDF in the original engine; that
+/// mapping is not wired up yet, so such clips report 0.0.
+fn resolve_caf(vfs: &crate::crypak::Vfs, name: &str) -> Option<f32> {
+    if name.is_empty() {
+        return None;
+    }
+    let lower = name.replace('\\', "/").to_ascii_lowercase();
+    if lower.ends_with(".caf") {
+        if let Some(bytes) = vfs.read(&lower) {
+            return crate::anim::Caf::parse(&bytes).map(|c| c.duration_secs());
+        }
+    }
+    let stem = lower.rsplit('/').next().unwrap_or(&lower).trim_end_matches(".caf").to_string();
+    let mut found = None;
+    for p in vfs.paths_with_ext("caf") {
+        let pl = p.replace('\\', "/").to_ascii_lowercase();
+        let f = pl.rsplit('/').next().unwrap_or(&pl);
+        if f.strip_suffix(".caf") == Some(stem.as_str()) {
+            found = Some(p);
+            break;
+        }
+    }
+    let path = found?;
+    let bytes = vfs.read(&path)?;
+    crate::anim::Caf::parse(&bytes).map(|c| c.duration_secs())
 }
 
 pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
@@ -350,5 +405,450 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
             Ok(())
         })?,
     )?;
+
+    // -- streaming / network / physics bookkeeping --------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "NetPresent",
+        lua.create_function(move |_, (this, _): (Table, Variadic<Value>)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.net_present = true;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetUpdatePolicy",
+        lua.create_function(move |_, (this, policy): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.update_policy = num(&policy).unwrap_or(0.0) as i32;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetRegisterInSectors",
+        lua.create_function(move |_, (this, on): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.register_in_sectors = truthy(&on);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "AwakePhysics",
+        lua.create_function(move |_, (this, on): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.physics_awake = truthy(&on);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "EnablePhysics",
+        lua.create_function(move |_, (this, on): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.physics_enabled = truthy(&on);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetPhysicParams",
+        lua.create_function(move |_, (this, ptype, params): (Table, Value, Value)| {
+            let (Some(id), Some(ptype)) = (self_id(&this), num(&ptype)) else { return Ok(()) };
+            let mut pp = PhysParams::default();
+            if let Value::Table(tbl) = &params {
+                if let Ok(v) = tbl.raw_get::<Value>("flags") {
+                    pp.flags = num(&v).unwrap_or(0.0) as u32;
+                }
+                if let Ok(v) = tbl.raw_get::<Value>("flags_mask") {
+                    pp.flags_mask = num(&v).unwrap_or(0.0) as u32;
+                }
+                if let Ok(v) = tbl.raw_get::<Value>("mass") {
+                    pp.mass = num(&v).unwrap_or(0.0) as f32;
+                }
+                if let Ok(v) = tbl.raw_get::<Value>("density") {
+                    pp.density = num(&v).unwrap_or(0.0) as f32;
+                }
+                if let Ok(v) = tbl.raw_get::<Value>("velocity") {
+                    if let Some(v) = vec3_from(&v) {
+                        pp.velocity = v;
+                    }
+                }
+                for item in tbl.pairs::<Value, Value>() {
+                    let (k, v) = item?;
+                    if let Value::String(s) = k {
+                        if let Some(n) = num(&v) {
+                            pp.values.insert(s.to_string_lossy().to_string(), n);
+                        }
+                    }
+                }
+            }
+            if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                e.phys_params.insert(ptype as i64, pp);
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- sound / decals ------------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "SetSoundEffectRadius",
+        lua.create_function(move |_, (this, r): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.sound_effect_radius = num(&r).unwrap_or(0.0) as f32;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "PlaySoundEvent",
+        lua.create_function(move |_, (this, name): (Table, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.sound_events.push(name);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "EnableDecals",
+        lua.create_function(move |_, (this, _slot, on): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.decals_enabled = truthy(&on);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    n.raw_set(
+        "RemoveDecals",
+        lua.create_function(move |_, this: Table| {
+            // No decal list is kept in the engine layer yet; the call is
+            // accepted so scripts do not fall through to the logging stub.
+            let _ = self_id(&this);
+            Ok(())
+        })?,
+    )?;
+
+    // -- AI registration -----------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "SetAIName",
+        lua.create_function(move |_, (this, name): (Table, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.ai_name = Some(name);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- triggers ------------------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "InvalidateTrigger",
+        lua.create_function(move |_, this: Table| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.trigger_invalidated = true;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- flowgraph -----------------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "ActivateOutput",
+        lua.create_function(move |_, (this, port, value): (Table, Value, Value)| {
+            if let (Some(id), Some(port)) = (self_id(&this), value_str(&port)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.flow_outputs.push(FlowOutput { port, value: flow_value(&value) });
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "ProcessBroadcastEvent",
+        lua.create_function(move |_, (this, event): (Table, Value)| {
+            if let (Some(id), Some(port)) = (self_id(&this), value_str(&event)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.flow_outputs.push(FlowOutput { port, value: FlowValue::Nil });
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- particle precache ---------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "PreLoadParticleEffect",
+        lua.create_function(move |_, (this, name): (Table, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.preloaded_effects.push(name);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- character animation -------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "StartAnimation",
+        lua.create_function(move |_, (this, args): (Table, Variadic<Value>)| {
+            let Some(id) = self_id(&this) else { return Ok(()) };
+            let slot = args.first().and_then(num).unwrap_or(0.0) as usize;
+            let name = args.get(1).and_then(value_str).unwrap_or_default();
+            let layer = args.get(2).and_then(num).unwrap_or(0.0) as i32;
+            let speed = args.get(4).and_then(num).unwrap_or(1.0) as f32;
+            let looping = args.get(5).map(truthy).unwrap_or(false);
+            let length = resolve_caf(&c.vfs, &name).unwrap_or(0.0);
+            let now = c.now_ms();
+            if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                e.animations.insert(
+                    slot,
+                    AnimState { name, layer, speed, start_ms: now, looping, length, running: true },
+                );
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "StopAnimation",
+        lua.create_function(move |_, (this, slot, _layer): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                let slot = num(&slot).unwrap_or(0.0) as i64;
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    if slot < 0 {
+                        for a in e.animations.values_mut() {
+                            a.running = false;
+                        }
+                    } else if let Some(a) = e.animations.get_mut(&(slot as usize)) {
+                        a.running = false;
+                    }
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "ResetAnimation",
+        lua.create_function(move |_, (this, slot, _layer): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                let slot = num(&slot).unwrap_or(0.0) as i64;
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    if slot < 0 {
+                        e.animations.clear();
+                    } else {
+                        e.animations.remove(&(slot as usize));
+                    }
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetAnimationSpeed",
+        lua.create_function(move |_, (this, slot, _layer, speed): (Table, Value, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                let slot = num(&slot).unwrap_or(0.0) as usize;
+                let speed = num(&speed).unwrap_or(1.0) as f32;
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    let a = e.animations.entry(slot).or_insert_with(AnimState::default);
+                    a.speed = speed;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetAnimationLength",
+        lua.create_function(move |_, (this, _slot, name): (Table, Value, Value)| {
+            let _ = self_id(&this);
+            Ok(value_str(&name).and_then(|n| resolve_caf(&c.vfs, &n)).unwrap_or(0.0) as f64)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "IsAnimationRunning",
+        lua.create_function(move |_, (this, slot, _layer): (Table, Value, Value)| {
+            Ok(match (self_id(&this), num(&slot)) {
+                (Some(id), Some(s)) => c
+                    .world
+                    .borrow()
+                    .get(id)
+                    .and_then(|e| e.animations.get(&(s as usize)))
+                    .map(|a| a.running)
+                    .unwrap_or(false),
+                _ => false,
+            })
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetAnimationTime",
+        lua.create_function(move |_, (this, slot, _layer): (Table, Value, Value)| {
+            let now = c.now_ms();
+            Ok(match (self_id(&this), num(&slot)) {
+                (Some(id), Some(s)) => c
+                    .world
+                    .borrow()
+                    .get(id)
+                    .and_then(|e| e.animations.get(&(s as usize)))
+                    .map(|a| {
+                        let dt = (now - a.start_ms).max(0) as f32 / 1000.0;
+                        (dt * a.speed) as f64
+                    })
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            })
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetAnimationTime",
+        lua.create_function(move |_, (this, slot, _layer, t): (Table, Value, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                let slot = num(&slot).unwrap_or(0.0) as usize;
+                let t = num(&t).unwrap_or(0.0) as f32;
+                let now = c.now_ms();
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    if let Some(a) = e.animations.get_mut(&slot) {
+                        a.start_ms = now - (t / a.speed.max(f32::EPSILON) * 1000.0) as i64;
+                    }
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "ForceCharacterUpdate",
+        lua.create_function(move |_, (this, _slot, always): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.character_update = truthy(&always);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    install_actor_compat(lua, ctx)?;
     Ok(())
+}
+
+/// The actor methods the level scripts reach during boot but that the actor
+/// bind does not provide yet. They are added to a pre-created `ActorNative`
+/// table; `actor::install` runs later, keeps this table (its `or {}` idiom)
+/// and adds its own methods, so nothing here is clobbered.
+///
+/// TODO: move these into the actor bind once it owns code-event / link /
+/// movement-target state.
+fn install_actor_compat(lua: &Lua, ctx: &Ctx) -> Result<()> {
+    let actor: Table = match lua.globals().get::<Value>("ActorNative")? {
+        Value::Table(t) => t,
+        _ => {
+            let t = lua.create_table()?;
+            lua.globals().set("ActorNative", t.clone())?;
+            t
+        }
+    };
+
+    let c = ctx.clone();
+    actor.raw_set(
+        "CreateCodeEvent",
+        lua.create_function(move |_, (this, ev): (Table, Value)| {
+            let Some(id) = actor_entity(&this) else { return Ok(()) };
+            let port = match &ev {
+                Value::Table(t) => t.raw_get::<Value>("event").ok().and_then(|v| value_str(&v)),
+                v => value_str(v),
+            }
+            .unwrap_or_else(|| "codeevent".into());
+            if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                e.flow_outputs.push(FlowOutput { port, value: FlowValue::Nil });
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    actor.raw_set(
+        "LinkToEntity",
+        lua.create_function(move |_, (this, target): (Table, Value)| {
+            if let (Some(id), Some(target)) = (actor_entity(&this), value_to_id(&target)) {
+                if let Some(a) = c.actors.borrow_mut().get_mut(&id) {
+                    a.linked_vehicle = Some(target);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    actor.raw_set(
+        "SetMovementTarget",
+        lua.create_function(move |_, (this, pos): (Table, Value)| {
+            if let (Some(id), Some(pos)) = (actor_entity(&this), vec3_from(&pos)) {
+                if let Some(a) = c.actors.borrow_mut().get_mut(&id) {
+                    a.stored_pos = Some(pos);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+/// The entity id carried by an `ActorNative` receiver (`__id`).
+fn actor_entity(this: &Table) -> Option<super::world::EntityId> {
+    value_to_id(&this.raw_get::<Value>("__id").ok()?)
+}
+
+impl Default for AnimState {
+    fn default() -> Self {
+        AnimState {
+            name: String::new(),
+            layer: 0,
+            speed: 1.0,
+            start_ms: 0,
+            looping: false,
+            length: 0.0,
+            running: false,
+        }
+    }
 }

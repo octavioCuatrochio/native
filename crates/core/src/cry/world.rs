@@ -80,6 +80,51 @@ impl PhysKind {
     }
 }
 
+/// `SetPhysicParams(type, params)` payload, kept per `PHYSICPARAM_*` type.
+/// The common scalar fields are lifted out; everything else the script passed
+/// is preserved verbatim in [`PhysParams::values`] so later consumers see the
+/// same numbers the original physics object would have received.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PhysParams {
+    pub flags: u32,
+    pub flags_mask: u32,
+    pub mass: f32,
+    pub density: f32,
+    pub velocity: [f32; 3],
+    pub values: BTreeMap<String, f64>,
+}
+
+/// A flowgraph output value (`ActivateOutput` / `ProcessBroadcastEvent`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowValue {
+    Nil,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Id(EntityId),
+}
+
+/// One recorded flowgraph output, in call order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowOutput {
+    pub port: String,
+    pub value: FlowValue,
+}
+
+/// Per-slot character-animation state (`StartAnimation`, `SetAnimationSpeed`,
+/// `StopAnimation`). `length` is the resolved clip duration in seconds (0.0
+/// when the clip could not be resolved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimState {
+    pub name: String,
+    pub layer: i32,
+    pub speed: f32,
+    pub start_ms: i64,
+    pub looping: bool,
+    pub length: f32,
+    pub running: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EntityData {
     pub id: EntityId,
@@ -107,6 +152,37 @@ pub struct EntityData {
     /// Current script state name (`""` = no state).
     pub state: String,
     pub removed: bool,
+    /// `SetUpdatePolicy` (`ENTITY_UPDATE_*`).
+    pub update_policy: i32,
+    /// `SetRegisterInSectors(b)`.
+    pub register_in_sectors: bool,
+    /// `NetPresent(...)` network bookkeeping (single-player host).
+    pub net_present: bool,
+    /// `EnablePhysics(b)`.
+    pub physics_enabled: bool,
+    /// `AwakePhysics(n)`.
+    pub physics_awake: bool,
+    /// `SetSoundEffectRadius(f)`.
+    pub sound_effect_radius: f32,
+    /// Sound events fired on this entity (`PlaySoundEvent`), in order.
+    pub sound_events: Vec<String>,
+    /// `PreLoadParticleEffect(name)` / `LoadParticleEffect` precache list.
+    pub preloaded_effects: Vec<String>,
+    /// `SetPhysicParams` payloads keyed by `PHYSICPARAM_*` value.
+    pub phys_params: BTreeMap<i64, PhysParams>,
+    /// `ActivateOutput` / `ProcessBroadcastEvent` queue.
+    pub flow_outputs: Vec<FlowOutput>,
+    /// Character animation state per slot.
+    pub animations: BTreeMap<usize, AnimState>,
+    /// `InvalidateTrigger()` was called since the last update.
+    pub trigger_invalidated: bool,
+    /// `SetAIName(name)` / `RegisterWithAI` bookkeeping.
+    pub ai_name: Option<String>,
+    pub ai_registered: bool,
+    /// `EnableDecals(b)`.
+    pub decals_enabled: bool,
+    /// `ForceCharacterUpdate` / `CharacterUpdateAlways`.
+    pub character_update: bool,
 }
 
 impl EntityData {
@@ -134,6 +210,22 @@ impl EntityData {
             trigger_bbox: None,
             state: String::new(),
             removed: false,
+            update_policy: 0,
+            register_in_sectors: true,
+            net_present: false,
+            physics_enabled: true,
+            physics_awake: true,
+            sound_effect_radius: 0.0,
+            sound_events: Vec::new(),
+            preloaded_effects: Vec::new(),
+            phys_params: BTreeMap::new(),
+            flow_outputs: Vec::new(),
+            animations: BTreeMap::new(),
+            trigger_invalidated: false,
+            ai_name: None,
+            ai_registered: false,
+            decals_enabled: true,
+            character_update: false,
         }
     }
 

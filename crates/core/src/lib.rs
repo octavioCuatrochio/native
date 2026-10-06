@@ -21,6 +21,7 @@ pub mod class3_move;
 pub mod class3_physics;
 pub mod combat;
 pub mod cryimg;
+pub mod cry;
 pub mod crypak;
 pub mod dba;
 pub mod entity;

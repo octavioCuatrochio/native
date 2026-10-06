@@ -724,4 +724,19 @@ mod tests {
         assert!(ENGINE_CONSTANTS.iter().all(|(n, _)| !n.is_empty()));
         assert!(ENGINE_CONSTANTS.len() > 500);
     }
+
+    #[test]
+    fn bit_ops_follow_cryengine_semantics() {
+        let lua = Lua::new();
+        install(&lua).unwrap();
+        let eval = |code: &str| lua.load(code).eval::<i64>().unwrap();
+        assert_eq!(eval("return band(6, 3)"), 2);
+        assert_eq!(eval("return bor(4, 3)"), 7);
+        assert_eq!(eval("return bxor(6, 3)"), 5);
+        assert_eq!(eval("return bnot(0)"), -1);
+        assert_eq!(eval("return imod(7, 3)"), 1);
+        assert_eq!(eval("return lshift(1, 4)"), 16);
+        assert_eq!(eval("return rshift(16, 2)"), 4);
+        assert_eq!(eval("return arshift(-16, 2)"), -4);
+    }
 }

@@ -768,6 +768,534 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
             Ok(())
         })?,
     )?;
+    // -- slot transforms -----------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "SetSlotPos",
+        lua.create_function(move |_, (this, slot, p): (Table, Value, Value)| {
+            if let (Some(id), Some(i), Some(p)) = (self_id(&this), num(&slot), vec3_from(&p)) {
+                let mut w = c.world.borrow_mut();
+                if let Some(s) = w.get_mut(id).and_then(|e| e.slots.get_mut(i as usize)).and_then(|s| s.as_mut()) {
+                    s.pos = p;
+                }
+                w.events.push(super::world::WorldEvent::SlotsChanged(id));
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetSlotAngles",
+        lua.create_function(move |_, (this, slot, a): (Table, Value, Value)| {
+            if let (Some(id), Some(i), Some(a)) = (self_id(&this), num(&slot), vec3_from(&a)) {
+                let mut w = c.world.borrow_mut();
+                if let Some(s) = w.get_mut(id).and_then(|e| e.slots.get_mut(i as usize)).and_then(|s| s.as_mut()) {
+                    s.rot = quat_from_angles(a);
+                }
+                w.events.push(super::world::WorldEvent::SlotsChanged(id));
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetSlotPos",
+        lua.create_function(move |lua, (this, slot, out): (Table, Value, Option<Table>)| {
+            let p = self_id(&this)
+                .and_then(|id| {
+                    let w = c.world.borrow();
+                    let e = w.get(id)?;
+                    Some(e.slot(num(&slot).unwrap_or(0.0) as usize)?.pos)
+                })
+                .unwrap_or_default();
+            vec3_out(lua, out, p)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetSlotAngles",
+        lua.create_function(move |lua, (this, slot, out): (Table, Value, Option<Table>)| {
+            let a = self_id(&this)
+                .and_then(|id| {
+                    let w = c.world.borrow();
+                    let e = w.get(id)?;
+                    Some(angles_from_quat(e.slot(num(&slot).unwrap_or(0.0) as usize)?.rot))
+                })
+                .unwrap_or_default();
+            vec3_out(lua, out, a)
+        })?,
+    )?;
+    for name in ["GetSlotScale", "GetWorldScale"] {
+        let c = ctx.clone();
+        n.raw_set(
+            name,
+            lua.create_function(move |lua, (this, slot, out): (Table, Option<Value>, Option<Table>)| {
+                let s = self_id(&this)
+                    .and_then(|id| {
+                        let w = c.world.borrow();
+                        let e = w.get(id)?;
+                        match slot.as_ref().and_then(num) {
+                            Some(i) => Some(e.slot(i as usize)?.scale),
+                            None => Some(e.scale),
+                        }
+                    })
+                    .unwrap_or([1.0; 3]);
+                vec3_out(lua, out, s)
+            })?,
+        )?;
+    }
+    for name in ["SetSlotScale", "SetScale", "SetWorldScale"] {
+        let c = ctx.clone();
+        n.raw_set(
+            name,
+            lua.create_function(move |_, (this, a, b): (Table, Value, Value)| {
+                let Some(id) = self_id(&this) else { return Ok(()) };
+                let scale = vec3_from(&b)
+                    .or_else(|| vec3_from(&a))
+                    .or_else(|| num(&b).map(|n| [n as f32; 3]))
+                    .or_else(|| num(&a).map(|n| [n as f32; 3]))
+                    .unwrap_or([1.0; 3]);
+                let slot = num(&a);
+                let mut w = c.world.borrow_mut();
+                if let Some(e) = w.get_mut(id) {
+                    match (name, slot) {
+                        ("SetSlotScale", Some(i)) => {
+                            if let Some(s) = e.slots.get_mut(i as usize).and_then(|s| s.as_mut()) {
+                                s.scale = scale;
+                            }
+                        }
+                        _ => e.scale = scale,
+                    }
+                }
+                w.events.push(super::world::WorldEvent::SlotsChanged(id));
+                Ok(())
+            })?,
+        )?;
+    }
+    let c = ctx.clone();
+    n.raw_set(
+        "GetScale",
+        lua.create_function(move |lua, (this, out): (Table, Option<Table>)| {
+            let s = self_id(&this).and_then(|id| c.world.borrow().get(id).map(|e| e.scale)).unwrap_or([1.0; 3]);
+            vec3_out(lua, out, s)
+        })?,
+    )?;
+
+    // -- local transform (same as world when unparented) ---------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "GetLocalPos",
+        lua.create_function(move |lua, (this, out): (Table, Option<Table>)| {
+            let p = self_id(&this).and_then(|id| c.world.borrow().get(id).map(|e| e.pos)).unwrap_or_default();
+            vec3_out(lua, out, p)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetLocalPos",
+        lua.create_function(move |_, (this, p): (Table, Value)| {
+            if let (Some(id), Some(p)) = (self_id(&this), vec3_from(&p)) {
+                c.world.borrow_mut().set_pos(id, p);
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetLocalAngles",
+        lua.create_function(move |lua, (this, out): (Table, Option<Table>)| {
+            let q = self_id(&this).and_then(|id| c.world.borrow().get(id).map(|e| e.rot)).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            vec3_out(lua, out, angles_from_quat(q))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetLocalAngles",
+        lua.create_function(move |_, (this, a): (Table, Value)| {
+            if let (Some(id), Some(a)) = (self_id(&this), vec3_from(&a)) {
+                c.world.borrow_mut().set_rot(id, quat_from_angles(a));
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetDirectionVector",
+        lua.create_function(move |_, (this, d): (Table, Value)| {
+            if let (Some(id), Some(d)) = (self_id(&this), vec3_from(&d)) {
+                c.world.borrow_mut().set_rot(id, super::world::quat_from_dir(d));
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- physics / motion ----------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "AddImpulse",
+        lua.create_function(move |_, (this, args): (Table, Variadic<Value>)| {
+            let Some(id) = self_id(&this) else { return Ok(()) };
+            let dir = args.get(2).and_then(vec3_from);
+            let scale = args.get(3).and_then(num).unwrap_or(0.0) as f32;
+            if let Some(dir) = dir {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    let mass = if e.mass > 0.0 { e.mass } else { 1.0 };
+                    for i in 0..3 {
+                        e.velocity[i] += dir[i] * scale / mass;
+                    }
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetVelocity",
+        lua.create_function(move |lua, (this, out): (Table, Option<Table>)| {
+            let v = self_id(&this).and_then(|id| c.world.borrow().get(id).map(|e| e.velocity)).unwrap_or_default();
+            vec3_out(lua, out, v)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "RagDollize",
+        lua.create_function(move |_, (this, _slot): (Table, Option<Value>)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.physics = PhysKind::Rigid;
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "IsARigidBody",
+        lua.create_function(move |_, this: Table| {
+            Ok(self_id(&this)
+                .and_then(|id| c.world.borrow().get(id).map(|e| matches!(e.physics, PhysKind::Rigid | PhysKind::Articulated)))
+                .unwrap_or(false))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetPhysicsProperties",
+        lua.create_function(move |_, (this, _slot, active): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.physics_awake = truthy(&active);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "CharacterUpdateOnRender",
+        lua.create_function(move |_, (this, _slot, on): (Table, Value, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.character_update = truthy(&on);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- render / slots ------------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "LoadSubObject",
+        lua.create_function(move |_, (this, slot, file, _geom): (Table, Value, Value, Value)| {
+            let Some(id) = self_id(&this) else { return Ok(-1i64) };
+            let Some(path) = value_str(&file) else { return Ok(-1) };
+            if path.is_empty() {
+                return Ok(-1);
+            }
+            let mut w = c.world.borrow_mut();
+            let Some(e) = w.get_mut(id) else { return Ok(-1) };
+            let i = slot_index(&slot, e.free_slot_index());
+            e.set_slot(i, Some(Slot::new(SlotKind::Static, path.replace('\\', "/"))));
+            w.events.push(super::world::WorldEvent::SlotsChanged(id));
+            Ok(i as i64)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "DrawObject",
+        lua.create_function(move |_, (this, slot): (Table, Option<Value>)| {
+            if let Some(id) = self_id(&this) {
+                let mut w = c.world.borrow_mut();
+                if let Some(e) = w.get_mut(id) {
+                    let i = slot_index(slot.as_ref().unwrap_or(&Value::Nil), e.free_slot_index());
+                    if let Some(s) = e.slots.get_mut(i).and_then(|s| s.as_mut()) {
+                        s.visible = true;
+                    }
+                }
+                w.events.push(super::world::WorldEvent::SlotsChanged(id));
+            }
+            Ok(())
+        })?,
+    )?;
+    n.raw_set(
+        "UpdateLightClipBounds",
+        lua.create_function(move |_, (this, _slot): (Table, Option<Value>)| {
+            let _ = self_id(&this);
+            Ok(())
+        })?,
+    )?;
+
+    // -- material parameters -------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "SetMaterialFloat",
+        lua.create_function(move |_, (this, slot, sub, name, value): (Table, Value, Value, Value, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                let key = format!("{}:{}:{}", num(&slot).unwrap_or(0.0) as i64, num(&sub).unwrap_or(0.0) as i64, name);
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.material_floats.insert(key, num(&value).unwrap_or(0.0) as f32);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetMaterialFloat",
+        lua.create_function(move |_, (this, slot, sub, name): (Table, Value, Value, Value)| {
+            let Some(id) = self_id(&this) else { return Ok(0.0) };
+            let Some(name) = value_str(&name) else { return Ok(0.0) };
+            let key = format!("{}:{}:{}", num(&slot).unwrap_or(0.0) as i64, num(&sub).unwrap_or(0.0) as i64, name);
+            Ok(c.world.borrow().get(id).and_then(|e| e.material_floats.get(&key).copied()).unwrap_or(0.0) as f64)
+        })?,
+    )?;
+
+    // -- skeleton helpers (no skeleton in the engine layer yet) --------------
+    n.raw_set(
+        "GetBoneNameFromTable",
+        lua.create_function(move |_, (this, _idx): (Table, Value)| {
+            let _ = self_id(&this);
+            Ok(Value::Nil)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetBonePos",
+        lua.create_function(move |lua, (this, _name, out): (Table, Value, Option<Table>)| {
+            let p = self_id(&this).map(|id| c.world.borrow().world_pos(id)).unwrap_or_default();
+            vec3_out(lua, out, p)
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetHelperPos",
+        lua.create_function(move |lua, (this, _name, object_space, out): (Table, Value, Option<Value>, Option<Table>)| {
+            let p = self_id(&this)
+                .map(|id| {
+                    let w = c.world.borrow();
+                    if truthy(object_space.as_ref().unwrap_or(&Value::Nil)) {
+                        w.get(id).map(|e| e.pos).unwrap_or_default()
+                    } else {
+                        w.world_pos(id)
+                    }
+                })
+                .unwrap_or_default();
+            vec3_out(lua, out, p)
+        })?,
+    )?;
+
+    // -- links ---------------------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "CountLinks",
+        lua.create_function(move |_, this: Table| {
+            Ok(self_id(&this).and_then(|id| c.world.borrow().get(id).map(|e| e.links.len())).unwrap_or(0))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetLink",
+        lua.create_function(move |_, (this, idx): (Table, Value)| {
+            let i = num(&idx).unwrap_or(0.0) as usize;
+            Ok(self_id(&this)
+                .and_then(|id| c.world.borrow().get(id).and_then(|e| e.links.get(i).map(|l| l.1)))
+                .map(super::host::id_value)
+                .unwrap_or(Value::Nil))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetLinkName",
+        lua.create_function(move |lua, (this, target): (Table, Value)| {
+            let Some(target) = value_to_id(&target) else { return Ok(Value::Nil) };
+            Ok(self_id(&this)
+                .and_then(|id| {
+                    c.world
+                        .borrow()
+                        .get(id)
+                        .and_then(|e| e.links.iter().find(|l| l.1 == target).map(|l| l.0.clone()))
+                })
+                .map(|n| Value::String(lua.create_string(n).unwrap()))
+                .unwrap_or(Value::Nil))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetLinkTarget",
+        lua.create_function(move |_, (this, name, idx): (Table, Value, Value)| {
+            let Some(name) = value_str(&name) else { return Ok(Value::Nil) };
+            let i = num(&idx).unwrap_or(0.0) as usize;
+            Ok(self_id(&this)
+                .and_then(|id| {
+                    c.world
+                        .borrow()
+                        .get(id)
+                        .and_then(|e| e.links.iter().filter(|l| l.0 == name).nth(i).map(|l| l.1))
+                })
+                .map(super::host::id_value)
+                .unwrap_or(Value::Nil))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "SetLinkTarget",
+        lua.create_function(move |_, (this, name, target): (Table, Value, Value)| {
+            let (Some(id), Some(name), Some(target)) = (self_id(&this), value_str(&name), value_to_id(&target)) else {
+                return Ok(());
+            };
+            if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                if let Some(l) = e.links.iter_mut().find(|l| l.0 == name) {
+                    l.1 = target;
+                } else {
+                    e.links.push((name, target));
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "CreateLink",
+        lua.create_function(move |_, (this, a, b): (Table, Value, Value)| {
+            let Some(id) = self_id(&this) else { return Ok(()) };
+            let (name, target) = if value_to_id(&a).is_some() && value_str(&b).is_some() {
+                (value_str(&b).unwrap(), value_to_id(&a).unwrap())
+            } else if value_str(&a).is_some() && value_to_id(&b).is_some() {
+                (value_str(&a).unwrap(), value_to_id(&b).unwrap())
+            } else {
+                return Ok(());
+            };
+            if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                e.links.push((name, target));
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "RemoveLink",
+        lua.create_function(move |_, (this, name): (Table, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.links.retain(|l| l.0 != name);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "RemoveAllLinks",
+        lua.create_function(move |_, this: Table| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.links.clear();
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // -- parenting / misc ----------------------------------------------------
+    let c = ctx.clone();
+    n.raw_set(
+        "GetParent",
+        lua.create_function(move |_, this: Table| {
+            Ok(self_id(&this)
+                .and_then(|id| c.world.borrow().get(id).and_then(|e| e.parent))
+                .map(super::host::id_value)
+                .unwrap_or(Value::Nil))
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "AttachChild",
+        lua.create_function(move |_, (this, child, _flags): (Table, Value, Option<Value>)| {
+            if let (Some(id), Some(child)) = (self_id(&this), value_to_id(&child)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(child) {
+                    e.parent = Some(id);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "GetDistance",
+        lua.create_function(move |_, (this, other): (Table, Value)| {
+            let (Some(id), Some(other)) = (self_id(&this), value_to_id(&other)) else { return Ok(0.0) };
+            let w = c.world.borrow();
+            let d = super::world::dist2(w.world_pos(id), w.world_pos(other)).sqrt();
+            Ok(d as f64)
+        })?,
+    )?;
+    n.raw_set(
+        "RegisterState",
+        lua.create_function(move |_, (this, _name): (Table, Value)| {
+            let _ = self_id(&this);
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "TriggerEvent",
+        lua.create_function(move |_, (this, ev): (Table, Value)| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.flow_outputs.push(FlowOutput { port: "TriggerEvent".into(), value: flow_value(&ev) });
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "StopAllSounds",
+        lua.create_function(move |_, this: Table| {
+            if let Some(id) = self_id(&this) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.sound_events.clear();
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    let c = ctx.clone();
+    n.raw_set(
+        "PlaySoundEventEx",
+        lua.create_function(move |_, (this, name): (Table, Value)| {
+            if let (Some(id), Some(name)) = (self_id(&this), value_str(&name)) {
+                if let Some(e) = c.world.borrow_mut().get_mut(id) {
+                    e.sound_events.push(name);
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    for name in ["AddConstraint", "BreakToPieces", "PhysicalizeSlot", "CreateBoneAttachment", "ResetAttachment"] {
+        n.raw_set(name, lua.create_function(|_, _: Variadic<Value>| Ok(Value::Nil))?)?;
+    }
+
     install_actor_compat(lua, ctx)?;
     Ok(())
 }

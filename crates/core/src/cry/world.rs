@@ -183,6 +183,10 @@ pub struct EntityData {
     pub decals_enabled: bool,
     /// `ForceCharacterUpdate` / `CharacterUpdateAlways`.
     pub character_update: bool,
+    /// Material float parameters keyed by `"slot:submat:name"`.
+    pub material_floats: BTreeMap<String, f32>,
+    /// Entity links (`name` -> target), in creation order.
+    pub links: Vec<(String, EntityId)>,
 }
 
 impl EntityData {
@@ -226,6 +230,8 @@ impl EntityData {
             ai_registered: false,
             decals_enabled: true,
             character_update: false,
+            material_floats: BTreeMap::new(),
+            links: Vec::new(),
         }
     }
 
@@ -482,6 +488,21 @@ mod tests {
         };
         let f = e.axis(1);
         assert!((f[0] + 1.0).abs() < 1e-5 && f[1].abs() < 1e-5, "{f:?}");
+    }
+
+    #[test]
+    fn new_entity_has_sane_engine_defaults() {
+        let e = EntityData::new(7, "x", "BasicEntity");
+        assert!(e.register_in_sectors);
+        assert!(e.physics_enabled);
+        assert!(e.physics_awake);
+        assert!(!e.net_present);
+        assert_eq!(e.update_policy, 0);
+        assert!(e.animations.is_empty());
+        assert!(e.phys_params.is_empty());
+        assert!(e.flow_outputs.is_empty());
+        assert!(e.material_floats.is_empty());
+        assert!(e.links.is_empty());
     }
 }
 

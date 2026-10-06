@@ -69,11 +69,8 @@
 //! and pushes them to the movement request (`vtable+0xa4`, flags `|0x58`). The
 //! downstream consumer is not in the export (`player_orientation.md` §5.1).
 //!
-//! Real-game telemetry resolves the *effective* curve: the run displacement
-//! ramps with a first-order time constant **`τ ≈ 0.2 s`** (accel ~0.6 s to 95%,
-//! stop slide ≈0.8 m), not the `τ = 0.063 s` that the shipped `inertiaAccel`
-//! would give (`notes/movement_telemetry.md`). [`integrate_inertia`] therefore
-//! uses the measured `MovementTuning::velocity_tau_accel` / `velocity_tau_decel`.
+//! Real-game telemetry at frame resolution confirms the shipped values drive a
+//! per-frame `k·dt` approach (see [`integrate_inertia`]).
 //!
 //! # Constrained rotation
 //! `CPlayerRotation::Process` `0x0161eae0` dispatches on `actor+0x16c`: the free
@@ -468,47 +465,36 @@ pub fn wrap_angle(a: f32) -> f32 {
     r
 }
 
-/// Per-axis player velocity-lag integrator (first-order exponential).
+/// Player velocity inertia: the living-entity velocity approach fed by the
+/// shipped `inertia` / `inertiaAccel`.
 ///
 /// # Recovery
-/// `CPlayer::PostPhysicalize` (`FUN_01504890`, `0x01504890`) reads the shipped
-/// tuning at `0x15048b0` (`movss xmm0, [edi+0xea4]` = **`inertia`**) and
-/// `0x15048e0` (`movss xmm0, [edi+0xea8]` = **`inertiaAccel`**), stores them into
-/// a local movement-request struct and pushes it via `request->vtable+0xa4`
-/// with request flags `| 0x58` (`player_orientation.md` §2.4). The **consumer**
-/// that later decays the actor velocity from those request fields is not in any
-/// export (`player_orientation.md` §5.1), so the exact curve was `[UNRECOVERED]`.
+/// `CPlayer::PostPhysicalize` (`0x01504890`) reads `inertia` (`actor+0xea4`)
+/// and `inertiaAccel` (`actor+0xea8`) and pushes them through
+/// `CAnimatedCharacter::SetParams` (`0x0081a250`). No game-side function reads
+/// them back (`camera_controller_full.md` §B.2): they are consumed by the
+/// physics living entity, which approaches the requested velocity each step.
 ///
 /// # Measurement
-/// Real-game telemetry (`notes/movement_telemetry.md`) resolves the curve: the
-/// run gait reaches ~95% of `runSpeed` in ~0.6 s from rest, and the actor slides
-/// ≈0.8 m after releasing `W` from `runSpeed`. Both are a first-order lag with a
-/// single time constant **`τ ≈ 0.2 s`** (`V·τ = 0.8 m`). The shipped
-/// `inertiaAccel = 16` / `inertia = 10` would be `τ = 0.063 s` / `0.1 s`, i.e.
-/// the game's *displacement* is ~2–3× slower than a naive `k·dt` step. We
-/// therefore integrate with the measured `τ` (`MovementTuning::velocity_tau_*`),
-/// which supersedes the shipped constants for parity.
+/// Frame-resolution retail telemetry (`notes/telemetry/dyn.csv`,
+/// `run_start_stop`, ~24 Hz frames) shows the run start going `0 → 2.9 → 4.0`
+/// m/s over two frames and the stop decaying by roughly ×0.5 per frame — the
+/// shipped `16` / `10` rates exactly. (An earlier fit of `τ ≈ 0.2 s` had
+/// folded the capture rig's ~0.2 s input latency, visible identically on key
+/// press and release, into the curve.)
 ///
 /// # Model
-/// A clamped, per-axis exponential approach. For each axis `i`:
-///
 /// ```text
-/// speeding_up_i = |d_i| > |c_i| and (c_i == 0 or d_i and c_i share sign)
-/// tau_i  = speeding_up_i ? tau_accel : tau_decel
-/// alpha  = 1 - exp(-dt / tau_i)          // tau <= 0 -> snap
-/// n_i    = c_i + (d_i - c_i) * alpha
-/// n_i    = clamp(n_i, min(c_i, d_i), max(c_i, d_i))   // no overshoot
+/// k  = |desired| > |current| ? k_accel : k_decel   // k <= 0: no inertia
+/// v' = v + (desired - v) * min(1, k * dt)
 /// ```
-///
-/// Each axis is independent and can never overshoot its target. Non-finite
-/// components collapse to `0`, a non-positive/non-finite `dt` leaves the
-/// velocity unchanged, and a non-positive/non-finite `tau` snaps to target, so
-/// the helper is total.
+/// Applied to the whole vector, so it never overshoots. Non-finite input
+/// collapses to `0`; a non-positive or non-finite `dt` is a no-op.
 pub fn integrate_inertia(
     current: [f32; 3],
     desired: [f32; 3],
-    tau_accel: f32,
-    tau_decel: f32,
+    k_accel: f32,
+    k_decel: f32,
     dt: f32,
 ) -> [f32; 3] {
     let cur = [sane(current[0]), sane(current[1]), sane(current[2])];
@@ -516,48 +502,25 @@ pub fn integrate_inertia(
     if !(dt.is_finite() && dt > 0.0) {
         return cur;
     }
-    let accel = sane(tau_accel);
-    let decel = sane(tau_decel);
-    let mut out = cur;
-    for i in 0..3 {
-        let c = cur[i];
-        let d = des[i];
-        // Rising target speed (same direction): use the accel time constant. A
-        // sign flip or a shrinking target speed is a deceleration: use decel.
-        let same_sign = c == 0.0 || d == 0.0 || (c > 0.0) == (d > 0.0);
-        let speeding_up = d.abs() > c.abs() && same_sign;
-        let tau = if speeding_up { accel } else { decel };
-        let alpha = if tau > 0.0 {
-            1.0 - (-dt / tau).exp()
-        } else {
-            1.0
-        };
-        let alpha = alpha.clamp(0.0, 1.0);
-        let mut n = c + (d - c) * alpha;
-        // Clamp so a single step can never overshoot the target on this axis.
-        let (lo, hi) = if d >= c { (c, d) } else { (d, c) };
-        n = n.clamp(lo, hi);
-        out[i] = sane(n);
-    }
-    out
+    let len2 = |v: [f32; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    let k = if len2(des) > len2(cur) { sane(k_accel) } else { sane(k_decel) };
+    let f = if k > 0.0 { (k * dt).min(1.0) } else { 1.0 };
+    [
+        sane(cur[0] + (des[0] - cur[0]) * f),
+        sane(cur[1] + (des[1] - cur[1]) * f),
+        sane(cur[2] + (des[2] - cur[2]) * f),
+    ]
 }
 
-/// Accelerate the current velocity toward `desired` using the **measured**
-/// first-order lag `τ ≈ 0.2 s` ([`MovementTuning::velocity_tau_accel`] /
-/// [`MovementTuning::velocity_tau_decel`], fitted in
-/// `notes/movement_telemetry.md`).
-///
-/// Thin wrapper over [`integrate_inertia`]. The shipped `inertia` (10) /
-/// `inertiaAccel` (16) are retained on [`MovementTuning`] for provenance but are
-/// not used here, because their naive `k·dt` step is ~2–3× faster than the
-/// actuator's real displacement ramp.
+/// Accelerate the current velocity toward `desired` with the shipped
+/// `inertiaAccel` / `inertia` rates ([`integrate_inertia`]).
 pub fn accelerate_velocity(
     current: [f32; 3],
     desired: [f32; 3],
     t: &MovementTuning,
     dt: f32,
 ) -> [f32; 3] {
-    integrate_inertia(current, desired, t.velocity_tau_accel, t.velocity_tau_decel, dt)
+    integrate_inertia(current, desired, t.inertia_accel, t.inertia, dt)
 }
 
 /// Orthonormal Z-up basis from a yaw: `[forward, right, up]`.
@@ -1361,86 +1324,61 @@ mod tests {
         assert!(approx(s.yaw, 0.4));
     }
 
-    /// The measured first-order velocity lag (`velocity_tau_*`, τ≈0.2 s) drives
-    /// both acceleration and deceleration; `integrate_inertia` is time-constant
-    /// based (the shipped `inertia`/`inertiaAccel` are provenance only).
+    /// The shipped `inertiaAccel` (16) / `inertia` (10) rates drive the
+    /// approach: it ramps (no snap), converges, and accelerates faster than it
+    /// decelerates.
     #[test]
     fn acceleration_reaches_target_velocity() {
         let t = default_movement();
         let dt = 1.0 / 60.0;
-        // One frame is not enough: the model ramps, it does not snap.
         let v1 = accelerate_velocity([0.0; 3], [4.0, 0.0, 0.0], &t, dt);
         assert!(v1[0] > 0.0 && v1[0] < 4.0, "v1={}", v1[0]);
 
-        // Converges to the target within the model.
         let mut v = [0.0f32; 3];
-        let target = [4.0f32, 0.0, 0.0];
         for _ in 0..240 {
-            v = accelerate_velocity(v, target, &t, dt);
+            v = accelerate_velocity(v, [4.0, 0.0, 0.0], &t, dt);
         }
         assert!((v[0] - 4.0).abs() < 1e-3, "v={:?}", v);
-
-        // Deceleration also converges.
         let mut v = [4.0f32, 0.0, 0.0];
         for _ in 0..240 {
             v = accelerate_velocity(v, [0.0; 3], &t, dt);
         }
         assert!(v[0].abs() < 1e-3, "v={:?}", v);
 
-        // A shorter accel tau is faster on the first frame than a longer decel
-        // tau; the shipped/measured default taus (both 0.2) are symmetric.
-        let fast = MovementTuning {
-            velocity_tau_accel: 0.05,
-            velocity_tau_decel: 0.4,
-            ..t
-        };
-        let accel = integrate_inertia(
-            [0.0; 3], [4.0, 0.0, 0.0], fast.velocity_tau_accel, fast.velocity_tau_decel, dt,
-        )[0];
-        let decel = 4.0
-            - integrate_inertia(
-                [4.0, 0.0, 0.0], [0.0; 3], fast.velocity_tau_accel, fast.velocity_tau_decel, dt,
-            )[0];
+        let accel = accelerate_velocity([0.0; 3], [4.0, 0.0, 0.0], &t, dt)[0];
+        let decel = 4.0 - accelerate_velocity([4.0, 0.0, 0.0], [0.0; 3], &t, dt)[0];
         assert!(accel > decel, "accel {accel} vs decel {decel}");
-        let sym_a = accelerate_velocity([0.0; 3], [4.0, 0.0, 0.0], &t, dt)[0];
-        let sym_d = 4.0 - accelerate_velocity([4.0, 0.0, 0.0], [0.0; 3], &t, dt)[0];
-        assert!(approx(sym_a, sym_d), "symmetric default {sym_a} vs {sym_d}");
 
-        // Total: NaN/zero-dt leave the velocity unchanged; tau <= 0 snaps.
         assert_eq!(accelerate_velocity([1.0, 2.0, 3.0], [4.0; 3], &t, 0.0), [1.0, 2.0, 3.0]);
         let bad = accelerate_velocity([f32::NAN; 3], [f32::INFINITY; 3], &t, dt);
         assert!(bad.iter().all(|v| v.is_finite()));
         assert_eq!(integrate_inertia([0.0; 3], [4.0; 3], 0.0, 0.0, dt), [4.0; 3]);
     }
 
-    /// The measured run ramp: from rest at the run gait, ~3.2 m in the first
-    /// second and ~0.8 m of slide after release (`notes/movement_telemetry.md`).
+    /// Retail frame trace (`notes/telemetry/dyn.csv`, `run_start_stop`, game
+    /// frames ≈ 0.042 s). Measured speeds after motion begins: `2.9, 4.0, 4.1`
+    /// m/s; after release: `2.9, 0.95, 1.2, 0.42, 0.29, 0.13` m/s.
     #[test]
-    fn velocity_lag_matches_measured_run_ramp() {
+    fn inertia_matches_retail_frame_trace() {
         let t = default_movement();
-        let g = flat(0.0);
-        let dt = 1.0 / 60.0;
+        let dt = 0.042;
+        let run = [4.0f32, 0.0, 0.0];
+        let v1 = accelerate_velocity([0.0; 3], run, &t, dt);
+        let v2 = accelerate_velocity(v1, run, &t, dt);
+        assert!(v1[0] > 2.4 && v1[0] < 3.2, "frame 1 {}", v1[0]);
+        assert!(v2[0] > 3.4, "frame 2 {}", v2[0]);
+        // The rejected τ = 0.2 s fit would only reach ~1.4 m/s by frame 2.
+        assert!(4.0 * (1.0 - (-2.0f32 * dt / 0.2).exp()) < 1.5);
 
-        // Accelerate from rest for 1 s: V*(t - tau*(1-exp(-t/tau))) = 3.21 m.
-        let mut s = MoveState::new([0.0, 0.0, 0.0]);
-        let i = input(1.0, 0.0, dt);
-        for _ in 0..60 {
-            update_normal(&mut s, &i, &t, &g, &[]);
+        let mut v = run;
+        let mut trace = Vec::new();
+        for _ in 0..4 {
+            v = accelerate_velocity(v, [0.0; 3], &t, dt);
+            trace.push(v[0]);
         }
-        assert!((s.pos[0] - 3.21).abs() < 0.15, "1s distance = {}", s.pos[0]);
-
-        // Run to the plateau, then release; the slide is V*tau = 0.8 m.
-        for _ in 0..240 {
-            update_normal(&mut s, &i, &t, &g, &[]);
-        }
-        assert!(approx(s.vel[0], 4.0), "plateau {}", s.vel[0]);
-        let stop_start = s.pos[0];
-        let idle = input(0.0, 0.0, dt);
-        for _ in 0..240 {
-            update_normal(&mut s, &idle, &t, &g, &[]);
-        }
-        let slide = s.pos[0] - stop_start;
-        assert!((slide - 0.8).abs() < 0.15, "stop slide = {slide}");
+        assert!(trace[0] > 1.8 && trace[0] < 3.0, "stop 1 {trace:?}");
+        assert!(trace[1] < 1.6, "stop 2 {trace:?}");
+        assert!(trace[3] < 0.6, "stop 4 {trace:?}");
     }
 
     /// The whole controller accelerates from rest toward the stance speed.
@@ -1942,47 +1880,30 @@ mod tests {
     // jump clamp, capsule/stance constants, controller accessors
     // -----------------------------------------------------------------------
 
-    /// The integrator is per-axis, accel-vs-decel, first-order
-    /// (`alpha = 1 - exp(-dt/tau)`) and clamped so it never overshoots.
-    /// `CPlayer::PostPhysicalize` `0x01504890` reads `inertia`/`inertiaAccel`,
-    /// but the measured effective lag is `notes/movement_telemetry.md`
-    /// (τ≈0.2 s), passed here as the time constants.
+    /// `v + (d - v) * min(1, k*dt)` on the whole vector, with `k_accel` while
+    /// the target is faster than the current velocity and `k_decel` otherwise.
     #[test]
-    fn inertia_integrator_is_per_axis_accel_decel_clamped() {
+    fn inertia_integrator_steps_with_accel_and_decel_rates() {
         let dt = 1.0 / 60.0;
-        let tau_a = 0.2f32;
-        let tau_d = 0.4f32;
-        // Rising target -> accel tau: alpha = 1 - exp(-dt/tau_a).
-        let alpha_a = 1.0 - (-dt / tau_a).exp();
-        let a = integrate_inertia([0.0; 3], [4.0, 0.0, 0.0], tau_a, tau_d, dt);
-        assert!((a[0] - 4.0 * alpha_a).abs() < 1e-6, "accel {a:?}");
-        assert!(a[0] > 0.0 && a[0] < 4.0);
-        // Shrinking target -> decel tau.
-        let alpha_d = 1.0 - (-dt / tau_d).exp();
-        let d = integrate_inertia([4.0, 0.0, 0.0], [0.0; 3], tau_a, tau_d, dt);
-        assert!((d[0] - 4.0 * (1.0 - alpha_d)).abs() < 1e-6, "decel {d:?}");
-        assert!(4.0 - d[0] < a[0], "accel must be faster than decel");
+        let (ka, kd) = (16.0f32, 10.0f32);
+        let a = integrate_inertia([0.0; 3], [4.0, 0.0, 0.0], ka, kd, dt);
+        assert!((a[0] - 4.0 * ka * dt).abs() < 1e-6, "accel {a:?}");
+        let d = integrate_inertia([4.0, 0.0, 0.0], [0.0; 3], ka, kd, dt);
+        assert!((d[0] - 4.0 * (1.0 - kd * dt)).abs() < 1e-6, "decel {d:?}");
 
-        // Per-axis: axis 0 accelerates while axis 1 decelerates in one call.
-        let mixed = integrate_inertia([0.0, 4.0, 0.0], [4.0, 0.0, 0.0], tau_a, tau_d, dt);
-        assert!((mixed[0] - 4.0 * alpha_a).abs() < 1e-6, "mixed {mixed:?}");
-        assert!((mixed[1] - 4.0 * (1.0 - alpha_d)).abs() < 1e-6, "mixed {mixed:?}");
+        // Turning at equal speed is not speeding up: decel rate on both axes.
+        let turn = integrate_inertia([0.0, 4.0, 0.0], [4.0, 0.0, 0.0], ka, kd, dt);
+        assert!((turn[0] - 4.0 * kd * dt).abs() < 1e-6, "turn {turn:?}");
+        assert!((turn[1] - 4.0 * (1.0 - kd * dt)).abs() < 1e-6, "turn {turn:?}");
 
-        // Clamped: a zero tau snaps, and cannot overshoot the target.
-        assert_eq!(
-            integrate_inertia([0.0; 3], [4.0, 0.0, 0.0], 0.0, 0.0, dt)[0],
-            4.0
-        );
-        // Reversal uses the decel tau and stays between current and target.
-        let rev = integrate_inertia([4.0, 0.0, 0.0], [-4.0, 0.0, 0.0], tau_a, tau_d, dt);
+        // k*dt >= 1 or k <= 0 lands exactly on the target.
+        assert_eq!(integrate_inertia([0.0; 3], [4.0, 0.0, 0.0], 100.0, kd, 0.1)[0], 4.0);
+        assert_eq!(integrate_inertia([0.0; 3], [4.0, 0.0, 0.0], 0.0, 0.0, dt)[0], 4.0);
+        let rev = integrate_inertia([4.0, 0.0, 0.0], [-4.0, 0.0, 0.0], ka, kd, dt);
         assert!(rev[0] < 4.0 && rev[0] > -4.0, "rev {rev:?}");
 
-        // Total: zero dt is a no-op; NaN/inf collapse to finite.
-        assert_eq!(
-            integrate_inertia([1.0, 2.0, 3.0], [4.0; 3], tau_a, tau_d, 0.0),
-            [1.0, 2.0, 3.0]
-        );
-        let bad = integrate_inertia([f32::NAN; 3], [f32::INFINITY; 3], tau_a, tau_d, dt);
+        assert_eq!(integrate_inertia([1.0, 2.0, 3.0], [4.0; 3], ka, kd, 0.0), [1.0, 2.0, 3.0]);
+        let bad = integrate_inertia([f32::NAN; 3], [f32::INFINITY; 3], ka, kd, dt);
         assert!(bad.iter().all(|v| v.is_finite()));
     }
 

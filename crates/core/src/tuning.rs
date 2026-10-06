@@ -41,27 +41,13 @@ pub struct MovementTuning {
     pub run_and_gun_mult: f32,
     /// `grabMultiplier` — speed scale while carrying the maximum load.
     pub grab_mult: f32,
-    /// `inertia` — higher is a faster speed change (10 is already fast).
-    ///
-    /// Kept for provenance; the *effective* displacement ramp measured from the
-    /// real game is [`velocity_tau_accel`](Self::velocity_tau_accel) /
-    /// [`velocity_tau_decel`](Self::velocity_tau_decel).
+    /// `inertia` — velocity-approach rate (1/s) while slowing down or turning
+    /// (`v += (target - v) * min(1, inertia * dt)`), see
+    /// [`crate::class3_move::integrate_inertia`].
     pub inertia: f32,
-    /// `inertiaAccel` — like `inertia`, used while accelerating.
-    ///
-    /// Kept for provenance; see [`velocity_tau_accel`](Self::velocity_tau_accel).
+    /// `inertiaAccel` — like `inertia`, used while the target speed exceeds
+    /// the current speed.
     pub inertia_accel: f32,
-    /// Measured first-order velocity-lag time constant while accelerating (s).
-    ///
-    /// Fit from real-game telemetry: holding `W` from rest, the run gait reaches
-    /// ~95% of `runSpeed` in ~0.6 s, i.e. `τ ≈ 0.20 s`
-    /// (`notes/movement_telemetry.md`). This supersedes `inertiaAccel` for
-    /// displacement parity (the shipped `16` would give `τ = 0.063 s`, ~3× fast).
-    pub velocity_tau_accel: f32,
-    /// Measured first-order velocity-lag time constant while decelerating or
-    /// reversing (s). The actor slides ≈ 0.8 m after releasing `W` from the run
-    /// speed (`V·τ`), i.e. `τ ≈ 0.20 s` (`notes/movement_telemetry.md`).
-    pub velocity_tau_decel: f32,
     /// `leanAngle` — view rotation (degrees) while leaning.
     pub lean_angle: f32,
     /// `physicsParams.Living.air_resistance`.
@@ -90,8 +76,6 @@ pub fn default_movement() -> MovementTuning {
         grab_mult: 0.5,         // player.lua grabMultiplier
         inertia: 10.0,          // player.lua inertia
         inertia_accel: 16.0,    // player.lua inertiaAccel (BasicActor uses 11.0)
-        velocity_tau_accel: 0.20, // measured from retail game, notes/movement_telemetry.md
-        velocity_tau_decel: 0.20, // measured from retail game, notes/movement_telemetry.md
         lean_angle: 15.0,       // player.lua leanAngle
         air_resistance: 0.0,    // player.lua physicsParams.Living.air_resistance
         threshold_creep_walk: 0.29, // player.lua creepWalkStepThreshold
@@ -300,7 +284,6 @@ pub fn parity_notes() -> &'static [&'static str] {
         "creepWalkStepThreshold 0.29 / walkRunStepThreshold 0.69: player.lua",
         "jumpHeight 1.0 m: extracted-game/gamedata/scripts/entities/actor/basicactor.lua",
         "cl_movement_* cvars ship unset (-1.0) in bin/StateOfDecay.unpacked.exe .data 0x190f4a8..0x190f4c4",
-        "velocity_tau_accel/decel 0.20 s: measured from retail telemetry, notes/movement_telemetry.md (supersedes inertiaAccel 16 / inertia 10 for displacement parity)",
         "cl_cam_rotation_speed 0.04 / accel time yaw 0.3 / pitch 0.6: gamedata/libs/config/meleeprototype.cfg",
         "cl_sensitivity 45: gamedata/libs/config/profiles/default/attributes.xml (OptionCfg.cl_sensitivity)",
     ]
@@ -326,8 +309,6 @@ mod tests {
         assert_eq!(m.grab_mult, 0.5);
         assert_eq!(m.inertia, 10.0);
         assert_eq!(m.inertia_accel, 16.0);
-        assert_eq!(m.velocity_tau_accel, 0.20);
-        assert_eq!(m.velocity_tau_decel, 0.20);
         assert_eq!(m.lean_angle, 15.0);
         assert_eq!(m.air_resistance, 0.0);
         assert_eq!(m.threshold_creep_walk, 0.29);

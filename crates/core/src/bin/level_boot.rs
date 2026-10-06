@@ -68,7 +68,7 @@ fn main() {
     // so area volumes along the way fire enter/leave events.
     let start = [3246.8f32, 3256.2, 217.1];
     let player = host
-        .spawn_scripted("Player", "scripts/entities/actor/player.lua", "Dev", start)
+        .spawn_actor("Player", "scripts/entities/actor/player.lua", "Dev", start, true)
         .expect("spawn player");
     host.add_area_listener(player);
     println!("[player] id {player} instance={}", host.ctx.instance(player).is_some());

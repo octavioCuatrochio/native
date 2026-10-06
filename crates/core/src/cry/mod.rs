@@ -2,6 +2,7 @@
 //! expect from the engine, implemented natively. Game logic itself is never
 //! re-written here; it runs from the original scripts loaded at runtime.
 
+pub mod actor;
 pub mod binds_entity;
 pub mod binds_system;
 pub mod constants;

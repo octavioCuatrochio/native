@@ -119,6 +119,8 @@ pub struct Ctx {
     pub loaded_scripts: Rc<RefCell<HashSet<String>>>,
     /// CVars (`System.GetCVar`/`SetCVar`), seeded from the shipped configs.
     pub cvars: Rc<RefCell<HashMap<String, String>>>,
+    /// Actor-system state (`self.actor`), by entity.
+    pub actors: Rc<RefCell<HashMap<EntityId, super::actor::ActorState>>>,
     /// Engine events delivered to a script handler, by event name.
     pub delivered: Rc<RefCell<BTreeMap<String, u64>>>,
     /// Echo `System.Log` output to stdout.
@@ -521,6 +523,8 @@ pub struct ScriptHost {
     pub areas: RefCell<Vec<AreaRt>>,
     /// Entities that trigger areas (the player; later vehicles/NPCs).
     pub area_listeners: RefCell<Vec<EntityId>>,
+    /// Classes the actor system owns (lower-case name -> is local player).
+    pub actor_classes: RefCell<HashMap<String, bool>>,
     /// Lower-cased class name -> script path (`.ent` registry).
     pub class_scripts: HashMap<String, (String, Option<String>)>,
 }
@@ -538,6 +542,7 @@ impl ScriptHost {
             loaded_scripts: Default::default(),
             cvars: Default::default(),
             delivered: Default::default(),
+            actors: Default::default(),
             echo_log: std::env::var("SOD_LUA_LOG").is_ok(),
         };
 
@@ -576,12 +581,14 @@ impl ScriptHost {
             ctx,
             areas: RefCell::new(Vec::new()),
             area_listeners: RefCell::new(Vec::new()),
+            actor_classes: RefCell::new(HashMap::new()),
             class_scripts: HashMap::new(),
         };
         host.install_script_binds()?;
         host.install_entity_system_binds()?;
         super::binds_system::install(&host.lua, &host.ctx)?;
         super::binds_entity::install(&host.lua, &host.ctx)?;
+        super::actor::install(&host.lua, &host.ctx)?;
         host.load_class_registry();
         Ok(host)
     }
@@ -688,19 +695,9 @@ impl ScriptHost {
         let Some(cls) = self.class_table(&le.class)? else { return Ok(id) };
         let xml = le.properties.as_ref().map(|p| p.to_lua(&self.lua)).transpose()?;
         let xml_inst = le.properties_instance.as_ref().map(|p| p.to_lua(&self.lua)).transpose()?;
-        self.init_instance(cls, id, &le.class, xml, xml_inst)?;
+        let actor = self.actor_classes.borrow().get(&le.class.to_ascii_lowercase()).copied();
+        Self::init_instance_with(&self.lua, &self.ctx, cls, id, &le.class, xml, xml_inst, actor)?;
         Ok(id)
-    }
-
-    fn init_instance(
-        &self,
-        cls: Table,
-        id: EntityId,
-        class: &str,
-        xml: Option<Table>,
-        xml_inst: Option<Table>,
-    ) -> Result<Table> {
-        Self::init_instance_with(&self.lua, &self.ctx, cls, id, class, xml, xml_inst)
     }
 
     fn init_instance_with(
@@ -711,11 +708,15 @@ impl ScriptHost {
         class: &str,
         xml: Option<Table>,
         xml_inst: Option<Table>,
+        actor: Option<bool>,
     ) -> Result<Table> {
         let newf: Function = lua.globals().get("__host_new_instance")?;
         let inst: Table = newf.call((cls.clone(), id_value(id), class, xml, xml_inst))?;
         inst.raw_set("__class", cls)?;
         ctx.instances.borrow_mut().insert(id, inst.clone());
+        if let Some(is_player) = actor {
+            super::actor::attach(lua, ctx, id, &inst, is_player)?;
+        }
 
         let cb: Function = lua.globals().get("__host_callback")?;
         let ev: Function = lua.globals().get("__host_event")?;
@@ -800,6 +801,11 @@ impl ScriptHost {
 
     /// Spawn a scripted entity outside the level file (actors such as the
     /// player, whose class the game module registers with a fixed script).
+    pub fn spawn_actor(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3], is_player: bool) -> Result<EntityId> {
+        self.actor_classes.borrow_mut().insert(class.to_ascii_lowercase(), is_player);
+        self.spawn_scripted(class, script, name, pos)
+    }
+
     pub fn spawn_scripted(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3]) -> Result<EntityId> {
         self.class_scripts
             .entry(class.to_ascii_lowercase())
@@ -1094,7 +1100,7 @@ impl ScriptHost {
                     return Ok(Value::Nil);
                 };
                 // Spawn-param properties replace the class defaults wholesale.
-                let inst = Self::init_instance_with(lua, &c, cls, id, &class, None, None)?;
+                let inst = Self::init_instance_with(lua, &c, cls, id, &class, None, None, None)?;
                 if let Value::Table(p) = params.get::<Value>("properties")? {
                     let _ = p; // applied below before init would need re-init; CE merges first.
                 }

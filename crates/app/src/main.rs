@@ -5,6 +5,7 @@
 //!   `sod-native <game> play`             third-person, controllable survivor
 //!   `sod-native <game> <model.cgf|.chr>` single asset
 
+mod cry_bridge;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
@@ -785,6 +786,8 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         app.insert_resource(t);
     }
     if play {
+        app.add_plugins(cry_bridge::CryPlugin { game_dir: game.to_string(), spawn: start_cry });
+        app.add_systems(Update, cry_sync_player);
         app.insert_resource(player_state);
         app.insert_resource(game_state);
         app.add_systems(Update, (
@@ -1337,6 +1340,9 @@ fn move_player(
     let input = sod_core::class3_move::MoveInput { forward: fwd_l, strafe: strafe_l, mouse_dx: 0.0, mouse_dy: 0.0, crouch, sprint, dt };
     let ground = |x: f32, y: f32| height_at(&world.terrain, x, y);
     sod_core::class3_move::update_normal(&mut player.mstate, &input, &t, &ground, &[]);
+    if std::env::var("SOD_DEBUG").is_ok() {
+        eprintln!("[dbg] move pos={:?} vel={:?} grounded={}", player.mstate.pos, player.mstate.vel, player.mstate.grounded);
+    }
     player.pos = [player.mstate.pos[0], player.mstate.pos[1]];
     player.yaw = player.mstate.yaw;
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();
@@ -1447,6 +1453,9 @@ fn follow_camera(
         Some(mut l) => l.0.step(cs.0.pos, cs.0.yaw, cs.0.pitch, 12.0, time.delta_secs()).0,
         None => cs.0.pos,
     };
+    if std::env::var("SOD_DEBUG").is_ok() {
+        eprintln!("[dbg] ppos={:?} yaw={:.3} cam_state.pos={:?} lagpos={:?} target={:?}", player.mstate.pos, cs.0.yaw, cs.0.pos, cam_pos, target);
+    }
     let base_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let pos = base_rot * Vec3::new(cam_pos[0], cam_pos[1], cam_pos[2]);
     let tgt = base_rot * Vec3::new(target[0], target[1], target[2]);
@@ -2013,4 +2022,15 @@ fn hud_update(
             None => node.display = Display::None,
         }
     }
+}
+
+/// Feed the controlled player's CryEngine-space position to the script host.
+fn cry_sync_player(
+    player: Option<Res<Player>>,
+    world: Res<World>,
+    out: Option<ResMut<cry_bridge::CryPlayerPos>>,
+) {
+    let (Some(player), Some(mut out)) = (player, out) else { return };
+    let [x, y] = player.pos;
+    out.0 = Some([x, y, height_at(&world.terrain, x, y)]);
 }

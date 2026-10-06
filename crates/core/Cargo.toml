@@ -1,0 +1,15 @@
+[package]
+name = "sod-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+flate2 = "1"
+quick-xml = "0.37"
+mlua = { version = "0.12", features = ["lua51", "vendored"] }
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"

@@ -1,0 +1,32 @@
+[package]
+name = "sod-native"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sod-core = { path = "../core" }
+anyhow.workspace = true
+log.workspace = true
+
+[dependencies.bevy]
+version = "0.19"
+default-features = false
+features = [
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_pbr",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_text",
+    "default_font",
+    "x11",
+    "wayland",
+    "dds",
+    "png",
+    "multi_threaded",
+]

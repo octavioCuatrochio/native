@@ -256,6 +256,11 @@ struct MenuItem {
     index: usize,
 }
 
+/// Marks the single top-level menu root; despawning it removes the whole menu
+/// (children are despawned recursively, so they must not be despawned again).
+#[derive(Component)]
+struct MenuRoot;
+
 /// The game's own UI font (`gamedata/fonts/veramono.ttf`), read from the paks.
 #[derive(Resource)]
 struct MenuFont(pub Vec<u8>);
@@ -285,7 +290,7 @@ fn auto_screenshot(
     mut commands: Commands,
     mut plan: ResMut<ShotPlan>,
     menu: Option<ResMut<MenuRes>>,
-    ui: Query<Entity, With<MenuUi>>,
+    ui: Query<Entity, With<MenuRoot>>,
 ) {
     let Some(path) = plan.path.clone() else { return };
     plan.frame += 1;
@@ -762,14 +767,18 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     };
 
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "sod-native — State of Decay: YOSE".into(),
-            resolution: (1280u32, 720u32).into(),
+    app.add_plugins(DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "sod-native — State of Decay: YOSE".into(),
+                resolution: (1280u32, 720u32).into(),
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }))
+        })
+        // Compile the scene's render pipelines synchronously so the first
+        // timed screenshots draw the world instead of an empty sky.
+        .set(bevy::render::RenderPlugin { synchronous_pipeline_compilation: true, ..default() }))
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
     .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
@@ -977,7 +986,9 @@ fn setup_world(
         }
         let mut parts = Vec::new();
         let yaw = ps.yaw;
-        let rot = base.rotation * Quat::from_rotation_z(yaw);
+        // Match `move_player`: the assembled model's forward is local +Y, so the
+        // render transform needs the `render_yaw` (-π/2) correction from spawn.
+        let rot = base.rotation * Quat::from_rotation_z(sod_core::class3_move::render_yaw(yaw));
         let tf0 = Transform { translation: base.rotation * Vec3::new(ps.spawn[0], ps.spawn[1], ps.spawn[2]), rotation: rot, scale: Vec3::ONE };
         commands.spawn((tf0, Visibility::default(), PlayerRoot)).with_children(|parent| {
             for (mi, m) in ps.model.meshes.iter().enumerate() {
@@ -1191,6 +1202,7 @@ fn setup_world(
                 },
                 BackgroundColor(Color::srgba(0.012, 0.016, 0.024, 0.88)),
                 MenuUi,
+                MenuRoot,
             ))
             .with_children(|p| {
                 if let Some(logo) = &logo_h {
@@ -1254,7 +1266,7 @@ fn menu_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut menu: ResMut<MenuRes>,
     mut commands: Commands,
-    q: Query<Entity, With<MenuUi>>,
+    q: Query<Entity, With<MenuRoot>>,
     mut items: Query<(&MenuItem, &mut TextColor)>,
 ) {
     if !menu.active {
@@ -1340,9 +1352,6 @@ fn move_player(
     let input = sod_core::class3_move::MoveInput { forward: fwd_l, strafe: strafe_l, mouse_dx: 0.0, mouse_dy: 0.0, crouch, sprint, dt };
     let ground = |x: f32, y: f32| height_at(&world.terrain, x, y);
     sod_core::class3_move::update_normal(&mut player.mstate, &input, &t, &ground, &[]);
-    if std::env::var("SOD_DEBUG").is_ok() {
-        eprintln!("[dbg] move pos={:?} vel={:?} grounded={}", player.mstate.pos, player.mstate.vel, player.mstate.grounded);
-    }
     player.pos = [player.mstate.pos[0], player.mstate.pos[1]];
     player.yaw = player.mstate.yaw;
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();
@@ -1453,9 +1462,6 @@ fn follow_camera(
         Some(mut l) => l.0.step(cs.0.pos, cs.0.yaw, cs.0.pitch, 12.0, time.delta_secs()).0,
         None => cs.0.pos,
     };
-    if std::env::var("SOD_DEBUG").is_ok() {
-        eprintln!("[dbg] ppos={:?} yaw={:.3} cam_state.pos={:?} lagpos={:?} target={:?}", player.mstate.pos, cs.0.yaw, cs.0.pos, cam_pos, target);
-    }
     let base_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let pos = base_rot * Vec3::new(cam_pos[0], cam_pos[1], cam_pos[2]);
     let tgt = base_rot * Vec3::new(target[0], target[1], target[2]);

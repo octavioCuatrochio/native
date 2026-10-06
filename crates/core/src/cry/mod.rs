@@ -8,6 +8,7 @@ pub mod binds_system;
 pub mod constants;
 pub mod host;
 pub mod mission;
+pub mod render;
 pub mod world;
 
 pub use host::{Ctx, ScriptHost};

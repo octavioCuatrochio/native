@@ -43,6 +43,27 @@ impl PropNode {
     }
 }
 
+/// Area volume carried by `AreaShape`/`AreaBox`/`AreaSphere`/... entities.
+/// Geometry is in the owning entity's local space.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AreaGeom {
+    Box { min: [f32; 3], max: [f32; 3] },
+    Sphere { center: [f32; 3], radius: f32 },
+    /// Closed polygon (local XY) extruded upward by `height` (0 = unbounded).
+    Shape { points: Vec<[f32; 3]>, height: f32 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelArea {
+    pub area_id: i32,
+    pub group: i32,
+    pub priority: i32,
+    pub proximity: f32,
+    pub geom: AreaGeom,
+    /// Entity ids that receive `OnEnterArea`/`OnLeaveArea`.
+    pub targets: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelEntity {
     pub id: u32,
@@ -57,6 +78,7 @@ pub struct LevelEntity {
     pub attrs: Vec<(String, String)>,
     pub properties: Option<PropNode>,
     pub properties_instance: Option<PropNode>,
+    pub area: Option<LevelArea>,
 }
 
 impl LevelEntity {
@@ -105,8 +127,40 @@ fn entity_header(e: &BytesStart) -> LevelEntity {
         scale: floats(get("Scale"), [1.0; 3]),
         properties: None,
         properties_instance: None,
+        area: None,
         attrs,
     }
+}
+
+fn area_from(n: &PropNode) -> Option<LevelArea> {
+    let f = |k: &str| n.attr(k).and_then(|v| v.trim().parse::<f32>().ok());
+    let v3 = |k: &str| n.attr(k).map(|v| floats(Some(v), [0.0; 3]));
+    let geom = if let (Some(min), Some(max)) = (v3("BoxMin"), v3("BoxMax")) {
+        AreaGeom::Box { min, max }
+    } else if let Some(radius) = f("SphereRadius") {
+        AreaGeom::Sphere { center: v3("SphereCenter").unwrap_or([0.0; 3]), radius }
+    } else {
+        let points: Vec<[f32; 3]> = n
+            .child("Points")
+            .map(|p| p.children.iter().map(|(_, pt)| floats(pt.attr("Pos"), [0.0; 3])).collect())
+            .unwrap_or_default();
+        if points.len() < 3 {
+            return None;
+        }
+        AreaGeom::Shape { points, height: f("Height").unwrap_or(0.0) }
+    };
+    let targets = n
+        .child("Entities")
+        .map(|e| e.children.iter().filter_map(|(_, c)| c.attr("Id")?.parse().ok()).collect())
+        .unwrap_or_default();
+    Some(LevelArea {
+        area_id: f("Id").unwrap_or(-1.0) as i32,
+        group: f("Group").unwrap_or(-1.0) as i32,
+        priority: f("Priority").unwrap_or(0.0) as i32,
+        proximity: f("Proximity").unwrap_or(0.0),
+        geom,
+        targets,
+    })
 }
 
 /// All `<Entity>` elements directly under `<Objects>`, in document order.
@@ -127,6 +181,7 @@ pub fn parse_level_entities(xml: &[u8]) -> Vec<LevelEntity> {
             match tag.as_str() {
                 "Properties" => e.properties = Some(node),
                 "PropertiesInstance" => e.properties_instance = Some(node),
+                "Area" => e.area = area_from(&node),
                 _ => {}
             }
         }
@@ -147,7 +202,7 @@ pub fn parse_level_entities(xml: &[u8]) -> Vec<LevelEntity> {
                     && (!props.is_empty()
                         || (stack.len() >= 2
                             && stack[stack.len() - 1] == b"Entity"
-                            && (name == b"Properties" || name == b"PropertiesInstance")))
+                            && (name == b"Properties" || name == b"PropertiesInstance" || name == b"Area")))
                 {
                     props.push((String::from_utf8_lossy(&name).to_string(), PropNode::from_start(&e)));
                 }
@@ -160,7 +215,7 @@ pub fn parse_level_entities(xml: &[u8]) -> Vec<LevelEntity> {
                     out.push(entity_header(&e));
                 } else if cur.is_some()
                     && (!props.is_empty()
-                        || (parent == Some(b"Entity") && (name == b"Properties" || name == b"PropertiesInstance")))
+                        || (parent == Some(b"Entity") && (name == b"Properties" || name == b"PropertiesInstance" || name == b"Area")))
                 {
                     props.push((String::from_utf8_lossy(&name).to_string(), PropNode::from_start(&e)));
                     close_prop(&mut cur, &mut props);
@@ -194,12 +249,22 @@ mod tests {
     <Physics bRigidBody="1" Mass="-1"><Simulation damping="0"/></Physics>
    </Properties>
   </Entity>
+  <Entity Name="amb" Pos="10,10,0" EntityClass="AreaShape" EntityId="7">
+   <Area Id="1" Group="1" Proximity="0" Priority="200" Height="11.2">
+    <Points><Point Pos="0,0,0"/><Point Pos="5,0,0"/><Point Pos="5,5,0"/></Points>
+    <Entities><Entity Id="4126"/><Entity Id="4423"/></Entities>
+   </Area>
+  </Entity>
 </Objects></Mission>"#;
 
     #[test]
     fn parses_entities_with_nested_properties() {
         let v = parse_level_entities(XML.as_bytes());
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
+        let a = v[2].area.as_ref().expect("area");
+        assert_eq!(a.targets, vec![4126, 4423]);
+        assert_eq!(a.priority, 200);
+        assert!(matches!(&a.geom, AreaGeom::Shape { points, height } if points.len() == 3 && (*height - 11.2).abs() < 1e-5));
         assert_eq!(v[0].id, 1092);
         assert_eq!(v[0].layer.as_deref(), Some("RTS"));
         let s = &v[1];

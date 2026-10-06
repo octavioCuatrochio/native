@@ -119,6 +119,8 @@ pub struct Ctx {
     pub loaded_scripts: Rc<RefCell<HashSet<String>>>,
     /// CVars (`System.GetCVar`/`SetCVar`), seeded from the shipped configs.
     pub cvars: Rc<RefCell<HashMap<String, String>>>,
+    /// Engine events delivered to a script handler, by event name.
+    pub delivered: Rc<RefCell<BTreeMap<String, u64>>>,
     /// Echo `System.Log` output to stdout.
     pub echo_log: bool,
 }
@@ -467,9 +469,58 @@ pub const NAMESPACES: &[&str] = &[
 /// One `<Entity>` from a mission/level file (see [`super::mission`]).
 pub use super::mission::LevelEntity;
 
+/// A live area volume (CryEngine `IAreaManager` entry).
+pub struct AreaRt {
+    pub owner: EntityId,
+    pub area: super::mission::LevelArea,
+    /// Listener entities currently inside (after group exclusivity).
+    pub inside: HashSet<EntityId>,
+}
+
+impl AreaRt {
+    /// Raw containment of a world point, in the owner's local space.
+    pub fn contains(&self, w: &EntityWorld, p: [f32; 3]) -> bool {
+        use super::mission::AreaGeom;
+        let Some(o) = w.get(self.owner) else { return false };
+        let op = w.world_pos(self.owner);
+        let inv = [-o.rot[0], -o.rot[1], -o.rot[2], o.rot[3]];
+        let d = super::world::quat_rotate(inv, [p[0] - op[0], p[1] - op[1], p[2] - op[2]]);
+        let l = [d[0] / o.scale[0].max(1e-6), d[1] / o.scale[1].max(1e-6), d[2] / o.scale[2].max(1e-6)];
+        match &self.area.geom {
+            AreaGeom::Box { min, max } => (0..3).all(|i| l[i] >= min[i] && l[i] <= max[i]),
+            AreaGeom::Sphere { center, radius } => {
+                super::world::dist2(l, *center) <= radius * radius
+            }
+            AreaGeom::Shape { points, height } => {
+                let zmin = points.iter().map(|q| q[2]).fold(f32::INFINITY, f32::min);
+                if *height > 0.0 && (l[2] < zmin || l[2] > zmin + height) {
+                    return false;
+                }
+                // Even-odd point-in-polygon on XY.
+                let mut inside = false;
+                let n = points.len();
+                let mut j = n - 1;
+                for i in 0..n {
+                    let (a, b) = (points[i], points[j]);
+                    if (a[1] > l[1]) != (b[1] > l[1])
+                        && l[0] < (b[0] - a[0]) * (l[1] - a[1]) / (b[1] - a[1]) + a[0]
+                    {
+                        inside = !inside;
+                    }
+                    j = i;
+                }
+                inside
+            }
+        }
+    }
+}
+
 pub struct ScriptHost {
     pub lua: Lua,
     pub ctx: Ctx,
+    pub areas: RefCell<Vec<AreaRt>>,
+    /// Entities that trigger areas (the player; later vehicles/NPCs).
+    pub area_listeners: RefCell<Vec<EntityId>>,
     /// Lower-cased class name -> script path (`.ent` registry).
     pub class_scripts: HashMap<String, (String, Option<String>)>,
 }
@@ -486,6 +537,7 @@ impl ScriptHost {
             errors: Default::default(),
             loaded_scripts: Default::default(),
             cvars: Default::default(),
+            delivered: Default::default(),
             echo_log: std::env::var("SOD_LUA_LOG").is_ok(),
         };
 
@@ -519,7 +571,13 @@ impl ScriptHost {
             f.call::<()>(*ns)?;
         }
 
-        let mut host = ScriptHost { lua, ctx, class_scripts: HashMap::new() };
+        let mut host = ScriptHost {
+            lua,
+            ctx,
+            areas: RefCell::new(Vec::new()),
+            area_listeners: RefCell::new(Vec::new()),
+            class_scripts: HashMap::new(),
+        };
         host.install_script_binds()?;
         host.install_entity_system_binds()?;
         super::binds_system::install(&host.lua, &host.ctx)?;
@@ -623,6 +681,9 @@ impl ScriptHost {
         data.guid = le.guid.clone();
         data.layer = le.layer.clone();
         let id = self.ctx.world.borrow_mut().insert(data);
+        if let Some(area) = &le.area {
+            self.areas.borrow_mut().push(AreaRt { owner: id, area: area.clone(), inside: HashSet::new() });
+        }
 
         let Some(cls) = self.class_table(&le.class)? else { return Ok(id) };
         let xml = le.properties.as_ref().map(|p| p.to_lua(&self.lua)).transpose()?;
@@ -670,6 +731,7 @@ impl ScriptHost {
     /// Dispatch an engine event to one entity (`Server`/`Client` per state).
     pub fn event(&self, id: EntityId, ev: &str, args: impl mlua::IntoLuaMulti) -> Result<()> {
         let Some(inst) = self.ctx.instance(id) else { return Ok(()) };
+        *self.ctx.delivered.borrow_mut().entry(ev.to_string()).or_default() += 1;
         let f: Function = self.lua.globals().get("__host_event")?;
         let mut mv = args.into_lua_multi(&self.lua)?;
         mv.push_front(Value::String(self.lua.create_string(ev)?));
@@ -720,6 +782,7 @@ impl ScriptHost {
                 }
             }
         }
+        self.update_areas()?;
         let active: Vec<EntityId> =
             self.ctx.world.borrow().entities.values().filter(|e| e.active && !e.removed).map(|e| e.id).collect();
         for id in active {
@@ -732,6 +795,96 @@ impl ScriptHost {
             self.ctx.timers.borrow_mut().kill_all_entity(id);
         }
         self.ctx.world.borrow_mut().flush_removed();
+        Ok(())
+    }
+
+    /// Spawn a scripted entity outside the level file (actors such as the
+    /// player, whose class the game module registers with a fixed script).
+    pub fn spawn_scripted(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3]) -> Result<EntityId> {
+        self.class_scripts
+            .entry(class.to_ascii_lowercase())
+            .or_insert_with(|| (class.to_string(), Some(script.to_string())));
+        let le = LevelEntity {
+            id: 0,
+            name: name.to_string(),
+            class: class.to_string(),
+            guid: None,
+            layer: None,
+            pos,
+            rot: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            attrs: Vec::new(),
+            properties: None,
+            properties_instance: None,
+            area: None,
+        };
+        self.spawn_level_entity(&le)
+    }
+
+    /// Register an entity whose movement triggers areas.
+    pub fn add_area_listener(&self, id: EntityId) {
+        let mut l = self.area_listeners.borrow_mut();
+        if !l.contains(&id) {
+            l.push(id);
+        }
+    }
+
+    /// Area enter/leave: within one group (> 0) only the highest-priority
+    /// containing area counts, as the CryEngine area manager does.
+    /// Linked entities get `OnEnterArea(entity, areaId)`,
+    /// `OnProceedFadeArea(entity, areaId, fade)` each frame while inside, and
+    /// `OnLeaveArea(entity, areaId)`.
+    pub fn update_areas(&self) -> Result<()> {
+        let listeners = self.area_listeners.borrow().clone();
+        let mut events: Vec<(Vec<u32>, &'static str, EntityId, i32)> = Vec::new();
+        {
+            let w = self.ctx.world.borrow();
+            let mut areas = self.areas.borrow_mut();
+            for &l in &listeners {
+                let Some(_) = w.get(l) else { continue };
+                let p = w.world_pos(l);
+                let raw: Vec<bool> = areas.iter().map(|a| a.contains(&w, p)).collect();
+                // Best priority per group among containing areas.
+                let mut best: HashMap<i32, i32> = HashMap::new();
+                for (a, &r) in areas.iter().zip(&raw) {
+                    if r && a.area.group > 0 {
+                        let e = best.entry(a.area.group).or_insert(i32::MIN);
+                        *e = (*e).max(a.area.priority);
+                    }
+                }
+                for (a, &r) in areas.iter_mut().zip(&raw) {
+                    let now = r && (a.area.group <= 0 || best.get(&a.area.group) == Some(&a.area.priority));
+                    let was = a.inside.contains(&l);
+                    let ev = match (was, now) {
+                        (false, true) => {
+                            a.inside.insert(l);
+                            Some("OnEnterArea")
+                        }
+                        (true, false) => {
+                            a.inside.remove(&l);
+                            Some("OnLeaveArea")
+                        }
+                        (true, true) => Some("OnProceedFadeArea"),
+                        _ => None,
+                    };
+                    if let Some(ev) = ev {
+                        if !a.area.targets.is_empty() {
+                            events.push((a.area.targets.clone(), ev, l, a.area.area_id));
+                        }
+                    }
+                }
+            }
+        }
+        for (targets, ev, l, area_id) in events {
+            let Some(who) = self.ctx.instance(l) else { continue };
+            for t in targets {
+                if ev == "OnProceedFadeArea" {
+                    self.event(t, ev, (who.clone(), area_id, 1.0f64))?;
+                } else {
+                    self.event(t, ev, (who.clone(), area_id))?;
+                }
+            }
+        }
         Ok(())
     }
 

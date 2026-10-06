@@ -39,7 +39,7 @@ fn main() {
     }
     let vfs = Rc::new(vfs);
 
-    let host = ScriptHost::new(vfs.clone()).expect("script host");
+    let mut host = ScriptHost::new(vfs.clone()).expect("script host");
     host.boot().expect("boot");
     println!("[boot] scripts loaded: {}  errors: {}", host.ctx.loaded_scripts.borrow().len(), host.ctx.errors.borrow().len());
 
@@ -63,11 +63,31 @@ fn main() {
     }
 
     let errs_at_spawn = host.ctx.errors.borrow().len();
+
+    // The player actor at the tutorial start point, walking east at run speed
+    // so area volumes along the way fire enter/leave events.
+    let start = [3246.8f32, 3256.2, 217.1];
+    let player = host
+        .spawn_scripted("Player", "scripts/entities/actor/player.lua", "Dev", start)
+        .expect("spawn player");
+    host.add_area_listener(player);
+    println!("[player] id {player} instance={}", host.ctx.instance(player).is_some());
+
     let dt = 1.0 / 30.0;
     let frames = (seconds / dt) as usize;
-    for _ in 0..frames {
+    for f in 0..frames {
+        let t = f as f32 * dt;
+        host.ctx.world.borrow_mut().set_pos(player, [start[0] + 4.0 * t, start[1], start[2]]);
         host.update(dt).expect("update");
     }
+    let mut areas_entered = 0;
+    for a in host.areas.borrow().iter() {
+        if a.inside.contains(&player) {
+            areas_entered += 1;
+        }
+    }
+    println!("[areas] {} volumes, player inside {areas_entered} at end", host.areas.borrow().len());
+    println!("[events] delivered: {:?}", host.ctx.delivered.borrow());
 
     let w = host.ctx.world.borrow();
     let active = w.entities.values().filter(|e| e.active).count();

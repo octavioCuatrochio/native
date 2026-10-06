@@ -72,12 +72,6 @@ pub const AIM_ACCEL_TIME_YAW: f32 = 0.4;
 /// `cl_cam_aim_rotation_acceleration_time_pitch` (live `0.6`).
 pub const AIM_ACCEL_TIME_PITCH: f32 = 0.6;
 
-/// Legacy values carried by `tuning::default_camera()` before the exe defaults
-/// were recovered (`camera.md` §3.1 note). Used only to substitute the recovered
-/// defaults; explicit non-legacy overrides pass through untouched.
-const LEGACY_ROTATION_SPEED: f32 = 0.04;
-const LEGACY_ACCEL_TIME_YAW: f32 = 0.3;
-const LEGACY_ACCEL_TIME_PITCH: f32 = 0.6;
 
 /// Boom defaults mirror `follow_camera` (`-fwd * 5.0 + up * 2.6`).
 const DEFAULT_BOOM_DISTANCE: f32 = 5.0;
@@ -228,35 +222,36 @@ pub fn update_mode(
     } else {
         0.0
     };
-    let dx = sane(input.mouse_dx);
-    let dy = sane(input.mouse_dy);
+    let _ = t;
 
-    // Mouse displacement -> desired angular velocity (rad/s). Sensitivity is
-    // normalised against the shipped 45 so the option scales linearly.
-    let sens = if t.sensitivity.is_finite() && t.sensitivity > 0.0 {
-        t.sensitivity / BASE_SENSITIVITY
+    // Device input -> camera input value in -1..=1 (the player-input object's
+    // `+0xd8/+0xdc`, read by the camera through `0x1487870`).
+    let mouse = [sane(input.mouse_dx), sane(input.mouse_dy)];
+    let (v, device_scale) = if mouse != [0.0, 0.0] {
+        // Mouse (rotate action handler `0x1588ee0`): raw counts this frame
+        // times `0.01 + 0.025*s`, clamped to +-1; device scale `1 + 6*s`
+        // (`0x150ea1c`). s = 0.5 live.
+        let k = mouse_count_scale(MOUSE_SENSITIVITY_NORM);
+        (
+            [(mouse[0] * k).clamp(-1.0, 1.0), (mouse[1] * k).clamp(-1.0, 1.0)],
+            1.0 + MOUSE_DEVICE_SCALE_PER_SENS * MOUSE_SENSITIVITY_NORM,
+        )
     } else {
-        1.0
+        // Right stick: shaped deflection (fitted curve, see `STICK_RESPONSE`).
+        let [sx, sy] = [sane(input.stick[0]).clamp(-1.0, 1.0), sane(input.stick[1]).clamp(-1.0, 1.0)];
+        ([sx.signum() * stick_response(sx.abs()), sy.signum() * stick_response(sy.abs())], STICK_DEVICE_SCALE)
     };
-    let speed_yaw = resolve_rotation_speed(t.yaw_speed);
-    let speed_pitch = resolve_rotation_speed(t.pitch_speed);
-    let inv_dt = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-    // UNVERIFIED gain: retail captures show a per-frame dead zone (<= 4
-    // counts -> no rotation) and a per-frame cap (~9.4 deg for any single
-    // event of 100+ counts) whose exact rule is not yet recovered
-    // (`notes/telemetry/README.md`). Only the immediacy below is confirmed.
-    let want_yaw = dx * speed_yaw * MOUSE_YAW_SCALE * sens * inv_dt;
-    let want_pitch = dy * speed_pitch * MOUSE_PITCH_SCALE * sens * inv_dt;
 
-    // Input is applied immediately: retail captures show no acceleration ramp
-    // or smoothing for either device (a single mouse event lands within one
-    // frame; full stick is at full rate from the first sample and stops on
-    // release). `notes/telemetry/cam_mouse_flat.csv`, `cam_stick_fine.csv`.
-    let [sx, sy] = [sane(input.stick[0]).clamp(-1.0, 1.0), sane(input.stick[1]).clamp(-1.0, 1.0)];
-    let stick_yaw = sx.signum() * stick_response(sx.abs()) * STICK_YAW_RATE_MAX;
-    let stick_pitch = sy.signum() * stick_response(sy.abs()) * STICK_PITCH_RATE_MAX;
-    state.yaw_vel = want_yaw + stick_yaw;
-    state.pitch_vel = want_pitch + stick_pitch;
+    // Camera rotation (third-person update `0x15ea59c`): only when either
+    // axis exceeds the dead zone, then `speed * value * dt * device_scale`,
+    // applied immediately (no ramp or smoothing).
+    if v[0].abs() > CAM_INPUT_DEADZONE || v[1].abs() > CAM_INPUT_DEADZONE {
+        state.yaw_vel = CAM_YAW_SPEED * v[0] * device_scale;
+        state.pitch_vel = CAM_PITCH_SPEED * v[1] * device_scale;
+    } else {
+        state.yaw_vel = 0.0;
+        state.pitch_vel = 0.0;
+    }
 
     state.yaw = sane(state.yaw) + state.yaw_vel * dt;
     state.pitch = sane(state.pitch) + state.pitch_vel * dt;
@@ -555,12 +550,29 @@ pub enum CameraSet {
     Aim,
 }
 
-/// Right-stick yaw rate at full deflection (rad/s): 90.1 °/s measured
-/// (`notes/telemetry/cam_stick_fine.csv`, both directions).
-pub const STICK_YAW_RATE_MAX: f32 = 90.1 * std::f32::consts::PI / 180.0;
-/// Right-stick pitch rate at full deflection (rad/s): 84.1 °/s down / 77.9 °/s
-/// up measured; the mean is used until the asymmetry is explained.
-pub const STICK_PITCH_RATE_MAX: f32 = 81.0 * std::f32::consts::PI / 180.0;
+/// Camera yaw speed per unit input (rad/s), camera spec `+0x20` read live
+/// at the rotation site `0x15ea59c`: pi/2.
+pub const CAM_YAW_SPEED: f32 = std::f32::consts::FRAC_PI_2;
+/// Camera pitch speed per unit input (rad/s), camera spec `+0x1c`: 80 deg.
+pub const CAM_PITCH_SPEED: f32 = 1.396_263_4;
+/// Per-axis input dead zone at the rotation site (`0x171e200`).
+pub const CAM_INPUT_DEADZONE: f32 = 0.05;
+/// Mouse counts -> input value: `MOUSE_COUNT_BASE + MOUSE_COUNT_PER_SENS * s`
+/// (`0x171e1f8`, `0x17876fc`, handler `0x1588ee0`).
+pub const MOUSE_COUNT_BASE: f32 = 0.01;
+pub const MOUSE_COUNT_PER_SENS: f32 = 0.025;
+/// Normalised mouse sensitivity `s` (camera spec `+0x50`, 0.5 live with the
+/// default options). The mapping from the options menu is not recovered.
+pub const MOUSE_SENSITIVITY_NORM: f32 = 0.5;
+/// Mouse device scale `1 + MOUSE_DEVICE_SCALE_PER_SENS * s` (`0x172b108`).
+pub const MOUSE_DEVICE_SCALE_PER_SENS: f32 = 6.0;
+/// Stick device scale (option value read live as 1.0).
+pub const STICK_DEVICE_SCALE: f32 = 1.0;
+
+/// Input value per mouse count for a normalised sensitivity.
+pub fn mouse_count_scale(s: f32) -> f32 {
+    MOUSE_COUNT_BASE + MOUSE_COUNT_PER_SENS * sane(s)
+}
 
 /// Measured right-stick response `(|deflection|, fraction of max rate)`.
 ///
@@ -1246,19 +1258,6 @@ pub fn apply_invert(dx: f32, dy: f32, flags: InvertFlags) -> (f32, f32) {
 // internals
 // ---------------------------------------------------------------------------
 
-/// Effective `cl_cam_rotation_speed`: substitute the recovered exe default for
-/// the legacy profile value, honour everything else.
-#[inline]
-fn resolve_rotation_speed(v: f32) -> f32 {
-    if !v.is_finite() {
-        CAM_ROTATION_SPEED
-    } else if (v - LEGACY_ROTATION_SPEED).abs() < 1e-6 {
-        CAM_ROTATION_SPEED
-    } else {
-        v
-    }
-}
-
 /// Slab test on the segment `o -> o + d` (parameter in `[0, 1]`).
 fn segment_hit(o: [f32; 3], d: [f32; 3], b: &physics::Aabb) -> Option<f32> {
     let mut t0 = 0.0f32;
@@ -1406,10 +1405,10 @@ mod tests {
         assert_eq!(stick_response(0.65), 0.0);
         let cases = [(0.70, 6.85), (0.75, 11.9), (0.80, 19.9), (0.85, 30.3), (0.90, 45.6), (0.95, 65.4), (1.0, 90.1)];
         for (m, expect) in cases {
-            let got = deg(stick_response(m) * STICK_YAW_RATE_MAX);
+            let got = deg(stick_response(m) * CAM_YAW_SPEED);
             assert!((got - expect).abs() < 0.5, "yaw at {m}: {got} vs {expect}");
         }
-        let pitch85 = deg(stick_response(0.85) * STICK_PITCH_RATE_MAX);
+        let pitch85 = deg(stick_response(0.85) * CAM_PITCH_SPEED);
         assert!((pitch85 - 27.1).abs() < 1.0, "pitch at 0.85: {pitch85}");
 
         // One second of full right stick turns the camera by the full rate,
@@ -1420,7 +1419,7 @@ mod tests {
         for _ in 0..60 {
             update(&mut s, &full, &t, [0.0; 3]);
         }
-        assert!((s.yaw - STICK_YAW_RATE_MAX).abs() < 1e-3, "yaw after 1 s {}", s.yaw);
+        assert!((s.yaw - CAM_YAW_SPEED).abs() < 1e-3, "yaw after 1 s {}", s.yaw);
         update(&mut s, &idle(false), &t, [0.0; 3]);
         assert_eq!(s.yaw_vel, 0.0);
         let mut l = CameraState::new();
@@ -1428,89 +1427,52 @@ mod tests {
         assert!(l.yaw_vel < 0.0, "left stick turns the other way");
     }
 
-    /// Recovered tuning: `cl_cam_rotation_speed 0.2`, mouse scales `0.5/0.75`,
-    /// accel times `0.5/0.4`.
-    fn recovered_tuning() -> tuning::CameraTuning {
-        tuning::CameraTuning {
-            yaw_speed: CAM_ROTATION_SPEED,
-            pitch_speed: CAM_ROTATION_SPEED,
-            accel_time_yaw: ACCEL_TIME_YAW,
-            accel_time_pitch: ACCEL_TIME_PITCH,
-            sensitivity: BASE_SENSITIVITY,
-        }
-    }
-
-    /// First-frame angular velocity from rest (applied immediately).
-    fn expected_first_frame(dt: f32, dx: f32, dy: f32) -> (f32, f32) {
-        let inv = 1.0 / dt;
+    /// Expected mouse angular velocity for `(dx, dy)` counts in one frame.
+    fn expected_mouse(dx: f32, dy: f32) -> (f32, f32) {
+        let k = mouse_count_scale(MOUSE_SENSITIVITY_NORM);
+        let z = 1.0 + MOUSE_DEVICE_SCALE_PER_SENS * MOUSE_SENSITIVITY_NORM;
         (
-            dx * CAM_ROTATION_SPEED * MOUSE_YAW_SCALE * inv,
-            dy * CAM_ROTATION_SPEED * MOUSE_PITCH_SCALE * inv,
+            CAM_YAW_SPEED * (dx * k).clamp(-1.0, 1.0) * z,
+            CAM_PITCH_SPEED * (dy * k).clamp(-1.0, 1.0) * z,
         )
     }
 
-    /// The recovered `cl_cam_rotation_speed` / mouse scales / acceleration times
-    /// drive the first frame exactly.
+    /// Values read live at the rotation site with the virtual mouse
+    /// (`notes/telemetry/README.md`): 8 counts/frame -> input 0.18, device
+    /// scale 4, yaw speed pi/2; 16 -> 0.36; >= 45 counts saturate at 1.
     #[test]
-    fn recovered_angular_constants_drive_the_model() {
-        let t = recovered_tuning();
-        let dt = 1.0 / 60.0;
-        let inp = CameraInput { mouse_dx: 10.0, mouse_dy: 10.0, dt, ..Default::default() };
-        let mut s = CameraState::new();
-        update(&mut s, &inp, &t, [0.0; 3]);
+    fn mouse_matches_live_rotation_factors() {
+        let k = mouse_count_scale(MOUSE_SENSITIVITY_NORM);
+        assert!((k - 0.0225).abs() < 1e-7);
+        assert!(((8.0 * k) - 0.18).abs() < 1e-6 && ((16.0 * k) - 0.36).abs() < 1e-6);
+        assert_eq!(1.0 + MOUSE_DEVICE_SCALE_PER_SENS * MOUSE_SENSITIVITY_NORM, 4.0);
 
-        let (expect_yaw, expect_pitch) = expected_first_frame(dt, 10.0, 10.0);
-        assert!(
-            (s.yaw_vel - expect_yaw).abs() < 1e-3,
-            "yaw_vel {} vs {}",
-            s.yaw_vel,
-            expect_yaw
-        );
-        assert!(
-            (s.pitch_vel - expect_pitch).abs() < 1e-3,
-            "pitch_vel {} vs {}",
-            s.pitch_vel,
-            expect_pitch
-        );
-        // Equal deltas: pitch/yaw follow the mouse scales (0.75 / 0.5).
-        assert!((s.pitch_vel / s.yaw_vel - 1.5).abs() < 1e-4, "{} vs {}", s.yaw_vel, s.pitch_vel);
-
-        assert_eq!(ACCEL_TIME_YAW, 0.3);
-        assert_eq!(ACCEL_TIME_PITCH, 0.6);
-        assert_eq!(CAM_ROTATION_SPEED, 0.04);
-        assert_eq!(MOUSE_YAW_SCALE, 0.5);
-        assert_eq!(MOUSE_PITCH_SCALE, 0.75);
+        let t = t();
+        for (dx, dy) in [(8.0, 0.0), (16.0, -16.0), (100.0, 0.0), (400.0, 0.0)] {
+            let mut s = CameraState::new();
+            update(&mut s, &CameraInput { mouse_dx: dx, mouse_dy: dy, ..idle(false) }, &t, [0.0; 3]);
+            let (ey, ep) = expected_mouse(dx, dy);
+            assert!((s.yaw_vel - ey).abs() < 1e-5, "{dx}: {} vs {ey}", s.yaw_vel);
+            assert!((s.pitch_vel - ep).abs() < 1e-5, "{dy}: {} vs {ep}", s.pitch_vel);
+        }
+        // 100 and 400 counts both saturate: identical rotation (the cap).
+        let (a, _) = expected_mouse(100.0, 0.0);
+        let (b, _) = expected_mouse(400.0, 0.0);
+        assert_eq!(a, b);
+        // A 50 fps frame at saturation turns 2*pi*0.02 rad (~7.2 deg).
+        assert!((a * 0.02 - std::f32::consts::TAU * 0.02).abs() < 1e-5);
     }
 
-    /// The legacy profile values still present in `tuning::default_camera()`
-    /// are upgraded to the recovered exe defaults; a genuine override is kept.
+    /// Both axes inside the 0.05 dead zone: no rotation at all (2 counts ->
+    /// 0.045). One axis outside rotates both.
     #[test]
-    fn legacy_profile_values_are_upgraded() {
-        let legacy = tuning::CameraTuning {
-            yaw_speed: 0.04,
-            pitch_speed: 0.04,
-            accel_time_yaw: 0.3,
-            accel_time_pitch: 0.6,
-            sensitivity: 45.0,
-        };
-        let dt = 1.0 / 60.0;
-        let inp = CameraInput { mouse_dx: 10.0, mouse_dy: 10.0, dt, ..Default::default() };
+    fn camera_input_dead_zone() {
+        let t = t();
         let mut s = CameraState::new();
-        update(&mut s, &inp, &legacy, [0.0; 3]);
-        let (ey, ep) = expected_first_frame(dt, 10.0, 10.0);
-        assert!((s.yaw_vel - ey).abs() < 1e-3, "{} vs {ey}", s.yaw_vel);
-        assert!((s.pitch_vel - ep).abs() < 1e-3, "{} vs {ep}", s.pitch_vel);
-
-        // A non-legacy override is honoured verbatim.
-        let custom = tuning::CameraTuning {
-            yaw_speed: 0.05,
-            accel_time_yaw: 0.25,
-            ..legacy
-        };
-        let mut c = CameraState::new();
-        update(&mut c, &inp, &custom, [0.0; 3]);
-        let want = 10.0 * 0.05 * MOUSE_YAW_SCALE * (1.0 / dt);
-        assert!((c.yaw_vel - want).abs() < 1e-3, "{} vs {want}", c.yaw_vel);
+        update(&mut s, &CameraInput { mouse_dx: 2.0, mouse_dy: 1.0, ..idle(false) }, &t, [0.0; 3]);
+        assert_eq!((s.yaw_vel, s.pitch_vel), (0.0, 0.0));
+        update(&mut s, &CameraInput { mouse_dx: 3.0, mouse_dy: 1.0, ..idle(false) }, &t, [0.0; 3]);
+        assert!(s.yaw_vel > 0.0 && s.pitch_vel > 0.0, "{} {}", s.yaw_vel, s.pitch_vel);
     }
 
     #[test]

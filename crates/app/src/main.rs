@@ -1432,11 +1432,11 @@ fn follow_camera(
 ) {
     let Some(player) = player else { return };
     let Some(mut cs) = cam_state else { return };
-    // Per-pixel sensitivity (tunable with SOD_SENS); the recovered cl_cam_*
-    // constants are per-frame velocities, so scale the raw pixel delta down.
-    // Axes are flipped to the standard (mouse right = look right, mouse up =
-    // look up); set SOD_INVERT=0 to use the raw recovered signs.
-    let sens = std::env::var("SOD_SENS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.04);
+    // The camera takes raw mouse counts, exactly as the game's rotate action
+    // does (`camera::mouse_count_scale`); SOD_SENS is an optional extra
+    // multiplier (default 1). Axes are flipped to the standard (mouse right =
+    // look right, mouse up = look up); set SOD_INVERT=0 for the raw signs.
+    let sens = std::env::var("SOD_SENS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
     let invert = std::env::var("SOD_INVERT").map(|v| v != "0").unwrap_or(true);
     let sgn = if invert { -1.0 } else { 1.0 };
     let (mut dx, mut dy) = (motion.delta.x * sens * sgn, motion.delta.y * sens * sgn);

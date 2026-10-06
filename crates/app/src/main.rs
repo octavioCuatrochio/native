@@ -1448,7 +1448,7 @@ fn follow_camera(
     // Focal target = player chest (cry coords); aim on right mouse.
     let target = camera::focal_target([player.mstate.pos[0], player.mstate.pos[1], player.mstate.pos[2]]);
     let aim = mouse.pressed(MouseButton::Right);
-    let input = camera::CameraInput { mouse_dx: dx, mouse_dy: dy, aim, dt: time.delta_secs() };
+    let input = camera::CameraInput { mouse_dx: dx, mouse_dy: dy, aim, dt: time.delta_secs(), ..Default::default() };
     camera::update(&mut cs.0, &input, &t, target);
     // Recenter the camera behind the player while walking (nav camera), unless
     // the player is actively looking this frame.

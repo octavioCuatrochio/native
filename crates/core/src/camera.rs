@@ -168,13 +168,16 @@ impl Default for CameraState {
     }
 }
 
-/// One frame of mouse/aim input.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// One frame of mouse/stick/aim input.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CameraInput {
     /// Mouse X delta this frame (pixels).
     pub mouse_dx: f32,
     /// Mouse Y delta this frame (pixels).
     pub mouse_dy: f32,
+    /// Right-stick deflection `[x, y]`, each `-1..=1`, same sign convention as
+    /// `mouse_dx`/`mouse_dy`. Mapped through [`stick_response`].
+    pub stick: [f32; 2],
     /// True while the aim button is held.
     pub aim: bool,
     /// Frame time (s).
@@ -238,16 +241,22 @@ pub fn update_mode(
     let speed_yaw = resolve_rotation_speed(t.yaw_speed);
     let speed_pitch = resolve_rotation_speed(t.pitch_speed);
     let inv_dt = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+    // UNVERIFIED gain: retail captures show a per-frame dead zone (<= 4
+    // counts -> no rotation) and a per-frame cap (~9.4 deg for any single
+    // event of 100+ counts) whose exact rule is not yet recovered
+    // (`notes/telemetry/README.md`). Only the immediacy below is confirmed.
     let want_yaw = dx * speed_yaw * MOUSE_YAW_SCALE * sens * inv_dt;
     let want_pitch = dy * speed_pitch * MOUSE_PITCH_SCALE * sens * inv_dt;
 
-    // Linear approach over the acceleration time: reaches the target exactly
-    // after `accel_time` seconds of held input.
-    let (accel_yaw, accel_pitch) = accel_times(mode, t);
-    let a_yaw = accel_alpha(dt, accel_yaw);
-    let a_pitch = accel_alpha(dt, accel_pitch);
-    state.yaw_vel = sane(state.yaw_vel) + (want_yaw - sane(state.yaw_vel)) * a_yaw;
-    state.pitch_vel = sane(state.pitch_vel) + (want_pitch - sane(state.pitch_vel)) * a_pitch;
+    // Input is applied immediately: retail captures show no acceleration ramp
+    // or smoothing for either device (a single mouse event lands within one
+    // frame; full stick is at full rate from the first sample and stops on
+    // release). `notes/telemetry/cam_mouse_flat.csv`, `cam_stick_fine.csv`.
+    let [sx, sy] = [sane(input.stick[0]).clamp(-1.0, 1.0), sane(input.stick[1]).clamp(-1.0, 1.0)];
+    let stick_yaw = sx.signum() * stick_response(sx.abs()) * STICK_YAW_RATE_MAX;
+    let stick_pitch = sy.signum() * stick_response(sy.abs()) * STICK_PITCH_RATE_MAX;
+    state.yaw_vel = want_yaw + stick_yaw;
+    state.pitch_vel = want_pitch + stick_pitch;
 
     state.yaw = sane(state.yaw) + state.yaw_vel * dt;
     state.pitch = sane(state.pitch) + state.pitch_vel * dt;
@@ -544,6 +553,47 @@ pub enum CameraSet {
     Nav,
     /// Aiming set (`cl_cam_aim_*`); tighter threshold and slower ramp.
     Aim,
+}
+
+/// Right-stick yaw rate at full deflection (rad/s): 90.1 °/s measured
+/// (`notes/telemetry/cam_stick_fine.csv`, both directions).
+pub const STICK_YAW_RATE_MAX: f32 = 90.1 * std::f32::consts::PI / 180.0;
+/// Right-stick pitch rate at full deflection (rad/s): 84.1 °/s down / 77.9 °/s
+/// up measured; the mean is used until the asymmetry is explained.
+pub const STICK_PITCH_RATE_MAX: f32 = 81.0 * std::f32::consts::PI / 180.0;
+
+/// Measured right-stick response `(|deflection|, fraction of max rate)`.
+///
+/// Yaw (10 deflections, both directions) and pitch (3 deflections) share this
+/// normalised shape within 1 %, so one curve scaled per axis reproduces both.
+/// Everything at or below 0.65 is dead. Fitted from retail captures, not
+/// decompiled: the code that applies it is not yet located.
+pub const STICK_RESPONSE: [(f32, f32); 9] = [
+    (0.65, 0.0),
+    (0.70, 0.0758),
+    (0.75, 0.1323),
+    (0.80, 0.2211),
+    (0.85, 0.3366),
+    (0.90, 0.5065),
+    (0.95, 0.7259),
+    (1.00, 1.0),
+    (1.00, 1.0),
+];
+
+/// Fraction of the maximum stick rotation rate for a deflection magnitude,
+/// linearly interpolated through [`STICK_RESPONSE`].
+pub fn stick_response(m: f32) -> f32 {
+    let m = sane(m).abs().min(1.0);
+    if m <= STICK_RESPONSE[0].0 {
+        return 0.0;
+    }
+    for w in STICK_RESPONSE.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if m <= x1 {
+            return if x1 > x0 { y0 + (y1 - y0) * (m - x0) / (x1 - x0) } else { y1 };
+        }
+    }
+    1.0
 }
 
 /// Resolved rotation parameters for a [`CameraSet`] (`camera.md` §3.2).
@@ -1209,41 +1259,6 @@ fn resolve_rotation_speed(v: f32) -> f32 {
     }
 }
 
-/// Effective acceleration time for one axis (same legacy substitution).
-#[inline]
-fn resolve_accel_time(v: f32, legacy: f32, recovered: f32) -> f32 {
-    if !v.is_finite() {
-        recovered
-    } else if (v - legacy).abs() < 1e-6 {
-        recovered
-    } else {
-        v
-    }
-}
-
-/// `(yaw, pitch)` acceleration time for a mode. Aim uses the dedicated
-/// `cl_cam_aim_rotation_acceleration_time_*` (live `0.4`/`0.6`).
-#[inline]
-fn accel_times(mode: CameraMode, t: &tuning::CameraTuning) -> (f32, f32) {
-    match mode {
-        CameraMode::Aim => (AIM_ACCEL_TIME_YAW, AIM_ACCEL_TIME_PITCH),
-        CameraMode::Nav | CameraMode::FirstPerson => (
-            resolve_accel_time(t.accel_time_yaw, LEGACY_ACCEL_TIME_YAW, ACCEL_TIME_YAW),
-            resolve_accel_time(t.accel_time_pitch, LEGACY_ACCEL_TIME_PITCH, ACCEL_TIME_PITCH),
-        ),
-    }
-}
-
-/// Fraction of the way to travel toward the target angular velocity this frame.
-#[inline]
-fn accel_alpha(dt: f32, time: f32) -> f32 {
-    if !time.is_finite() || time <= 1e-6 {
-        1.0
-    } else {
-        (dt / time).clamp(0.0, 1.0)
-    }
-}
-
 /// Slab test on the segment `o -> o + d` (parameter in `[0, 1]`).
 fn segment_hit(o: [f32; 3], d: [f32; 3], b: &physics::Aabb) -> Option<f32> {
     let mut t0 = 0.0f32;
@@ -1329,12 +1344,7 @@ mod tests {
     }
 
     fn idle(aim: bool) -> CameraInput {
-        CameraInput {
-            mouse_dx: 0.0,
-            mouse_dy: 0.0,
-            aim,
-            dt: 1.0 / 60.0,
-        }
+        CameraInput { aim, dt: 1.0 / 60.0, ..Default::default() }
     }
 
     #[test]
@@ -1347,12 +1357,7 @@ mod tests {
         let t = t();
         let mut up = CameraState::new();
         for _ in 0..600 {
-            let inp = CameraInput {
-                mouse_dx: 0.0,
-                mouse_dy: 100.0,
-                aim: false,
-                dt: 1.0 / 60.0,
-            };
+            let inp = CameraInput { mouse_dy: 100.0, ..idle(false) };
             update(&mut up, &inp, &t, [0.0; 3]);
         }
         assert!(up.pitch <= PITCH_LIMIT + 1e-4, "pitch {} above limit", up.pitch);
@@ -1364,12 +1369,7 @@ mod tests {
 
         let mut down = CameraState::new();
         for _ in 0..600 {
-            let inp = CameraInput {
-                mouse_dx: 0.0,
-                mouse_dy: -100.0,
-                aim: false,
-                dt: 1.0 / 60.0,
-            };
+            let inp = CameraInput { mouse_dy: -100.0, ..idle(false) };
             update(&mut down, &inp, &t, [0.0; 3]);
         }
         assert!(down.pitch >= -PITCH_LIMIT - 1e-4, "pitch {} below limit", down.pitch);
@@ -1381,50 +1381,51 @@ mod tests {
         assert!(up.pitch.is_finite() && down.pitch.is_finite());
     }
 
+    /// Mouse input is applied in full on the frame it arrives and stops the
+    /// frame it ends (retail flicks land in a single frame, no settle).
     #[test]
-    fn angular_velocity_accelerates_toward_target() {
+    fn mouse_rotation_is_immediate() {
         let t = t();
-        let inp = CameraInput {
-            mouse_dx: 10.0,
-            mouse_dy: 0.0,
-            aim: false,
-            dt: 1.0 / 60.0,
-        };
-
-        let mut one = CameraState::new();
-        update(&mut one, &inp, &t, [0.0; 3]);
-        let v1 = one.yaw_vel;
+        let inp = CameraInput { mouse_dx: 10.0, ..idle(false) };
+        let mut s = CameraState::new();
+        update(&mut s, &inp, &t, [0.0; 3]);
+        let v1 = s.yaw_vel;
         assert!(v1 > 0.0, "expected positive yaw velocity, got {v1}");
+        update(&mut s, &inp, &t, [0.0; 3]);
+        assert!((s.yaw_vel - v1).abs() < 1e-6, "no ramp: {v1} -> {}", s.yaw_vel);
+        update(&mut s, &idle(false), &t, [0.0; 3]);
+        assert_eq!(s.yaw_vel, 0.0, "stops on release");
+    }
 
-        // Held input keeps accelerating toward the (constant) target.
-        let mut many = CameraState::new();
-        let mut prev = 0.0;
-        let mut increased = 0;
-        for _ in 0..60 {
-            update(&mut many, &inp, &t, [0.0; 3]);
-            if many.yaw_vel > prev + 1e-6 {
-                increased += 1;
-            }
-            prev = many.yaw_vel;
+    /// The right stick reproduces the retail capture: dead through 0.65,
+    /// 90.1 °/s yaw at full deflection, same shape on pitch.
+    #[test]
+    fn stick_matches_retail_capture() {
+        let deg = |r: f32| r.to_degrees();
+        assert_eq!(stick_response(0.25), 0.0);
+        assert_eq!(stick_response(0.65), 0.0);
+        let cases = [(0.70, 6.85), (0.75, 11.9), (0.80, 19.9), (0.85, 30.3), (0.90, 45.6), (0.95, 65.4), (1.0, 90.1)];
+        for (m, expect) in cases {
+            let got = deg(stick_response(m) * STICK_YAW_RATE_MAX);
+            assert!((got - expect).abs() < 0.5, "yaw at {m}: {got} vs {expect}");
         }
-        assert!(
-            many.yaw_vel > v1 * 1.5,
-            "velocity did not accelerate: {v1} -> {}",
-            many.yaw_vel
-        );
-        assert!(increased > 40, "velocity should rise most frames ({increased})");
+        let pitch85 = deg(stick_response(0.85) * STICK_PITCH_RATE_MAX);
+        assert!((pitch85 - 27.1).abs() < 1.0, "pitch at 0.85: {pitch85}");
 
-        // Zero acceleration time reaches the target immediately.
-        let mut instant = t;
-        instant.accel_time_yaw = 0.0;
-        let mut fast = CameraState::new();
-        update(&mut fast, &inp, &instant, [0.0; 3]);
-        assert!(
-            fast.yaw_vel > v1,
-            "instant accel {} should exceed ramped {}",
-            fast.yaw_vel,
-            v1
-        );
+        // One second of full right stick turns the camera by the full rate,
+        // from the first frame, and stops on release.
+        let t = t();
+        let mut s = CameraState::new();
+        let full = CameraInput { stick: [1.0, 0.0], ..idle(false) };
+        for _ in 0..60 {
+            update(&mut s, &full, &t, [0.0; 3]);
+        }
+        assert!((s.yaw - STICK_YAW_RATE_MAX).abs() < 1e-3, "yaw after 1 s {}", s.yaw);
+        update(&mut s, &idle(false), &t, [0.0; 3]);
+        assert_eq!(s.yaw_vel, 0.0);
+        let mut l = CameraState::new();
+        update(&mut l, &CameraInput { stick: [-0.9, 0.0], ..idle(false) }, &t, [0.0; 3]);
+        assert!(l.yaw_vel < 0.0, "left stick turns the other way");
     }
 
     /// Recovered tuning: `cl_cam_rotation_speed 0.2`, mouse scales `0.5/0.75`,
@@ -1439,15 +1440,12 @@ mod tests {
         }
     }
 
-    /// First-frame angular velocity from rest, expected from the constants:
-    /// `v = want * dt / time`.
+    /// First-frame angular velocity from rest (applied immediately).
     fn expected_first_frame(dt: f32, dx: f32, dy: f32) -> (f32, f32) {
         let inv = 1.0 / dt;
-        let want_yaw = dx * CAM_ROTATION_SPEED * MOUSE_YAW_SCALE * inv;
-        let want_pitch = dy * CAM_ROTATION_SPEED * MOUSE_PITCH_SCALE * inv;
         (
-            want_yaw * (dt / ACCEL_TIME_YAW),
-            want_pitch * (dt / ACCEL_TIME_PITCH),
+            dx * CAM_ROTATION_SPEED * MOUSE_YAW_SCALE * inv,
+            dy * CAM_ROTATION_SPEED * MOUSE_PITCH_SCALE * inv,
         )
     }
 
@@ -1457,12 +1455,7 @@ mod tests {
     fn recovered_angular_constants_drive_the_model() {
         let t = recovered_tuning();
         let dt = 1.0 / 60.0;
-        let inp = CameraInput {
-            mouse_dx: 10.0,
-            mouse_dy: 10.0,
-            aim: false,
-            dt,
-        };
+        let inp = CameraInput { mouse_dx: 10.0, mouse_dy: 10.0, dt, ..Default::default() };
         let mut s = CameraState::new();
         update(&mut s, &inp, &t, [0.0; 3]);
 
@@ -1479,8 +1472,8 @@ mod tests {
             s.pitch_vel,
             expect_pitch
         );
-        // Yaw time 0.3 < pitch time 0.6, so yaw reaches its target sooner.
-        assert!(s.yaw_vel > s.pitch_vel, "{} vs {}", s.yaw_vel, s.pitch_vel);
+        // Equal deltas: pitch/yaw follow the mouse scales (0.75 / 0.5).
+        assert!((s.pitch_vel / s.yaw_vel - 1.5).abs() < 1e-4, "{} vs {}", s.yaw_vel, s.pitch_vel);
 
         assert_eq!(ACCEL_TIME_YAW, 0.3);
         assert_eq!(ACCEL_TIME_PITCH, 0.6);
@@ -1501,12 +1494,7 @@ mod tests {
             sensitivity: 45.0,
         };
         let dt = 1.0 / 60.0;
-        let inp = CameraInput {
-            mouse_dx: 10.0,
-            mouse_dy: 10.0,
-            aim: false,
-            dt,
-        };
+        let inp = CameraInput { mouse_dx: 10.0, mouse_dy: 10.0, dt, ..Default::default() };
         let mut s = CameraState::new();
         update(&mut s, &inp, &legacy, [0.0; 3]);
         let (ey, ep) = expected_first_frame(dt, 10.0, 10.0);
@@ -1521,39 +1509,8 @@ mod tests {
         };
         let mut c = CameraState::new();
         update(&mut c, &inp, &custom, [0.0; 3]);
-        let want = 10.0 * 0.05 * MOUSE_YAW_SCALE * (1.0 / dt) * (dt / 0.25);
+        let want = 10.0 * 0.05 * MOUSE_YAW_SCALE * (1.0 / dt);
         assert!((c.yaw_vel - want).abs() < 1e-3, "{} vs {want}", c.yaw_vel);
-    }
-
-    #[test]
-    fn aim_and_nav_use_distinct_accel_times() {
-        let t = t();
-        let mut nav = CameraState::new();
-        update(&mut nav, &idle(false), &t, [0.0; 3]);
-        let mut nav2 = CameraState::new();
-        update(
-            &mut nav2,
-            &CameraInput { mouse_dx: 10.0, ..idle(false) },
-            &t,
-            [0.0; 3],
-        );
-
-        let mut aim = CameraState::new();
-        update(
-            &mut aim,
-            &CameraInput { mouse_dx: 10.0, ..idle(true) },
-            &t,
-            [0.0; 3],
-        );
-        assert_eq!(aim.mode, CameraMode::Aim);
-        // Aim accel time (1.0) is longer than nav (0.5): it ramps more slowly.
-        assert!(
-            nav2.yaw_vel > aim.yaw_vel,
-            "nav {} should exceed aim {}",
-            nav2.yaw_vel,
-            aim.yaw_vel
-        );
-        let _ = nav;
     }
 
     #[test]
@@ -1861,6 +1818,7 @@ mod tests {
             mouse_dy: f32::NAN,
             aim: false,
             dt: f32::NAN,
+            ..Default::default()
         };
         update(&mut s, &inp, &t, [f32::NAN; 3]);
         assert!(s.yaw.is_finite() && s.pitch.is_finite());

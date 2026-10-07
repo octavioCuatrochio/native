@@ -53,6 +53,14 @@ pub struct CharParams {
     /// `SpecularStrenght` / `RimStrenght` (skin shader multipliers).
     pub specular_strength: f32,
     pub rim_strength: f32,
+    /// `StringGenMask` string feature defines compiled per material.
+    /// `UL_Character.cfx` only samples `$DecalOverlay` / runs `ApplyDecal`
+    /// when `%BLEND_DECAL_MAP` is set; `$Detail` / `ApplyPattern` need
+    /// `%BLEND_PATTERN_MAP`.
+    pub blend_decal_map: bool,
+    pub blend_pattern_map: bool,
+    /// `GenMask` numeric `%_RT_*` feature bitmask (kept for diagnostics).
+    pub gen_mask: u64,
 }
 
 impl Default for CharParams {
@@ -75,6 +83,9 @@ impl Default for CharParams {
             melanin: 0.0,
             specular_strength: 1.0,
             rim_strength: 0.3,
+            blend_decal_map: false,
+            blend_pattern_map: false,
+            gen_mask: 0,
         }
     }
 }
@@ -285,6 +296,15 @@ impl MtlState {
             c.glossiness[0] = get("shininess")
                 .and_then(|v| v.trim().parse::<f32>().ok())
                 .unwrap_or(1.0);
+            // Shader features compiled into this material. `%BLEND_DECAL_MAP`
+            // and `%BLEND_PATTERN_MAP` gate the decal/detail overlay passes;
+            // `GenMask` is the numeric `%_RT_*` bitmask.
+            let string_mask = get("stringgenmask").unwrap_or_default();
+            c.blend_decal_map = string_mask.contains("%BLEND_DECAL_MAP");
+            c.blend_pattern_map = string_mask.contains("%BLEND_PATTERN_MAP");
+            c.gen_mask = get("genmask")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
             c
         };
         match name {
@@ -675,6 +695,27 @@ mod tests {
         assert_eq!(s.char.melanin, 0.4);
         assert_eq!(s.char.specular_strength, 0.6);
         assert_eq!(s.char.rim_strength, 0.2);
+    }
+
+    #[test]
+    fn captures_character_gen_mask_flags() {
+        let slots = parse(
+            br#"<Material>
+                 <SubMaterials>
+                   <Material Name="shirtShader" Shader="UL_Character" GenMask="200"
+                             StringGenMask="%BLEND_DECAL_MAP">
+                   </Material>
+                   <Material Name="hatShader" Shader="UL_Character" GenMask="20"
+                             StringGenMask="">
+                   </Material>
+                 </SubMaterials>
+               </Material>"#,
+        );
+        // Base shirt compiles the decal layer in; the cap does not.
+        assert!(slots[0].char.blend_decal_map);
+        assert_eq!(slots[0].char.gen_mask, 200);
+        assert!(!slots[1].char.blend_decal_map);
+        assert_eq!(slots[1].char.gen_mask, 20);
     }
 
     #[test]

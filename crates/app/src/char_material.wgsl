@@ -47,6 +47,14 @@ var decal_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(113)
 var decal_smp: sampler;
 
+// Point-sampled view of the Custom map, used only for the region id (blue
+// channel). The authored shader uses `LayoutSamplerPoint` here so the region
+// id does not get blended across region boundaries by linear filtering.
+@group(#{MATERIAL_BIND_GROUP}) @binding(114)
+var custom_point_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(115)
+var custom_point_smp: sampler;
+
 // `UL_Character.cfx` builds the region recolour as the matrix product
 // brightness * contrast * saturation * hue and applies it to the diffuse in
 // row-vector order (brightness then contrast then saturation then hue), then
@@ -133,7 +141,9 @@ fn fragment(
         textureSample(custom_tex, custom_smp, uv),
         has_custom);
     // UL_Character: channelId in {0, 1/3, 2/3, 1} -> region round(channelId*3).
-    let region = round(clamp(custom.b, 0.0, 1.0) * 3.0);
+    // The authored shader point-samples the channel id (LayoutSamplerPoint) so
+    // linear filtering cannot blend two regions into a third at the seams.
+    let region = round(clamp(textureSample(custom_point_tex, custom_point_smp, uv).b, 0.0, 1.0) * 3.0);
     var gloss = ch.s0.w;
 
     if (ch.flags.x > 0.5) {
@@ -178,6 +188,29 @@ fn fragment(
         }
     }
 
+    var out: FragmentOutput;
+
+    // `SOD_CHAR_DEBUG` visualisations (ch.misc.z): prove what the shader reads.
+    let dbg = ch.misc.z;
+    if (dbg > 0.5) {
+        var c = vec3<f32>(0.0);
+        if (dbg < 1.5) {
+            // region id: 0 red, 1 green, 2 blue, 3 white.
+            if (region > 2.5) { c = vec3<f32>(1.0, 1.0, 1.0); }
+            else if (region > 1.5) { c = vec3<f32>(0.0, 0.0, 1.0); }
+            else if (region > 0.5) { c = vec3<f32>(0.0, 1.0, 0.0); }
+            else { c = vec3<f32>(1.0, 0.0, 0.0); }
+        } else if (dbg < 2.5) { c = custom.rgb; }
+        else if (dbg < 3.5) { c = vec3<f32>(custom.r); }
+        else if (dbg < 4.5) { c = vec3<f32>(custom.g); }
+        else if (dbg < 5.5) { c = vec3<f32>(custom.b); }
+        else if (dbg < 6.5) { c = vec3<f32>(uv, 0.0); }
+        else if (dbg < 7.5) { c = texel.rgb; }
+        else { c = rgb; }
+        out.color = vec4<f32>(c, 1.0);
+        return out;
+    }
+
     rgb = rgb * ch.mat_dif.rgb;
     pbr.material.base_color = vec4<f32>(rgb, alpha);
 
@@ -186,7 +219,6 @@ fn fragment(
     pbr.material.perceptual_roughness = clamp(1.0 - g / 255.0, 0.04, 1.0);
     pbr.material.metallic = 0.0;
 
-    var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr);
     out.color = main_pass_post_lighting_processing(pbr, out.color);
     out.color = alpha_discard(pbr.material, out.color);

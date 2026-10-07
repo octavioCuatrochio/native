@@ -130,6 +130,12 @@ const MAX_TERRAIN_LAYERS: usize = 32;
 /// while keeping authored features.
 const LAYER_BLEND_RADIUS: usize = 2;
 
+/// Load radius (m) for props, brushes and vegetation around the start. Defaults to the
+/// whole Class3 map (4096 m square); `SOD_WORLD_RADIUS` narrows it for quick runs.
+fn world_radius() -> f32 {
+    std::env::var("SOD_WORLD_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(6000.0)
+}
+
 /// Uniform block for [`TerrainMaterialExt`]: terrain extent in `params.xy`, the
 /// active ground-layer count in `params.z`, and each ground layer's world-space
 /// tiling (repeats per metre) in `tiles`.
@@ -1131,7 +1137,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     };
 
     // Keep only props in the tutorial zone (covers the Ranger Station at ~166 m).
-    let zone_radius = 400.0f32;
+    let zone_radius = world_radius();
     let xml_in_zone = placements_all
         .iter()
         .filter(|p| p.model.is_some())
@@ -1151,7 +1157,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         with_models.len(), zone_radius, cry_host.is_some(), xml_in_zone);
 
     // Static architecture (buildings/walls/rocks) around the zone.
-    let arch_radius = 360.0f32;
+    let arch_radius = world_radius();
     let mut brushes: Vec<(String, [f32; 3], [f32; 4], f32)> = Vec::new();
     for b in architecture::brushes_in_region(&terrain_bytes, start_cry, arch_radius) {
         brushes.push((b.model, b.pos, b.rot, b.scale));
@@ -1206,7 +1212,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     };
 
     // Trees / bushes (vegetation) from the same octree.
-    let veg_radius = 360.0f32;
+    let veg_radius = world_radius();
     let mut vegetation: Vec<(String, [f32; 3], f32, f32)> = Vec::new();
     if std::env::var("SOD_NOVEG").is_err() {
         for v in vegetation::vegetation_in_region(&terrain_bytes, start_cry, veg_radius) {
@@ -1222,9 +1228,6 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     let mut unique_veg_models: Vec<String> = vegetation.iter().map(|v| v.0.clone()).collect();
     unique_veg_models.sort();
     unique_veg_models.dedup();
-    unique_veg_models.truncate(220);
-    vegetation.retain(|v| unique_veg_models.binary_search(&v.0).is_ok());
-    vegetation.truncate(20000);
     println!("[world] vegetation: {} instances / {} models within {:.0}m",
         vegetation.len(), unique_veg_models.len(), veg_radius);
 

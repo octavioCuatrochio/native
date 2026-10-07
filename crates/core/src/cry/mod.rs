@@ -13,6 +13,8 @@ pub mod binds_sound;
 pub mod binds_system;
 pub mod combat;
 pub mod combat_perception;
+pub mod content;
+pub mod content_runtime;
 mod cvar_table;
 pub mod constants;
 pub mod cvars;

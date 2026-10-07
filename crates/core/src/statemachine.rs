@@ -119,10 +119,13 @@
 //! slot (offset `0xe`) and its two floats to `0x10`/`0x14`. `SmTick` then
 //! switches the machine and plays the target state's fragment.
 //!
-//! What remains unknown: header `0x1c`, `0x6c`, `0x70`; the semantics of the
-//! per-block sub-tables (`trigger_types`, `entity_types`, `transform_types`,
-//! `action_data`, `transform_data`) beyond their counts/offsets; and the
-//! bytecode inside `block_strings`/`action_data`.
+//! The per-block sub-tables are now decoded too: the payload blobs
+//! (trigger / entity / transform sources, filters, actions) are walked with the
+//! descriptor tables in [`crate::sm_tables`] and returned in
+//! [`StateMachine::payloads`] (see [`crate::sm_payload`]). What remains opaque
+//! is header `0x1c`, `0x6c`, `0x70`, the script bytecode inside
+//! `block_strings`, and the uninterpreted fields of most individual trigger
+//! evaluators.
 //!
 //! ## `.chrparams`
 //!
@@ -251,6 +254,9 @@ pub struct StateMachine {
     pub transitions: Vec<SmTransition>,
     /// All mapped sections, in file order.
     pub sections: Vec<SmSection>,
+    /// Records decoded from the trigger / entity / transform / filter / action
+    /// payload blobs, plus coverage accounting (see [`crate::sm_payload`]).
+    pub payloads: crate::sm_payload::SmPayloads,
     /// `true` for the big-endian XB360 build.
     pub big_endian: bool,
 }
@@ -593,7 +599,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
         }
     }
 
-    Some(StateMachine {
+    let mut sm = StateMachine {
         name: read_cstr(bytes, NAME_OFF, NAME_BYTES),
         states,
         start_state: hw.get(0x28 / 4).copied().unwrap_or(0),
@@ -601,8 +607,13 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
         blocks,
         transitions,
         sections,
+        payloads: crate::sm_payload::SmPayloads::empty(0),
         big_endian: be,
-    })
+    };
+    // Second pass: decode the opaque payload blobs now that the structural
+    // tables are available.
+    sm.payloads = crate::sm_payload::decode(bytes, &sm);
+    Some(sm)
 }
 
 /// Lenient name-only decode (the pre-existing behaviour), used when the strict
@@ -663,6 +674,7 @@ fn parse_names_only(bytes: &[u8], be: bool) -> Option<StateMachine> {
         blocks: Vec::new(),
         transitions: Vec::new(),
         sections: Vec::new(),
+        payloads: crate::sm_payload::SmPayloads::empty(bytes.len()),
         big_endian: be,
     })
 }

@@ -6,6 +6,7 @@
 //!   * `script`  - run real game Lua (Lua 5.1) against a minimal engine API shim.
 
 pub mod ag_graph;
+pub mod ag_runtime;
 pub mod ai;
 pub mod anim;
 pub mod anim_graph;

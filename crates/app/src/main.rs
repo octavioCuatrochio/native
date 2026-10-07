@@ -720,6 +720,180 @@ fn height_at(t: &Terrain, x: f32, y: f32) -> f32 {
     t.height_interp(x, y)
 }
 
+/// Build the drawn terrain with a near-player detail inset.
+///
+/// The far field is meshed at `far_stride` on the native lattice; a square of
+/// half-extent ~`near_radius` around `center` is re-meshed at `near_stride` and
+/// spliced into a matching hole. The inset bounds are snapped to the coarse
+/// lattice and its borderline vertices are bilinearly interpolated from the
+/// coarse grid, so the seam is watertight (no T-junction cracks).
+fn build_terrain_lod(
+    t: &terrain::Terrain,
+    center: [f32; 3],
+    near_radius: f32,
+    near_stride: usize,
+    far_stride: usize,
+) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let far = far_stride.max(1);
+    let near = near_stride.max(1);
+    let s = t.samples;
+    if s < 2 || t.heights.len() < s * s {
+        return terrain::build_mesh(t, far);
+    }
+    let (mut pos, coarse_idx) = terrain::build_mesh(t, far);
+    if pos.is_empty() {
+        return (pos, coarse_idx);
+    }
+    let nv = (s + far - 1) / far;
+
+    // Inset bounds in sample indices, snapped down to the coarse lattice.
+    let snap = |v: f32| -> usize { ((v / far as f32).floor() as isize * far as isize).max(0) as usize };
+    let half = near_radius / t.spacing;
+    let ci = (center[0] - t.world_min[0]) / t.spacing;
+    let cj = (center[1] - t.world_min[1]) / t.spacing;
+    let last = ((s - 1) / far) * far;
+    let lo_i = snap(ci - half).min(s - 1);
+    let lo_j = snap(cj - half).min(s - 1);
+    let hi_i = snap(ci + half).min(last);
+    let hi_j = snap(cj + half).min(last);
+    if hi_i <= lo_i || hi_j <= lo_j {
+        return (pos, coarse_idx);
+    }
+
+    // Coarse triangles minus the quads fully inside the inset.
+    let mut index: Vec<u32> = Vec::with_capacity(coarse_idx.len());
+    for gj in 0..nv - 1 {
+        let sj = (gj * far).min(s - 1);
+        for gi in 0..nv - 1 {
+            let si = (gi * far).min(s - 1);
+            let inside = si >= lo_i
+                && sj >= lo_j
+                && (si + far).min(s - 1) <= hi_i
+                && (sj + far).min(s - 1) <= hi_j;
+            if inside {
+                continue;
+            }
+            let a = (gj * nv + gi) as u32;
+            let b = (gj * nv + gi + 1) as u32;
+            let c = ((gj + 1) * nv + gi + 1) as u32;
+            let d = ((gj + 1) * nv + gi) as u32;
+            index.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+
+    // Fine inset sharing the coarse lattice along its border.
+    let width = (hi_i - lo_i) / near + 1;
+    let depth = (hi_j - lo_j) / near + 1;
+    let base = pos.len() as u32;
+    for jj in 0..depth {
+        let sj = lo_j + jj * near;
+        for ii in 0..width {
+            let si = lo_i + ii * near;
+            let x = t.world_min[0] + (si as f32 + 0.5) * t.spacing;
+            let y = t.world_min[1] + (sj as f32 + 0.5) * t.spacing;
+            let border = si == lo_i || si == hi_i || sj == lo_j || sj == hi_j;
+            let z = if border { coarse_height(t, si, sj, far) } else { t.heights[sj * s + si] };
+            pos.push([x, y, z]);
+        }
+    }
+    for jj in 0..depth - 1 {
+        for ii in 0..width - 1 {
+            let a = base + (jj * width + ii) as u32;
+            let b = base + (jj * width + ii + 1) as u32;
+            let c = base + ((jj + 1) * width + ii + 1) as u32;
+            let d = base + ((jj + 1) * width + ii) as u32;
+            index.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+    (pos, index)
+}
+
+/// Bilinear height of the coarse lattice (`far` spacing) at fine index `(si, sj)`.
+fn coarse_height(t: &terrain::Terrain, si: usize, sj: usize, far: usize) -> f32 {
+    let s = t.samples;
+    let fx = si as f32 / far as f32;
+    let fy = sj as f32 / far as f32;
+    let gx = fx.floor() as usize;
+    let gy = fy.floor() as usize;
+    let tx = fx - gx as f32;
+    let ty = fy - gy as f32;
+    let i0 = (gx * far).min(s - 1);
+    let i1 = ((gx + 1) * far).min(s - 1);
+    let j0 = (gy * far).min(s - 1);
+    let j1 = ((gy + 1) * far).min(s - 1);
+    let top = t.heights[j0 * s + i0] * (1.0 - tx) + t.heights[j0 * s + i1] * tx;
+    let bot = t.heights[j1 * s + i0] * (1.0 - tx) + t.heights[j1 * s + i1] * tx;
+    top * (1.0 - ty) + bot * ty
+}
+
+/// Composite the authored terrain-layer detail maps over a coloured ground bake.
+///
+/// The `terrainmaterials/*_diffuse.dds` returned by
+/// [`sod_core::surfaces::resolve_surface_textures`] are neutral (~127 grey)
+/// detail maps. Each is sampled in world space at its authored `TexMod` tiling
+/// (repeats per metre), rescaled to unit mean and blended in, restoring the
+/// per-layer high-frequency detail the `Terrain.Layer` shader would provide
+/// without shifting the baked colour.
+fn bake_layer_detail(
+    vfs: &Vfs,
+    ter: &Terrain,
+    layers: &[sod_core::surfaces::SurfaceTexture],
+    rgba: &mut [u8],
+    w: u32,
+    h: u32,
+) {
+    let detail_blend = std::env::var("SOD_LAYER_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25f32);
+    if detail_blend <= 0.0 || w == 0 || h == 0 || rgba.len() < (w as usize) * (h as usize) * 4 {
+        return;
+    }
+    let mut by_id: [Option<&sod_core::surfaces::SurfaceTexture>; 256] = std::array::from_fn(|_| None);
+    for l in layers {
+        if l.id <= 255 {
+            by_id[l.id as usize] = Some(l);
+        }
+    }
+    // Decode each layer's detail map once, indexed by surface id.
+    let mut img_by_id: [Option<sod_core::asset::DdsImageRgba>; 256] = std::array::from_fn(|_| None);
+    for id in 0..256usize {
+        if let Some(l) = by_id[id] {
+            if let Some(p) = l.diffuse.as_deref() {
+                img_by_id[id] = vfs.read(p).and_then(|b| sod_core::asset::decode_dds_rgba(&b));
+            }
+        }
+    }
+    let span_x = ter.samples as f32 * ter.spacing;
+    let span_y = ter.samples as f32 * ter.spacing;
+    let (x0, y0) = (ter.world_min[0], ter.world_min[1]);
+    for oy in 0..h as usize {
+        let wy = y0 + (oy as f32 + 0.5) / h as f32 * span_y;
+        for ox in 0..w as usize {
+            let wx = x0 + (ox as f32 + 0.5) / w as f32 * span_x;
+            let id = ter.surface_at(wx, wy) as usize;
+            let (Some(layer), Some(img)) = (by_id[id], img_by_id[id].as_ref()) else { continue };
+            let d = sample_detail(img, wx * layer.tile_u, wy * layer.tile_v);
+            let o = (oy * w as usize + ox) * 4;
+            for c in 0..3 {
+                let base = rgba[o + c] as f32 / 255.0;
+                let detail = d[c] as f32 / 127.5; // unit-mean neutral detail
+                let v = base * (1.0 - detail_blend + detail_blend * detail);
+                rgba[o + c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+}
+
+/// Nearest, wrapping RGB sample of a decoded image (tiled detail sampling).
+fn sample_detail(img: &sod_core::asset::DdsImageRgba, u: f32, v: f32) -> [u8; 3] {
+    let (iw, ih) = (img.width as usize, img.height as usize);
+    if iw == 0 || ih == 0 || img.rgba.len() < iw * ih * 4 {
+        return [128, 128, 128];
+    }
+    let tx = ((u.rem_euclid(1.0) * iw as f32) as usize).min(iw - 1);
+    let ty = ((v.rem_euclid(1.0) * ih as f32) as usize).min(ih - 1);
+    let o = (ty * iw + tx) * 4;
+    [img.rgba[o], img.rgba[o + 1], img.rgba[o + 2]]
+}
+
 fn run_world(game: &str, vfs: Vfs, play: bool) {
     let level_pak_path = Path::new(game).join("Game/levels/Class3/level.pak");
     let level_pak = sod_core::Pak::open(&level_pak_path).expect("open level.pak");
@@ -727,29 +901,32 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     let read = |name: &str| level_pak.find(name).and_then(|i| level_pak.read_idx(i).ok());
 
     let terrain_bytes = read("terrain/terrain.dat").expect("terrain.dat");
-    let ter = terrain::decode_terrain(&terrain_bytes).expect("terrain");
+    // Reconstruct on the native 2 m lattice: the source quadtree leaves reach
+    // 2 m and the old 4 m `decode_terrain` aliased them away (terrain.rs
+    // `decode_terrain_hires`). The mesh below adapts around the player, so the
+    // extra height detail is nearly free.
+    let ter = terrain::decode_terrain_hires(&terrain_bytes).expect("terrain");
     println!("[world] terrain {}x{} @ {:.1}m  height {:.1}..{:.1} m", ter.samples, ter.samples, ter.spacing, ter.min, ter.max);
     // Terrain surface palette (leveldata.xml) -> per-vertex colour by surface type.
     let surface_types = read("leveldata.xml").map(|b| surfaces::parse_surface_types(&b)).unwrap_or_default();
     println!("[world] surface types: {}", surface_types.len());
-    // The feet stand on the interpolated 4 m heightmap; the drawn ground uses
-    // an 8 m grid by default (full res cost ~40 ms on p90 frames in debug).
-    // Proper fix: near-player terrain LOD. SOD_TERRAIN_STRIDE overrides.
-    let terrain_stride = std::env::var("SOD_TERRAIN_STRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize);
-    let (tverts, tindex) = terrain::build_mesh(&ter, terrain_stride);
-    // Tint the (textured) ground by surface type, mixed toward white so the
-    // tiled diffuse detail stays visible.
-    let tcolors: Vec<[f32; 4]> = tverts.iter().map(|p| {
-        let c = surfaces::color_for(&surface_types, ter.surface_at(p[0], p[1]));
-        [0.55 + 0.45 * c[0], 0.55 + 0.45 * c[1], 0.55 + 0.45 * c[2], 1.0]
-    }).collect();
     let ground_tex = vfs.read("textures/ground/grass_dirt_mix01_diffuse.dds");
-    // Bake a per-surface ground albedo from the real ground textures.
-    let ground_albedo = surfaces::build_ground_albedo(&vfs, &ter, &surface_types, 1024);
+    // Real terrain layers: `leveldata.xml` SurfaceType -> DetailMaterial ->
+    // `terrain/terrainmaterials/*.mtl`, with the authored `TexMod` tiling
+    // (surfaces.rs `resolve_surface_textures`). Those `*_diffuse.dds` are
+    // neutral detail maps, so they are composited over a coloured per-surface
+    // bake rather than used as albedo directly. The bake runs at 1 m/texel.
+    let terrain_layers = surfaces::resolve_surface_textures(&vfs, &surface_types);
+    let resolved = terrain_layers.iter().filter(|l| l.diffuse.is_some()).count();
+    println!("[world] terrain layers: {resolved}/{} resolved", terrain_layers.len());
+    let ground_albedo = surfaces::build_ground_albedo(&vfs, &ter, &surface_types, 4096)
+        .map(|(w, h, mut rgba)| {
+            bake_layer_detail(&vfs, &ter, &terrain_layers, &mut rgba, w, h);
+            (w, h, rgba)
+        });
     if let Some((w, _h, _)) = &ground_albedo {
         println!("[world] ground albedo {w}px");
     }
-    println!("[world] terrain mesh: {} verts", tverts.len());
 
     // --- locate the Mt. Tanner tutorial zone -------------------------------
     let tag_points = read("tag_points_win.markup").and_then(|b| tagpoints::TagPoints::parse(&b));
@@ -769,6 +946,29 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         });
     println!("[world] placements: {} total, {} tag points; Mt. Tanner start {:?}",
         total, tag_points.as_ref().map(|t| t.len()).unwrap_or(0), start_cry);
+
+    // Drawn terrain: a coarse 8 m grid for the far hills plus a native-2 m inset
+    // around the player, so the foreground keeps the authored detail at roughly
+    // the triangle budget of the old uniform 8 m mesh (see `build_terrain_lod`).
+    // `SOD_TERRAIN_STRIDE` forces a uniform stride for A/B tests.
+    let (tverts, tindex) = match std::env::var("SOD_TERRAIN_STRIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(stride) => {
+            let m = terrain::build_mesh(&ter, stride);
+            println!("[world] terrain mesh: {} verts (uniform stride {stride})", m.0.len());
+            m
+        }
+        None => {
+            let m = build_terrain_lod(&ter, start_cry, 160.0, 1, 4);
+            println!("[world] terrain mesh: {} verts (near 160 m inset @ 2 m, far 8 m)", m.0.len());
+            m
+        }
+    };
+    // Tint the (textured) ground by surface type, mixed toward white so the
+    // tiled diffuse detail stays visible.
+    let tcolors: Vec<[f32; 4]> = tverts.iter().map(|p| {
+        let c = surfaces::color_for(&surface_types, ter.surface_at(p[0], p[1]));
+        [0.55 + 0.45 * c[0], 0.55 + 0.45 * c[1], 0.55 + 0.45 * c[2], 1.0]
+    }).collect();
 
     // Boot the original scripts on the native entity world. What gets drawn
     // for entities is what their scripts loaded (`LoadObject`/`DrawSlot`/
@@ -897,7 +1097,11 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
             continue;
         }
         let Some(bytes) = vfs.read(path) else { continue };
-        let dm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mesh::decode_model(&bytes))) {
+        // Draw only renderable LOD0 geometry: `decode_model_render` skips the
+        // per-file physics hit-proxy (`*_hitref`, `$physics_proxy*`) and in-file
+        // LOD helper nodes that would otherwise overdraw the real model as a
+        // low-poly shell (mesh.rs `node_is_render_geometry`).
+        let dm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mesh::decode_model_render(&bytes))) {
             Ok(Some(dm)) => dm,
             _ => continue,
         };
@@ -1228,23 +1432,47 @@ fn setup_world(
     // Prebuild model meshes + materials. One material per palette slot, and one
     // mesh per submesh, so complex multi-material models texture correctly.
     let mut built: HashMap<String, Vec<(Handle<Mesh>, Handle<StandardMaterial>)>> = HashMap::new();
+    let no_slots: Vec<MaterialSlot> = Vec::new();
     for (path, dmeshes) in &world.models {
+        let slots = world.slots.get(path).unwrap_or(&no_slots);
         let mut mat_handles: Vec<Handle<StandardMaterial>> = Vec::new();
-        if let Some(slots) = world.slots.get(path) {
-            for slot in slots {
-                let mut mat = StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, alpha_mode: AlphaMode::Mask(0.5), ..default() };
-                if let Some(tp) = slot.texture("Diffuse") {
-                    if let Some(bytes) = world.tex_bytes.get(tp) {
-                        if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) {
-                            mat.base_color_texture = Some(h);
-                        }
+        // `mat_handles` must stay index-aligned with the palette, so a NoDraw
+        // slot still occupies its position but is never drawn (below).
+        let mut nodraw: Vec<bool> = Vec::new();
+        let mut has_normal = false;
+        for slot in slots {
+            if slot.is_nodraw() {
+                mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
+                nodraw.push(true);
+                continue;
+            }
+            // Authored cutout threshold for foliage/decals (material.rs); the
+            // old fixed 0.5 punched holes in the wrong texels.
+            let alpha_mode = AlphaMode::Mask(slot.alpha_test.unwrap_or(0.5));
+            let mut mat = StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, alpha_mode, ..default() };
+            if let Some(tp) = slot.texture("Diffuse") {
+                if let Some(bytes) = world.tex_bytes.get(tp) {
+                    if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) {
+                        mat.base_color_texture = Some(h);
                     }
                 }
-                mat_handles.push(materials.add(mat));
             }
+            // Normal map (linear, not sRGB); needs tangents, generated below.
+            if let Some(tp) = slot.texture("Bumpmap").or_else(|| slot.texture("Normal")) {
+                if let Some(bytes) = world.tex_bytes.get(tp) {
+                    let key = format!("{tp}#normal");
+                    if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, &key, bytes, false) {
+                        mat.normal_map_texture = Some(h);
+                        has_normal = true;
+                    }
+                }
+            }
+            mat_handles.push(materials.add(mat));
+            nodraw.push(false);
         }
         if mat_handles.is_empty() {
             mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
+            nodraw.push(false);
         }
         let mut list = Vec::new();
         for m in dmeshes {
@@ -1255,15 +1483,22 @@ fn setup_world(
                 bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
                 if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
                 bm.insert_indices(Indices::U32(indices.to_vec()));
+                // Bevy only applies a normal map when the mesh carries
+                // tangents (`VERTEX_TANGENTS`); derive them for models with one.
+                if has_normal && m.uvs.len() == m.positions.len() {
+                    let _ = bm.generate_tangents();
+                }
                 bm
             };
             if m.submeshes.is_empty() {
-                if m.indices.is_empty() { continue; }
+                if m.indices.is_empty() || nodraw.first().copied().unwrap_or(false) { continue; }
                 list.push((meshes.add(build_mesh(&m.indices)), mat_handles[0].clone()));
             } else {
                 for sm in &m.submeshes {
                     if sm.indices.is_empty() { continue; }
-                    let mat = mat_handles.get(sm.material as usize).cloned().unwrap_or_else(|| mat_handles[0].clone());
+                    let mi = sm.material as usize;
+                    if nodraw.get(mi).copied().unwrap_or(false) { continue; }
+                    let mat = mat_handles.get(mi).cloned().unwrap_or_else(|| mat_handles[0].clone());
                     list.push((meshes.add(build_mesh(&sm.indices)), mat));
                 }
             }

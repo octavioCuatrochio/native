@@ -10,6 +10,7 @@ mod ai_bridge;
 mod light_bridge;
 mod particle_bridge;
 mod interact;
+mod content_bridge;
 mod vehicle_bridge;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -1481,6 +1482,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
             cry_bridge::install(&mut app, h);
             ai_bridge::install(&mut app);
             app.add_plugins(interact::InteractPlugin);
+            app.add_plugins(content_bridge::ContentBridgePlugin);
             app.add_plugins(particle_bridge::ParticleBridgePlugin);
             app.add_plugins(vehicle_bridge::VehicleBridgePlugin);
             app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));

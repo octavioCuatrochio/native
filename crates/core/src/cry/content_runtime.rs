@@ -62,6 +62,14 @@ pub trait MissionWorld {
     fn actor_dead(&self, _mission: &str, _actor_index: usize) -> bool {
         false
     }
+    /// Completion override for objectives whose native predicate the test or
+    /// debug harness cannot produce yet (e.g. `KillActor` when the actor has no
+    /// live script handle). Returning `true` completes the objective on this
+    /// tick, exactly as a satisfied predicate would. Production worlds leave
+    /// the default.
+    fn force_objective_complete(&self, _mission: &str, _objective: &Objective) -> bool {
+        false
+    }
 }
 
 /// Observable output of a mission action. The app can map these onto HUD,
@@ -199,6 +207,21 @@ impl ContentManager {
         self.active.iter().any(|m| m.mission.label == label && m.state == MissionRun::Active)
     }
 
+    /// Whether an active mission has fired its `Activated` event. `EnterArea`
+    /// missions stay `false` until the app triggers their area.
+    pub fn is_activated(&self, label: &str) -> bool {
+        self.active.iter().any(|m| m.mission.label == label && m.activated)
+    }
+
+    /// The active objective of a running mission (its spec), when one is up.
+    pub fn active_objective_ref(&self, label: &str) -> Option<&Objective> {
+        self.active
+            .iter()
+            .find(|m| m.mission.label == label)
+            .and_then(|m| m.objective.as_ref())
+            .map(|o| &o.spec)
+    }
+
     pub fn is_complete(&self, label: &str) -> bool {
         self.completed.iter().any(|l| l == label)
     }
@@ -318,6 +341,12 @@ impl ContentManager {
         self.process_pending();
         for i in 0..self.active.len() {
             if self.active[i].state != MissionRun::Active {
+                continue;
+            }
+            // `EnterArea` missions are created but wait for the app to fire
+            // `activate_mission` once the player enters the area; only then does
+            // the first objective phase begin (`Class3:01355920`).
+            if !self.active[i].activated {
                 continue;
             }
             if self.active[i].objective.is_none() {
@@ -689,6 +718,9 @@ fn objective_condition_met(
     mission: &Mission,
     elapsed: f32,
 ) -> bool {
+    if world.force_objective_complete(&mission.label, spec) {
+        return true;
+    }
     match spec.kind {
         ObjectiveType::ClearArea => {
             if spec.locations.is_empty() {
@@ -935,6 +967,54 @@ mod tests {
         cm.tick(0.1, &TestWorld::new([0.0, 49.0, 0.0], 5));
         assert!(has_effect(&cm, |e| matches!(e, ContentEffect::ObjectiveCompleted { objective, .. } if objective == "Survive!")));
         assert!(cm.is_complete("ta10Buddies"));
+    }
+
+    #[test]
+    fn enter_area_mission_waits_for_activation() {
+        let xml = r#"<RtsMissionData><MissionFrameworkBucket Label="Arc">
+            <MissionFramework Label="ta20Forest" Type="Story" ActivateType="EnterArea" ApproachRadius="25">
+              <MissionActors><Actors><TagPoint ActorName="RTSPoint_TannerCabins" /></Actors></MissionActors>
+              <ObjectiveBuckets><ObjectiveBucket Label="Search"><Objectives>
+                <Objective Type="SearchBuilding" ObjectiveText="Search the Cabins" />
+              </Objectives></ObjectiveBucket></ObjectiveBuckets>
+            </MissionFramework>
+          </MissionFrameworkBucket></RtsMissionData>"#;
+        let mut cm = ContentManager::new(MissionData::parse(xml.as_bytes()));
+        assert!(cm.create_mission("ta20Forest"));
+        assert!(cm.is_active("ta20Forest"));
+        // Not OnAdd: created but not activated, and no objective is chosen yet.
+        assert!(!cm.is_activated("ta20Forest"));
+        cm.tick(0.1, &TestWorld::new([0.0; 3], 0));
+        assert_eq!(cm.active_objective_text("ta20Forest"), None);
+        // The app fires activation once the player reaches the area.
+        assert!(cm.activate_mission("ta20Forest"));
+        assert!(cm.is_activated("ta20Forest"));
+        assert_eq!(cm.active_objective_text("ta20Forest"), Some("Search the Cabins"));
+    }
+
+    #[test]
+    fn force_override_completes_objective() {
+        struct Forced;
+        impl MissionWorld for Forced {
+            fn player_pos(&self) -> [f32; 3] {
+                [0.0; 3]
+            }
+            fn force_objective_complete(&self, mission: &str, _o: &Objective) -> bool {
+                mission == "ta20Tower"
+            }
+        }
+        let xml = r#"<RtsMissionData><MissionFrameworkBucket Label="Arc">
+            <MissionFramework Label="ta20Tower" Type="Story" ActivateType="OnAdd">
+              <MissionActors><Actors><Player /></Actors></MissionActors>
+              <ObjectiveBuckets><ObjectiveBucket Label="Survey"><Objectives>
+                <Objective Type="Survey" ObjectiveText="Survey the Area" />
+              </Objectives></ObjectiveBucket></ObjectiveBuckets>
+            </MissionFramework>
+          </MissionFrameworkBucket></RtsMissionData>"#;
+        let mut cm = ContentManager::new(MissionData::parse(xml.as_bytes()));
+        cm.create_mission("ta20Tower");
+        cm.tick(0.1, &Forced);
+        assert!(cm.is_complete("ta20Tower"));
     }
 
     #[test]

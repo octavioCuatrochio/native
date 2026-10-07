@@ -174,9 +174,10 @@ pub fn update_terrain_lod(
     // only the per-sector children draw.
     if terrain.is_none() {
         let Some((e, m, mat)) = terrain_q.iter().next() else { return };
-        if let Some(mut mesh) = meshes.get_mut(&m.0) {
-            *mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-        }
+        // Drop the setup-time mesh from the entity (an attribute-less mesh would
+        // break the shadow/prepass pipeline); the entity stays as the parent.
+        meshes.remove(&m.0);
+        commands.entity(e).remove::<Mesh3d>();
         *terrain = Some((e, mat.0.clone()));
     }
     let (terrain_e, terrain_mat) = terrain.clone().unwrap();

@@ -17,6 +17,7 @@ pub mod architecture;
 pub mod asset;
 pub mod audio;
 pub mod audio_fev;
+pub mod audio_play;
 pub mod cache;
 pub mod camera;
 pub mod cdf;

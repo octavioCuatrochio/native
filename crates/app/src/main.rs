@@ -2777,6 +2777,10 @@ fn animate_followers(time: Res<Time>, mut meshes: ResMut<Assets<Mesh>>, mut q: Q
     }
 }
 
+/// Player melee/firearm input. The attack itself now runs through the original
+/// game-rules pipeline: this only translates the input into a
+/// [`ai_bridge::PlayerAttackRequest`] (the bridge owns the script host and the
+/// damage model), exactly as `CreateHit` does in `singleplayer.lua:332`.
 fn player_attack(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -2784,64 +2788,49 @@ fn player_attack(
     player: Option<Res<Player>>,
     state: Option<ResMut<PlayerState>>,
     mut game: ResMut<GameState>,
-    mut npcs: Query<(Entity, &Transform, &mut Npc)>,
-    mut commands: Commands,
+    mut req: Option<ResMut<ai_bridge::PlayerAttackRequest>>,
 ) {
     if menu.active { return; }
     let (Some(player), Some(mut state)) = (player, state) else { return };
-    let br = base_rot();
-    let pw = br * Vec3::new(player.pos[0], player.pos[1], 0.0);
     let dt = time.delta_secs();
     let PlayerState { vitals, melee, gun, gun_state, .. } = &mut *state;
     let auto = std::env::var("SOD_AUTOFIGHT").is_ok();
+    // `SOD_AUTOFIGHT` closes to melee; `SOD_AUTOGUN` also fires at range.
+    let auto_gun = std::env::var("SOD_AUTOGUN").is_ok();
     game.auto_cd = (game.auto_cd - dt).max(0.0);
     game.auto_fire_cd = (game.auto_fire_cd - dt).max(0.0);
     let melee_now = keys.just_pressed(KeyCode::Space) || (auto && game.auto_cd <= 0.0);
-    let fire_now = keys.just_pressed(KeyCode::KeyF) || (auto && game.auto_fire_cd <= 0.0);
+    let fire_now =
+        keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && game.auto_fire_cd <= 0.0);
 
-    // Melee: nearest zombie within reach.
-    if melee_now {
-        let mut best: Option<(Entity, f32)> = None;
-        for (e, t, _n) in npcs.iter_mut() {
-            let d = (t.translation - pw).length();
-            if d < 2.8 && best.map_or(true, |(_, b)| d < b) { best = Some((e, d)); }
-        }
-        if let Some((e, _)) = best {
-            if let Ok((_, _, mut npc)) = npcs.get_mut(e) {
-                let hit = combat::melee_swing(melee, npc.kind, npc.hp, sod_core::game::HitLocation::TORSO, vitals.stamina);
-                npc.hp = (npc.hp - hit.damage).max(0.0);
-                vitals.stamina = (vitals.stamina - hit.stamina_cost).max(0.0);
-                println!("[combat] {} -> {} hp {:.0} (dmg {:.0}, sever {:?})", melee.name, npc.kind.name(), npc.hp, hit.damage, hit.sever);
-                if npc.hp <= 0.0 {
-                    commands.entity(e).despawn();
-                    game.kills += 1;
-                    let kills = game.kills;
-                    println!("[combat] zombie killed ({} total)", kills);
-                    game.tutorial.notify(&mission::TutorialTrigger::KillCount(kills));
-                }
-            }
-        }
+    let mut out = ai_bridge::PlayerAttackRequest {
+        origin: player.mstate.pos,
+        yaw: player.mstate.yaw,
+        ..Default::default()
+    };
+
+    // Auto-fight harness: keep the demo supplied so both weapon paths stay
+    // exercised (normal play waits for a real reload).
+    if auto && gun_state.in_mag == 0 && gun_state.reserve == 0 {
+        *gun_state = combat::GunState::new(7, 21);
     }
 
-    // Firearm: nearest zombie, any range.
+    if melee_now {
+        let cost = melee.stamina_cost();
+        let tired = vitals.stamina < cost;
+        vitals.stamina = (vitals.stamina - cost).max(0.0);
+        out.melee = Some(if tired { melee.damage * 0.5 } else { melee.damage });
+        game.auto_cd = 0.6;
+    }
+
     if fire_now {
-        let mut best: Option<(Entity, f32)> = None;
-        for (e, t, _n) in npcs.iter_mut() {
-            let d = (t.translation - pw).length();
-            if best.map_or(true, |(_, b)| d < b) { best = Some((e, d)); }
-        }
-        if let Some((e, _)) = best {
-            if let Some(dmg) = gun_state.fire(gun, dt) {
-                if let Ok((_, _, mut npc)) = npcs.get_mut(e) {
-                    npc.hp = sod_core::game::apply_zombie_damage(npc.hp, npc.kind, dmg, sod_core::game::HitLocation::TORSO, combat::BLOATER_HEADSHOT_KILL);
-                    println!("[combat] {} ({}/{} rounds) -> {} hp {:.0}", gun.name, gun_state.in_mag, gun.mag_size, npc.kind.name(), npc.hp);
-                    if npc.hp <= 0.0 {
-                        commands.entity(e).despawn();
-                        game.kills += 1;
-                        let kills = game.kills;
-                        game.tutorial.notify(&mission::TutorialTrigger::KillCount(kills));
-                    }
-                }
+        if let Some(dmg) = gun_state.fire(gun, dt) {
+            out.shot = Some(dmg);
+            game.auto_fire_cd = gun.shot_interval().max(0.1);
+        } else {
+            game.auto_fire_cd = 0.12;
+            if auto && gun_state.in_mag == 0 && gun_state.reload_left <= 0.0 {
+                gun_state.reload(gun);
             }
         }
     }
@@ -2849,35 +2838,58 @@ fn player_attack(
     if keys.just_pressed(KeyCode::KeyR) && gun_state.reload(gun) {
         println!("[combat] reloading {} ({}/{})", gun.name, gun_state.in_mag, gun_state.reserve);
     }
-}
 
-fn npc_attack(time: Res<Time>, menu: Res<MenuRes>, player: Option<Res<Player>>, state: Option<ResMut<PlayerState>>, q: Query<(&Transform, &Npc)>) {
-    if menu.active { return; }
-    let (Some(player), Some(mut state)) = (player, state) else { return };
-    let dt = time.delta_secs();
-    let br = base_rot();
-    let pw = br * Vec3::new(player.pos[0], player.pos[1], 0.0);
-    let mut dmg = 0.0;
-    for (t, npc) in &q {
-        if (t.translation - pw).length() < 1.3 {
-            // Damage-per-second derived from strike damage / strike cooldown.
-            dmg += combat::zombie_attack_damage(npc.kind) * dt / combat::zombie_melee_cooldown(npc.kind);
-        }
-    }
-    if dmg > 0.0 {
-        state.vitals.hp = (state.vitals.hp - dmg).max(0.0);
+    if let Some(r) = req.as_deref_mut() {
+        *r = out;
     }
 }
 
-fn player_vitals(time: Res<Time>, menu: Res<MenuRes>, state: Option<ResMut<PlayerState>>) {
+/// Legacy proximity damage is retired: zombies now strike through the original
+/// `g_gameRules` hit pipeline in `ai_bridge::combat_step` (with perception,
+/// hit type/material and the recovered damage rules), not this per-`Npc` DPS.
+fn npc_attack(
+    _time: Res<Time>,
+    _menu: Res<MenuRes>,
+    _player: Option<Res<Player>>,
+    _state: Option<ResMut<PlayerState>>,
+    _q: Query<(&Transform, &Npc)>,
+) {
+}
+
+/// Advance the player's stamina/bleed and mirror the authoritative actor health
+/// (written by `ai_bridge::combat_step` through the game-rules pipeline) into
+/// the HUD vitals. The HUD therefore reads `self.actor` health, not the old
+/// separate approximation.
+fn player_vitals(
+    time: Res<Time>,
+    menu: Res<MenuRes>,
+    state: Option<ResMut<PlayerState>>,
+    cry: Option<NonSendMut<cry_bridge::CryHost>>,
+) {
     if menu.active { return; }
     let Some(mut state) = state else { return };
     let dt = time.delta_secs();
     state.vitals.tick(dt);
     state.gun_state.tick(dt);
+    let cry = cry.as_deref();
+    if let Some(cry) = cry {
+        let pid = cry.player;
+        if let Ok(actors) = cry.host.ctx.actors.try_borrow() {
+            if let Some(a) = actors.get(&pid) {
+                state.vitals.max_hp = a.max_health.max(1.0);
+                state.vitals.hp = a.health.clamp(0.0, state.vitals.max_hp);
+            }
+        }
+    }
     if state.vitals.is_downed() {
         println!("[game] player downed -> revive");
         state.vitals.revive();
+        if let Some(cry) = cry {
+            if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&cry.player) {
+                a.max_health = state.vitals.max_hp;
+                a.health = state.vitals.hp;
+            }
+        }
     }
 }
 

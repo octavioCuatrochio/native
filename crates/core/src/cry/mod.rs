@@ -11,6 +11,8 @@ pub mod ai_runtime;
 pub mod binds_entity;
 pub mod binds_sound;
 pub mod binds_system;
+pub mod combat;
+pub mod combat_perception;
 mod cvar_table;
 pub mod constants;
 pub mod cvars;

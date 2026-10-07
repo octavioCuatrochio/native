@@ -27,8 +27,13 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use std::path::{Path, PathBuf};
 use sod_core::cry::ai;
 use sod_core::cry::ai_data::AiState;
+use sod_core::cry::combat::{self as cry_combat, DamageTarget, HitMaterial};
+use sod_core::cry::combat_perception::{self as perception, Senses, SoundStimulus};
+use sod_core::game::ZombieKind;
 use sod_core::cry::navmesh::{self, NavMesh};
 use sod_core::cry::phys_world::CollisionWorld;
 use sod_core::cry::world::EntityId;
@@ -62,8 +67,45 @@ struct ZombieTemplate {
     idle: anim::Caf,
     /// Forward shambling walk loop.
     walk: anim::Caf,
+    /// Best available death clip (played once on the corpse).
+    death: Option<anim::Caf>,
+    /// Best available hit-reaction clip (played once on a hit).
+    react: Option<anim::Caf>,
     /// Built once on the first render spawn.
     mats: Vec<Handle<StandardMaterial>>,
+}
+
+/// Per-live-handle combat state driven by the native perception/attack loop.
+#[derive(Clone, Debug, Default)]
+struct ZombieCombat {
+    /// Seconds until the next melee strike is allowed.
+    attack_cd: f32,
+    /// True once the zombie's perception acquired the player.
+    alerted: bool,
+    /// Hit-reaction timer (seconds); drives the visible knock-back.
+    reaction: f32,
+}
+
+/// Player attack intent published by `main.rs::player_attack` and resolved by
+/// the bridge (which owns the actor health and the script host).
+#[derive(Resource, Default)]
+pub struct PlayerAttackRequest {
+    /// `Some(base_damage)` when a melee swing landed this frame.
+    pub melee: Option<f32>,
+    /// `Some(base_damage)` when a firearm round fired this frame.
+    pub shot: Option<f32>,
+    /// CryEngine-space player position.
+    pub origin: [f32; 3],
+    /// Player body yaw (radians).
+    pub yaw: f32,
+}
+
+/// The outcome of one frame of combat, for HUD/telemetry.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct CombatStats {
+    pub hits_dealt: u64,
+    pub hits_taken: u64,
+    pub kills: u64,
 }
 
 /// The whole bridge state: runtime, navmesh, per-class character templates and
@@ -89,6 +131,22 @@ pub struct ZombieBridge {
     log_timer: f32,
     /// True once init has been attempted (success or not).
     tried_init: bool,
+    /// Per-live-handle perception/attack state.
+    combat: HashMap<u32, ZombieCombat>,
+    /// Dead handles kept as corpses for this many seconds before despawn.
+    dead: HashMap<u32, f32>,
+    /// Handles killed this run; never re-promoted (the director does not model
+    /// kills, so without this a dead slot would respawn on the next tick).
+    killed: HashSet<u32>,
+    /// Player actor health was pushed into the script host.
+    player_ready: bool,
+    /// Monotonic frame counter (deterministic hit-material selection).
+    frame: u64,
+    /// Cumulative combat counters.
+    stats: CombatStats,
+    /// One-shot combat screenshots (`SOD_HITSHOT`) already taken.
+    shot_player: bool,
+    shot_zombie: bool,
 }
 
 /// One promoted zombie's render-side skinned character.
@@ -99,8 +157,16 @@ struct ZombieVisual {
     skeleton: Skeleton,
     idle: anim::Caf,
     walk: anim::Caf,
+    death: Option<anim::Caf>,
+    react: Option<anim::Caf>,
     time: f32,
     moving: bool,
+    /// True once the actor is dead (plays the death clip, then holds).
+    dying: bool,
+    /// True while a hit-reaction clip is playing.
+    reacting: bool,
+    /// Previous frame's reaction timer (to restart the clip on a fresh hit).
+    last_react: f32,
 }
 
 impl ZombieBridge {
@@ -113,16 +179,19 @@ impl ZombieBridge {
 /// Register the bridge. Call inside `run_world`'s play branch once the script
 /// host exists.
 pub fn install(app: &mut App) {
-    app.init_resource::<ZombieBridge>().add_systems(
-        Update,
-        (
-            zombie_bridge_tick.after(crate::move_player),
-            zombie_visual_sync,
-            animate_zombie_visuals,
-            zombie_hud.after(crate::hud_update),
-        )
-            .chain(),
-    );
+    app.init_resource::<ZombieBridge>()
+        .init_resource::<PlayerAttackRequest>()
+        .init_resource::<CombatStats>()
+        .add_systems(
+            Update,
+            (
+                zombie_bridge_tick.after(crate::move_player).after(crate::player_attack),
+                zombie_visual_sync,
+                animate_zombie_visuals,
+                zombie_hud.after(crate::hud_update),
+            )
+                .chain(),
+        );
 }
 
 /// Lazy-boot the runtime from the mounted data. Returns `false` until ready.
@@ -212,7 +281,9 @@ fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTem
         let walk = pick_clip(vfs, def.rig, WALK_CLIPS)
             .or_else(|| bank.caf_for(anim::Locomotion::Walk).cloned())
             .unwrap_or_else(|| idle.clone());
-        Some(ZombieTemplate { model, slots, tex_bytes, skeleton, influences, idle, walk, mats: Vec::new() })
+        let death = pick_clip(vfs, def.rig, DEATH_CLIPS);
+        let react = pick_clip(vfs, def.rig, REACT_CLIPS);
+        Some(ZombieTemplate { model, slots, tex_bytes, skeleton, influences, idle, walk, death, react, mats: Vec::new() })
     } else {
         crate::load_any_character(vfs, def.path, Some(def.rig)).map(
             |(model, slots, tex_bytes, skeleton, influences, _caf, bank)| {
@@ -222,6 +293,8 @@ fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTem
                 let walk = pick_clip(vfs, def.rig, WALK_CLIPS)
                     .or_else(|| bank.caf_for(anim::Locomotion::Walk).cloned())
                     .unwrap_or_else(|| idle.clone());
+                let death = pick_clip(vfs, def.rig, DEATH_CLIPS);
+                let react = pick_clip(vfs, def.rig, REACT_CLIPS);
                 ZombieTemplate {
                     model,
                     slots,
@@ -230,6 +303,8 @@ fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTem
                     influences,
                     idle,
                     walk,
+                    death,
+                    react,
                     mats: Vec::new(),
                 }
             },
@@ -244,6 +319,12 @@ const IDLE_CLIPS: &[&str] = &["relaxed_basic_idle", "wander_idle", "dormant_idle
 /// Walk clip preferences, best first.
 const WALK_CLIPS: &[&str] =
     &["wander_walk_01", "wander_walk", "relaxed_walk_forward_slow", "walk_forward", "walk"];
+/// Death clip preferences, best first (react/fall first, then down/death).
+const DEATH_CLIPS: &[&str] =
+    &["react_death", "death_01", "death", "react/fall", "fall_forward", "death_front"];
+/// Hit-reaction clip preferences, best first.
+const REACT_CLIPS: &[&str] =
+    &["react_mid_front", "react_mid", "react_light_front", "stagger", "flinch", "react"];
 
 /// Find and parse the first `.$caf` under `rig` whose path contains one of
 /// `needles` (in preference order). Used to pin the zombie locomotion loops the
@@ -278,10 +359,12 @@ fn player_pos(player: Option<&Player>, pos: Option<&CryPlayerPos>) -> Option<[f3
 fn zombie_bridge_tick(
     mut commands: Commands,
     cry: Option<NonSendMut<CryHost>>,
-    player: Option<Res<Player>>,
+    mut player: Option<ResMut<Player>>,
     cpos: Option<Res<CryPlayerPos>>,
     collision: Option<Res<Collision>>,
     time: Res<Time>,
+    mut req: ResMut<PlayerAttackRequest>,
+    mut sm: Option<ResMut<crate::PlayerSm>>,
     mut bridge: ResMut<ZombieBridge>,
 ) {
     let Some(mut cry) = cry else { return };
@@ -291,6 +374,7 @@ fn zombie_bridge_tick(
     }
     let dt = time.delta_secs().min(0.1);
     let collision = collision.as_ref().map(|c| &c.0);
+    ensure_player_health(&mut bridge, &mut cry);
 
     {
         let ZombieBridge { rt, nav, .. } = &mut *bridge;
@@ -301,12 +385,13 @@ fn zombie_bridge_tick(
     // Snapshot feet positions before the movement steps so the world sweep can
     // cast the frame's delta.
     let prev: Vec<[f32; 3]> = bridge.rt.as_ref().unwrap().zombies.iter().map(|z| z.pos).collect();
+    let killed = bridge.killed.clone();
     {
         let ZombieBridge { rt, nav, .. } = &mut *bridge;
         let rt = rt.as_mut().unwrap();
         rt.step_logical(dt, ppos, collision);
         rt.step_ai(dt, ppos, nav.as_ref(), collision);
-        apply_actor_physics(rt, ppos, collision, &prev);
+        apply_actor_physics(rt, ppos, collision, &prev, &killed);
     }
 
     // Push actor transforms into the script world and route raised signals to
@@ -334,6 +419,35 @@ fn zombie_bridge_tick(
         let _ = cry.host.event(s.entity, "OnSignal", (s.name.clone(), s.filter, s.mode));
     }
 
+    // The original combat loop: perception -> target acquisition -> melee hits
+    // through the game-rules damage pipeline.
+    let request = std::mem::take(&mut *req);
+    let hitshot = std::env::var("SOD_HITSHOT").ok().map(PathBuf::from);
+    combat_step(
+        &mut bridge,
+        &mut cry,
+        &mut commands,
+        &hitshot,
+        ppos,
+        collision,
+        dt,
+        request,
+        sm.as_deref_mut(),
+        player.as_deref_mut(),
+    );
+
+    // Retire expired corpses.
+    let expired: Vec<u32> =
+        bridge.dead.iter().filter(|(_, t)| **t <= 0.0).map(|(h, _)| *h).collect();
+    for h in expired {
+        bridge.dead.remove(&h);
+        if let Some(rt) = bridge.rt.as_mut() {
+            if let Some(z) = rt.zombies.iter_mut().find(|z| z.handle == h) {
+                z.live = false;
+            }
+        }
+    }
+
     log_transitions(&mut bridge);
     bridge.log_timer += dt;
     if bridge.log_timer >= 2.0 {
@@ -349,13 +463,18 @@ fn zombie_bridge_tick(
                 (dx * dx + dy * dy).sqrt()
             })
             .fold(f32::INFINITY, f32::min);
+        let alerted = bridge.combat.values().filter(|c| c.alerted).count();
         println!(
-            "[zombie] live={} logical={} total={} spawned={} despawned={} nearest={:.1}m",
+            "[zombie] live={} logical={} total={} spawned={} despawned={} alerted={} hits_dealt={} hits_taken={} kills={} nearest={:.1}m",
             live,
             rt.zombies.len() - live,
             rt.zombies.len(),
             rt.spawned,
             rt.despawned,
+            alerted,
+            bridge.stats.hits_dealt,
+            bridge.stats.hits_taken,
+            bridge.stats.kills,
             if nearest.is_finite() { nearest } else { -1.0 },
         );
     }
@@ -374,9 +493,13 @@ fn apply_actor_physics(
     player: [f32; 3],
     collision: Option<&CollisionWorld>,
     prev: &[[f32; 3]],
+    skip: &HashSet<u32>,
 ) {
     if let Some(c) = collision {
         for (z, p0) in rt.zombies.iter_mut().zip(prev.iter().copied()) {
+            if skip.contains(&z.handle) {
+                continue;
+            }
             let cap = zombie_actor::capsule_for_class(&z.entity_class);
             let delta = [z.pos[0] - p0[0], z.pos[1] - p0[1], z.pos[2] - p0[2]];
             if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] > 1e-8 {
@@ -387,15 +510,18 @@ fn apply_actor_physics(
     }
 
     // Actor-actor + actor-player separation. The player is a fixed body so the
-    // player controller (main.rs) stays authoritative.
-    let mut bodies: Vec<Body> = rt
-        .zombies
-        .iter()
-        .map(|z| {
-            let cap = zombie_actor::capsule_for_class(&z.entity_class);
-            Body { pos: z.pos, radius: cap.radius, height: cap.height, fixed: false }
-        })
-        .collect();
+    // player controller (main.rs) stays authoritative. Corpses are left in
+    // place and excluded so they do not wall live zombies off the player.
+    let mut indices: Vec<usize> = Vec::new();
+    let mut bodies: Vec<Body> = Vec::new();
+    for (i, z) in rt.zombies.iter().enumerate() {
+        if skip.contains(&z.handle) {
+            continue;
+        }
+        let cap = zombie_actor::capsule_for_class(&z.entity_class);
+        bodies.push(Body { pos: z.pos, radius: cap.radius, height: cap.height, fixed: false });
+        indices.push(i);
+    }
     bodies.push(Body {
         pos: player,
         radius: sod_core::class3_physics::PLAYER_CAPSULE_RADIUS,
@@ -403,14 +529,374 @@ fn apply_actor_physics(
         fixed: true,
     });
     zombie_actor::separate_bodies(&mut bodies, SEPARATION_ITERATIONS);
-    for (z, b) in rt.zombies.iter_mut().zip(bodies.iter()) {
-        z.pos[0] = b.pos[0];
-        z.pos[1] = b.pos[1];
+    for (k, &i) in indices.iter().enumerate() {
+        rt.zombies[i].pos[0] = bodies[k].pos[0];
+        rt.zombies[i].pos[1] = bodies[k].pos[1];
     }
     if let Some(c) = collision {
-        for z in rt.zombies.iter_mut() {
+        for &i in &indices {
+            let z = &mut rt.zombies[i];
             z.pos[2] = ground(c, z.pos[0], z.pos[1], z.pos[2]);
         }
+    }
+}
+
+/// How long a dead actor stays as a corpse before its entity/visual is removed.
+const CORPSE_TIME: f32 = 6.0;
+/// Player melee reach used by the auto/player attack resolver (m). The zombie's
+/// own strike radius is [`cry_combat::MELEE_DAMAGE_RADIUS`].
+const PLAYER_MELEE_REACH: f32 = 2.2;
+/// Maximum firearm range the resolver will target.
+const PLAYER_GUN_RANGE: f32 = 45.0;
+
+/// One-shot push of the player's `g_playerHealthValue` into the script actor.
+/// The zombie scripts call `BasicActor:ResetCommon` from `OnReset`, which the
+/// host does not send at spawn, so the actor otherwise keeps its 100 HP default.
+fn ensure_player_health(br: &mut ZombieBridge, cry: &mut CryHost) {
+    if br.player_ready {
+        return;
+    }
+    let target = cry
+        .host
+        .ctx
+        .cvars
+        .borrow()
+        .get("g_playerhealthvalue")
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(cry_combat::PLAYER_MAX_HEALTH);
+    let id = cry.player;
+    if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&id) {
+        a.max_health = target;
+        a.health = target;
+        br.player_ready = true;
+        println!("[combat] player actor #{id} health {target:.0}");
+    }
+}
+
+fn actor_health(cry: &CryHost, id: EntityId) -> Option<f32> {
+    cry.host.ctx.actors.borrow().get(&id).map(|a| a.health)
+}
+
+fn set_actor_health(cry: &CryHost, id: EntityId, hp: f32) {
+    if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&id) {
+        a.health = hp.max(0.0);
+    }
+}
+
+/// Deterministic hit-material choice: exercise headshots as well as body hits
+/// without an RNG resource. The bullet/melee `material` drives the headshot
+/// branch of [`cry_combat::process_actor_damage`].
+fn hit_material(frame: u64, handle: u32) -> HitMaterial {
+    if (frame.wrapping_add(handle as u64)) % 4 == 0 {
+        HitMaterial::Head
+    } else {
+        HitMaterial::Torso
+    }
+}
+
+/// Dispatch the death events the zombie's own script handles: `Kill` (reached
+/// from `SinglePlayer:ProcessDeath` -> `target:Kill(...)`), `OnDeadHit`
+/// (`BasicActor.Server:OnDeadHit`) and a `TO_IDLE` signal so the AI drops the
+/// hunt state.
+fn dispatch_zombie_death(cry: &CryHost, entity: EntityId, shooter: Option<EntityId>, weapon: Option<EntityId>, headshot: bool) {
+    let shooter = shooter.map(|s| s as i64).unwrap_or(0);
+    let weapon = weapon.map(|w| w as i64).unwrap_or(0);
+    let _ = cry.host.event(entity, "OnDeadHit", ());
+    let _ = cry.host.event(entity, "Kill", (true, shooter, weapon, false, headshot));
+    let _ = cry.host.event(entity, "OnSignal", ("TO_IDLE".to_string(), 0i64, 0i64));
+}
+
+/// Force the player's original `.sm` into a `MachineDriven` reaction. Reuses the
+/// `SOD_SMTEST` window (`enter_frame = 90`, hold 300 frames) by rewinding the
+/// debug driver's frame counter, so no animation code needs changing.
+fn trigger_player_reaction(sm: Option<&mut crate::PlayerSm>, name: &str) {
+    let Some(sm) = sm else { return };
+    if let Some(idx) = sm.inst.find_state(name) {
+        sm.test = crate::SmTest::Jump(idx);
+        sm.armed = false;
+        sm.released = false;
+        sm.frame = 89;
+        sm.next_release_frame = 389;
+        println!("[combat] player reaction -> [{idx}] {}", sm.inst.state_name());
+    }
+}
+
+/// Horizontal ground distance.
+fn horiz(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// `SOD_HITSHOT=<base>` combat screenshot path with a suffix.
+fn shot_path(base: &Path, suffix: &str) -> PathBuf {
+    let stem = base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "shot".into());
+    base.with_file_name(format!("{stem}.{suffix}.png"))
+}
+
+/// Apply one already-picked player hit to zombie `idx` through
+/// [`cry_combat::process_actor_damage`], then dispatch death if it was lethal.
+#[allow(clippy::too_many_arguments)]
+fn resolve_player_hit(
+    br: &mut ZombieBridge,
+    cry: &mut CryHost,
+    commands: &mut Commands,
+    hitshot: &Option<PathBuf>,
+    idx: usize,
+    player: EntityId,
+    hit: &cry_combat::Hit,
+    base: f32,
+    label: &str,
+) {
+    let (handle, kind, class) = {
+        let z = &br.rt.as_ref().unwrap().zombies[idx];
+        (z.handle, z.kind, z.entity_class.clone())
+    };
+    let entity = hit.target;
+    let cur = actor_health(cry, entity).unwrap_or_else(|| kind.stats().hp);
+    let out = cry_combat::process_actor_damage(cur, DamageTarget::Zombie(kind), hit, cry_combat::BLOATER_HEADSHOT_KILL);
+    set_actor_health(cry, entity, out.health);
+    br.stats.hits_dealt += 1;
+    if let Some(c) = br.combat.get_mut(&handle) {
+        c.reaction = 0.35;
+    }
+    println!(
+        "[combat] player({label}) -> zombie #{handle} {class} {base:.0} dmg ({cur:.0}->{:.0} hp){}",
+        out.health,
+        if out.dead { " KILL" } else if out.headshot { " headshot" } else { "" },
+    );
+    if out.dead {
+        if let Some(z) = br.rt.as_mut().unwrap().zombies.iter_mut().find(|z| z.handle == handle) {
+            z.live = false;
+        }
+        br.combat.remove(&handle);
+        br.dead.insert(handle, CORPSE_TIME);
+        br.killed.insert(handle);
+        dispatch_zombie_death(cry, entity, Some(player), hit.weapon, out.headshot);
+        br.stats.kills += 1;
+        println!("[combat] zombie #{handle} {class} died (kills={})", br.stats.kills);
+    }
+    // Capture the zombie's hit/death reaction once.
+    if out.dealt > 0.0 && !br.shot_zombie {
+        if let Some(base) = hitshot {
+            let p = shot_path(base, "zombie");
+            commands.spawn(Screenshot::primary_window()).observe(save_to_disk(p.clone()));
+            br.shot_zombie = true;
+            println!("[combat] zombie reaction screenshot {}", p.display());
+        }
+    }
+}
+
+/// The original combat loop for one frame:
+/// 1. zombie perception acquires the player (feeding the hunt pipe's target),
+/// 2. alerted zombies in melee range strike through the damage pipeline,
+/// 3. the player's queued melee/fire attack resolves against the nearest live
+///    zombie, and a lethal result dispatches the victim's `Kill`/`OnDeadHit`.
+#[allow(clippy::too_many_arguments)]
+fn combat_step(
+    br: &mut ZombieBridge,
+    cry: &mut CryHost,
+    commands: &mut Commands,
+    hitshot: &Option<PathBuf>,
+    player_pos: [f32; 3],
+    collision: Option<&CollisionWorld>,
+    dt: f32,
+    request: PlayerAttackRequest,
+    mut sm: Option<&mut crate::PlayerSm>,
+    mut player_res: Option<&mut Player>,
+) {
+    br.frame = br.frame.wrapping_add(1);
+    let player = cry.player;
+    let auto = std::env::var("SOD_AUTOFIGHT").is_ok();
+
+    // In the auto-fight harness the player does not turn (no mouse input), so
+    // face the nearest live zombie before resolving the melee cone. This only
+    // runs under `SOD_AUTOFIGHT`; normal play keeps the camera-driven yaw.
+    let mut aim_yaw = request.yaw;
+    if auto {
+        if let Some(p) = player_res.as_deref_mut() {
+            if let Some(rt) = br.rt.as_ref() {
+                let mut best: Option<(f32, f32)> = None;
+                for z in rt.zombies.iter().filter(|z| z.live && z.entity.is_some()) {
+                    let d = horiz(request.origin, z.pos);
+                    if best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, (z.pos[1] - request.origin[1]).atan2(z.pos[0] - request.origin[0])));
+                    }
+                }
+                if let Some((_, y)) = best {
+                    p.mstate.yaw = y;
+                    aim_yaw = y;
+                }
+            }
+        }
+    }
+
+    for c in br.combat.values_mut() {
+        c.attack_cd = (c.attack_cd - dt).max(0.0);
+        c.reaction = (c.reaction - dt).max(0.0);
+    }
+    for t in br.dead.values_mut() {
+        *t -= dt;
+    }
+
+    let forward = [aim_yaw.cos(), aim_yaw.sin()];
+    let gunshot = request.shot.is_some();
+
+    // --- 3. player attack (resolve before zombie attacks) ---
+    // Melee and the firearm are resolved independently (a frame can carry
+    // both) against the nearest qualifying live zombie.
+    let origin = request.origin;
+    if let Some(dmg) = request.melee {
+        let pick = {
+            let rt = br.rt.as_ref().unwrap();
+            let mut best: Option<(usize, f32)> = None;
+            for (i, z) in rt.zombies.iter().enumerate() {
+                if !z.live || br.dead.contains_key(&z.handle) || br.killed.contains(&z.handle) {
+                    continue;
+                }
+                if cry_combat::melee_arc_test(origin, [forward[0], forward[1], 0.0], z.pos, 70.0, 0.0, PLAYER_MELEE_REACH).is_some() {
+                    let d = horiz(origin, z.pos);
+                    if best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((i, d));
+                    }
+                }
+            }
+            best.map(|(i, _)| i)
+        };
+        if let Some(i) = pick {
+            let (entity, zpos, handle) = {
+                let z = &br.rt.as_ref().unwrap().zombies[i];
+                (z.entity.unwrap_or(0), z.pos, z.handle)
+            };
+            let material = hit_material(br.frame, handle);
+            let hit = cry_combat::Hit::melee(entity, player, dmg, material, zpos, [forward[0], forward[1], 0.0]);
+            resolve_player_hit(br, cry, commands, hitshot, i, player, &hit, dmg, "melee");
+        }
+    }
+    if let Some(dmg) = request.shot {
+        let max_range = PLAYER_GUN_RANGE;
+        let pick = {
+            let rt = br.rt.as_ref().unwrap();
+            let mut best: Option<(usize, f32)> = None;
+            for (i, z) in rt.zombies.iter().enumerate() {
+                if !z.live || br.dead.contains_key(&z.handle) || br.killed.contains(&z.handle) {
+                    continue;
+                }
+                let d = horiz(origin, z.pos);
+                if d <= max_range
+                    && line_of_sight(collision, origin, z.pos)
+                    && best.map_or(true, |(_, bd)| d < bd)
+                {
+                    best = Some((i, d));
+                }
+            }
+            best.map(|(i, _)| i)
+        };
+        if let Some(i) = pick {
+            let (entity, zpos, handle) = {
+                let z = &br.rt.as_ref().unwrap().zombies[i];
+                (z.entity.unwrap_or(0), z.pos, z.handle)
+            };
+            let material = hit_material(br.frame, handle);
+            let hit = cry_combat::Hit::bullet(entity, player, 0, dmg, material, zpos, [forward[0], forward[1], 0.0]);
+            resolve_player_hit(br, cry, commands, hitshot, i, player, &hit, dmg, "gun");
+        }
+    }
+
+    // --- 1 + 2. zombie perception and melee ---
+    let gun_sound = gunshot.then_some(SoundStimulus { pos: player_pos, radius: perception::COMBAT_SOUND_DIST });
+    let mut player_hit: Option<([f32; 3], f32, ZombieKind, HitMaterial, EntityId)> = None;
+    {
+        let rt = br.rt.as_mut().unwrap();
+        for i in 0..rt.zombies.len() {
+            let (handle, entity, class, kind, zpos, heading) = {
+                let z = &rt.zombies[i];
+                (z.handle, z.entity, z.entity_class.clone(), z.kind, z.pos, z.heading)
+            };
+            let Some(entity) = entity else { continue };
+            if br.dead.contains_key(&handle) || br.killed.contains(&handle) {
+                continue;
+            }
+            let dist = horiz(zpos, player_pos);
+            let senses = Senses::for_class(&class);
+            let los = |a: [f32; 3], b: [f32; 3]| line_of_sight(collision, a, b);
+            let perc = perception::perceive(zpos, heading, &senses, player_pos, false, los, gun_sound);
+            let entry = br.combat.entry(handle).or_default();
+            if perc.has_target() {
+                if !entry.alerted {
+                    entry.alerted = true;
+                    println!("[combat] zombie #{} {class} acquired player at {dist:.1}m", handle);
+                    let _ = cry.host.event(entity, "OnSignal", ("TO_FRESHMEAT".to_string(), 0i64, 0i64));
+                }
+                rt.zombies[i].target = Some(player_pos);
+            } else {
+                entry.alerted = false;
+                rt.zombies[i].target = None;
+            }
+            if entry.alerted && entry.attack_cd <= 0.0 && dist <= cry_combat::MELEE_DAMAGE_RADIUS + 1.1 {
+                let dmg = cry_combat::zombie_melee_damage(kind);
+                let material = hit_material(br.frame, handle);
+                entry.attack_cd = cry_combat::zombie_melee_cooldown(kind);
+                player_hit = Some((zpos, dmg, kind, material, entity));
+            }
+        }
+    }
+
+    if let Some((zpos, dmg, kind, material, attacker)) = player_hit {
+        let dir = [player_pos[0] - zpos[0], player_pos[1] - zpos[1], 0.0];
+        let hit = cry_combat::Hit::melee(player, attacker, dmg, material, zpos, dir);
+        let cur = actor_health(cry, player).unwrap_or(cry_combat::PLAYER_MAX_HEALTH);
+        let out = cry_combat::process_actor_damage(cur, DamageTarget::Player, &hit, true);
+        set_actor_health(cry, player, out.health);
+        br.stats.hits_taken += 1;
+        println!(
+            "[combat] zombie {} hit player for {:.0} ({:.0}->{:.0} hp){}",
+            kind.name(),
+            out.dealt,
+            cur,
+            out.health,
+            if out.dead { " DOWNED" } else if out.headshot { " headshot" } else { "" },
+        );
+        trigger_player_reaction(sm.as_deref_mut(), "Reaction.Core.Heavy.High.Front");
+        if !br.shot_player {
+            if let Some(base) = hitshot {
+                let p = shot_path(base, "player");
+                commands.spawn(Screenshot::primary_window()).observe(save_to_disk(p.clone()));
+                br.shot_player = true;
+                println!("[combat] player reaction screenshot {}", p.display());
+            }
+        }
+        if out.dead {
+            // The player's script `Kill` path would end the run; the demo keeps
+            // playing by reviving the actor to its pool after the downed event.
+            let maxh = cry
+                .host
+                .ctx
+                .actors
+                .borrow()
+                .get(&player)
+                .map(|a| a.max_health)
+                .unwrap_or(cry_combat::PLAYER_MAX_HEALTH);
+            set_actor_health(cry, player, maxh);
+        }
+    }
+}
+
+/// Simple eye-to-eye line of sight through the static collision world (1.5 m
+/// above each foot, the same eye height the runtime visibility check uses).
+fn line_of_sight(collision: Option<&CollisionWorld>, from: [f32; 3], to: [f32; 3]) -> bool {
+    let Some(c) = collision else { return true };
+    let a = [from[0], from[1], from[2] + 1.5];
+    let b = [to[0], to[1], to[2] + 1.5];
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 1e-3 {
+        return true;
+    }
+    match c.raycast(a, d, len - 0.2) {
+        Some(h) => h.t >= len - 0.2,
+        None => true,
     }
 }
 
@@ -427,7 +913,7 @@ fn ground(c: &CollisionWorld, x: f32, y: f32, fallback: f32) -> f32 {
 /// Create/destroy script-host actors so every live record owns an entity and no
 /// stale entity outlives its record.
 fn reconcile_host_entities(br: &mut ZombieBridge, cry: &mut CryHost, commands: &mut Commands) {
-    let live: HashSet<u32> = br
+    let mut live: HashSet<u32> = br
         .rt
         .as_ref()
         .unwrap()
@@ -436,6 +922,9 @@ fn reconcile_host_entities(br: &mut ZombieBridge, cry: &mut CryHost, commands: &
         .filter(|z| z.live)
         .map(|z| z.handle)
         .collect();
+    // Dead actors stay as corpses (and keep their entity/visual) for the
+    // corpse timer; see `combat_step` / `zombie_bridge_tick`.
+    live.extend(br.dead.keys().copied());
 
     let stale: Vec<u32> =
         br.host_entities.keys().copied().filter(|h| !live.contains(h)).collect();
@@ -444,6 +933,11 @@ fn reconcile_host_entities(br: &mut ZombieBridge, cry: &mut CryHost, commands: &
             cry.host.ctx.world.borrow_mut().remove(id);
             br.last_pipe.remove(&id);
             br.last_result.remove(&id);
+            // Clear the record's entity so a later re-promotion spawns a fresh
+            // actor instead of pointing at the removed one.
+            if let Some(z) = br.rt.as_mut().unwrap().zombies.iter_mut().find(|z| z.handle == h) {
+                z.entity = None;
+            }
         }
         if let Some(e) = br.visuals.remove(&h) {
             commands.entity(e).despawn();
@@ -454,8 +948,15 @@ fn reconcile_host_entities(br: &mut ZombieBridge, cry: &mut CryHost, commands: &
         }
     }
 
+    let killed: HashSet<u32> = br.killed.clone();
     let rt = br.rt.as_mut().unwrap();
     for z in rt.zombies.iter_mut() {
+        if killed.contains(&z.handle) {
+            // Permanently dead: the director does not model kills, so keep the
+            // slot demoted instead of letting it respawn.
+            z.live = false;
+            continue;
+        }
         if !z.live || z.entity.is_some() {
             continue;
         }
@@ -464,6 +965,15 @@ fn reconcile_host_entities(br: &mut ZombieBridge, cry: &mut CryHost, commands: &
             Ok(id) => {
                 z.entity = Some(id);
                 br.host_entities.insert(z.handle, id);
+                // The host does not send `OnReset` at spawn, so `ResetCommon`
+                // never runs and the actor keeps its 100 HP default. Seed the
+                // per-class `Damage.health` from the recovered stats
+                // (`ai-combat.md` §1.1) so the pipeline has the right pool.
+                if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&id) {
+                    let hp = z.kind.stats().hp;
+                    a.max_health = hp;
+                    a.health = hp;
+                }
                 if br.verbose < VERBOSE_SPAWN_LOG {
                     br.verbose += 1;
                     println!(
@@ -546,8 +1056,14 @@ fn zombie_visual_sync(
     let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     for (handle, class, pos, heading) in wanted {
         let Some(t) = bridge.templates.get(&class).and_then(|t| t.as_ref()) else { continue };
-        let (parts, skeleton, idle, walk) =
-            (build_parts(t, &mut meshes), t.skeleton.clone(), t.idle.clone(), t.walk.clone());
+        let (parts, skeleton, idle, walk, death, react) = (
+            build_parts(t, &mut meshes),
+            t.skeleton.clone(),
+            t.idle.clone(),
+            t.walk.clone(),
+            t.death.clone(),
+            t.react.clone(),
+        );
         let tf = Transform {
             translation: base * Vec3::new(pos[0], pos[1], pos[2]),
             rotation: base * Quat::from_rotation_z(sod_core::class3_move::render_yaw(heading)),
@@ -564,8 +1080,13 @@ fn zombie_visual_sync(
                     skeleton,
                     idle,
                     walk,
+                    death,
+                    react,
                     time: 0.0,
                     moving: false,
+                    dying: false,
+                    reacting: false,
+                    last_react: 0.0,
                 },
             ))
             .with_children(|parent| {
@@ -577,8 +1098,10 @@ fn zombie_visual_sync(
         bridge.visuals.insert(handle, entity);
     }
 
-    let live: HashSet<u32> =
+    let mut live: HashSet<u32> =
         bridge.rt.as_ref().unwrap().zombies.iter().filter(|z| z.live).map(|z| z.handle).collect();
+    // Keep corpses' visuals alive while their entity is held for the death clip.
+    live.extend(bridge.dead.keys().copied());
     let stale: Vec<u32> =
         bridge.visuals.keys().copied().filter(|h| !live.contains(h)).collect();
     for h in stale {
@@ -677,7 +1200,8 @@ fn build_parts(t: &ZombieTemplate, meshes: &mut Assets<Mesh>) -> Vec<AnimPart> {
     parts
 }
 
-/// Position and skin every zombie visual; clip is idle or walk.
+/// Position and skin every zombie visual; clip is idle/walk, a one-shot death
+/// clip on a corpse, and a brief knock-back lean on a hit reaction.
 fn animate_zombie_visuals(
     time: Res<Time>,
     bridge: Res<ZombieBridge>,
@@ -687,22 +1211,57 @@ fn animate_zombie_visuals(
     let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let rt = bridge.rt.as_ref();
     for (mut tf, mut v) in &mut q {
+        let mut yaw = 0.0f32;
         if let Some(rt) = rt {
             if let Some(z) = rt.zombies.iter().find(|z| z.handle == v.handle) {
                 tf.translation = base * Vec3::new(z.pos[0], z.pos[1], z.pos[2]);
-                tf.rotation =
-                    base * Quat::from_rotation_z(sod_core::class3_move::render_yaw(z.heading));
+                yaw = sod_core::class3_move::render_yaw(z.heading);
                 v.moving = z.moving;
             }
         }
+        // Corpses: switch to the one-shot death clip once.
+        let dead = bridge.dead.contains_key(&v.handle);
+        if dead && !v.dying {
+            v.dying = true;
+            v.time = 0.0;
+        }
+        // Victim reaction: a short back-lean and, when a reaction clip exists,
+        // a one-shot flinch. A fresh hit restarts the clip.
+        let reaction = bridge.combat.get(&v.handle).map(|c| c.reaction).unwrap_or(0.0);
+        if reaction > 0.0 {
+            if !v.reacting || reaction > v.last_react {
+                v.reacting = true;
+                v.time = 0.0;
+            }
+        } else {
+            v.reacting = false;
+        }
+        v.last_react = reaction;
+        let lean = (reaction / 0.35).clamp(0.0, 1.0) * 0.5;
+        tf.rotation = base * Quat::from_rotation_z(yaw) * Quat::from_rotation_x(-lean);
+
         if v.parts.is_empty() {
             continue;
         }
-        let moving = v.moving;
         v.time += time.delta_secs();
-        let caf = if moving { &v.walk } else { &v.idle };
+        let (caf, one_shot) = if v.dying {
+            match &v.death {
+                Some(d) => (d, true),
+                None => (&v.idle, false),
+            }
+        } else if v.reacting {
+            match &v.react {
+                Some(r) => (r, true),
+                None => (&v.idle, false),
+            }
+        } else if v.moving {
+            (&v.walk, false)
+        } else {
+            (&v.idle, false)
+        };
         let dur = caf.duration_secs().max(1.0 / 30.0);
-        let tick = caf.tick_from_seconds(v.time % dur);
+        let t = if one_shot { v.time.min(dur) } else { v.time % dur };
+        let tick = caf.tick_from_seconds(t);
         let sample = caf.sample_tick(tick);
         let posed = v.skeleton.pose_anchored(&sample);
         let skin_m = v.skeleton.skin_matrices(&posed);
@@ -731,9 +1290,10 @@ fn zombie_hud(
     let hp = hud.0.vitals.hp;
     let maxhp = hud.0.vitals.max_hp;
     let stam = hud.0.vitals.stamina;
+    let kills = bridge.stats.kills;
     for (mut t, line) in &mut lines {
         if matches!(line, crate::HudLine::Status) {
-            t.0 = format!("HP {hp:.0}/{maxhp:.0}   Stamina {stam:.0}   Zombies {n}");
+            t.0 = format!("HP {hp:.0}/{maxhp:.0}   Stamina {stam:.0}   Zombies {n}   Kills {kills}");
         }
     }
 }

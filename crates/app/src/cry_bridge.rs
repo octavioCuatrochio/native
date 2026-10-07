@@ -18,9 +18,18 @@ pub struct CryHost {
     pub player: EntityId,
 }
 
-/// Player position in CryEngine space, written by the movement code.
+/// The controlled player's transform in CryEngine space (position, and
+/// rotation as `(x, y, z, w)`), written after movement each frame.
 #[derive(Resource, Default)]
-pub struct CryPlayerPos(pub Option<[f32; 3]>);
+pub struct CryPlayerPos(pub Option<[f32; 3]>, pub Option<[f32; 4]>);
+
+/// Per-frame order: game code moves the player, the result is synced into
+/// the entity world, then scripts tick on up-to-date state.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CrySet {
+    Sync,
+    Tick,
+}
 
 /// Live counters for HUD/diagnostics.
 #[derive(Resource, Default, Debug)]
@@ -97,7 +106,8 @@ impl Plugin for CryPlugin {
         app.init_resource::<CryPlayerPos>().init_resource::<CryStats>();
         if let Some(h) = build_host(&self.game_dir, self.spawn) {
             app.insert_non_send_resource(h);
-            app.add_systems(Update, cry_tick);
+            app.configure_sets(Update, (CrySet::Sync, CrySet::Tick).chain());
+            app.add_systems(Update, cry_tick.in_set(CrySet::Tick));
         }
     }
 }
@@ -111,6 +121,9 @@ fn cry_tick(
     let Some(cry) = cry else { return };
     if let Some(p) = pos.0 {
         cry.host.ctx.world.borrow_mut().set_pos(cry.player, p);
+    }
+    if let Some(r) = pos.1 {
+        cry.host.ctx.world.borrow_mut().set_rot(cry.player, r);
     }
     // CryEngine clamps the frame time it hands to game code.
     let dt = time.delta_secs().min(0.1);

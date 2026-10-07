@@ -796,7 +796,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     }
     if play {
         app.add_plugins(cry_bridge::CryPlugin { game_dir: game.to_string(), spawn: start_cry });
-        app.add_systems(Update, cry_sync_player);
+        app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));
         app.insert_resource(player_state);
         app.insert_resource(game_state);
         app.add_systems(Update, (
@@ -2030,7 +2030,7 @@ fn hud_update(
     }
 }
 
-/// Feed the controlled player's CryEngine-space position to the script host.
+/// Feed the controlled player's CryEngine-space transform to the script host.
 fn cry_sync_player(
     player: Option<Res<Player>>,
     world: Res<World>,
@@ -2039,4 +2039,7 @@ fn cry_sync_player(
     let (Some(player), Some(mut out)) = (player, out) else { return };
     let [x, y] = player.pos;
     out.0 = Some([x, y, height_at(&world.terrain, x, y)]);
+    // Entity rotation = the model root's rotation about cry +Z.
+    let half = 0.5 * sod_core::class3_move::render_yaw(player.yaw);
+    out.1 = Some([0.0, 0.0, half.sin(), half.cos()]);
 }

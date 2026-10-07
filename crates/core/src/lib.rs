@@ -38,6 +38,7 @@ pub mod mission;
 pub mod nav;
 pub mod npc_ai;
 pub mod level;
+pub mod level_lights;
 pub mod material;
 pub mod mesh;
 pub mod parity;

@@ -91,10 +91,13 @@ pub const AMBIENT_DENSITY_CAPS: [u32; 6] = [50, 100, 75, 35, 100, 20];
 /// The cell density field must exceed this before the target is recomputed
 /// (`FUN_01348680:379` `0xe < density`, i.e. `density >= 15`).
 pub const AMBIENT_DENSITY_TRIGGER: u32 = 15;
-/// Cell square metres per zombie (`_DAT_0184410c`); the recovered code divides
-/// the cell area by it (`FUN_0133eb70:172`). Inferred as `20² = 400` from its
-/// other use as a squared proximity threshold (`FUN_01480790:153`).
-pub const AMBIENT_AREA_PER_ZOMBIE: f32 = 400.0;
+/// Square metres per ambient zombie. The director (`FUN_01348680`) loads the
+/// float at `0x184410c` (= 40000.0 in the exe) at `0x1349747` and passes it to
+/// `FUN_0133eb70` (call `0x1349805`) as `param_9`; there the cell rectangle,
+/// clipped to the player +-150 m (`0x172e928`), is divided by it, truncated by
+/// the CRT `_ftol` (`0x16b9210`) and reduced by the cell's current count
+/// (`param_10`). A fully covered 200 m cell therefore holds one zombie.
+pub const AMBIENT_AREA_PER_ZOMBIE: f32 = 40000.0;
 /// Per-cell placement attempts before giving up (`FUN_0133eb70:187`
 /// `uStack_1b0 < 0xa`).
 pub const AMBIENT_CELL_ATTEMPTS: u32 = 10;
@@ -1190,8 +1193,11 @@ impl SpawnDirector {
             return 0;
         }
         let area = (x1 - x0) * (y1 - y0);
+        // (int)(area / 40000) - current count; the density target only selects
+        // which cells the director visits (`AMBIENT_DENSITY_TRIGGER`).
+        let _ = target;
         let budget = (area / AMBIENT_AREA_PER_ZOMBIE).max(0.0) as u16;
-        let mut remaining = target.saturating_sub(count).min(budget);
+        let mut remaining = budget.saturating_sub(count);
         let mut spawned = 0u16;
         let mut attempts = 0u32;
         while remaining > 0
@@ -1682,7 +1688,8 @@ mod tests {
             }
             apply(&mut d, &mut w, &e);
         }
-        assert!(spawns >= 4, "expected ambient grid spawns, got {spawns}");
+        // Only cells fully inside the +-150 m box reach area 40000 => 1 zombie.
+        assert!(spawns >= 1, "expected ambient grid spawns, got {spawns}");
         assert_eq!(outside, 0, "ambient spawned outside the 150 m radius");
         assert!(w.zombies.len() <= MAX_ZOMBIES);
         // The density pass raised at least one node target above zero.
@@ -1936,7 +1943,9 @@ mod tests {
         );
         assert!(w.zombies.len() <= MAX_ZOMBIES);
         assert_eq!(ambient_outside, 0, "ambient grid spawned outside 150 m");
-        assert!(ambient >= 1, "expected ambient grid spawns at player start");
+        // No count asserted: with the original 40000 m² rule a cell only spawns
+        // when it lies fully inside the +-150 m box, which depends on where the
+        // player stands relative to the 200 m grid.
         assert!(d.points.is_empty() || timeline.iter().any(|l| l.contains("SPAWN")));
     }
 

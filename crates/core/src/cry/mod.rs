@@ -16,6 +16,8 @@ pub mod events;
 pub mod gamerules;
 pub mod host;
 pub mod mission;
+pub mod phys_proxy;
+pub mod phys_world;
 pub mod render;
 pub mod world;
 

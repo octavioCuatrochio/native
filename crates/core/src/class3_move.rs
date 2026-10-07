@@ -254,6 +254,10 @@ impl MoveState {
     }
 }
 
+/// Aim movement speed scale over `aimRunSpeed` (retail measurement, see
+/// `update_normal`).
+pub const AIM_SPEED_SCALE: f32 = 3.0;
+
 /// One frame of player input. `forward`/`strafe` are camera/body-relative
 /// analog axes (typically `-1..=1`); `mouse_*` are look deltas already in
 /// radians for the frame.
@@ -266,6 +270,10 @@ pub struct MoveInput {
     pub crouch: bool,
     pub sprint: bool,
     pub dt: f32,
+    /// Aiming: `Some(camera yaw)`. The body keeps facing the aim direction and
+    /// moves (forward/back/strafe) at the aim stance speed instead of turning
+    /// toward the movement direction.
+    pub aim_yaw: Option<f32>,
 }
 
 /// The six shipped per-stance speeds, in table order
@@ -718,11 +726,19 @@ pub fn step(
     //    (`0x01501900`: actor_scale * stance_slot * vtable_scale).
     let stance = gait_stance(drive, input.crouch, input.sprint, t);
     state.stance_index = stance;
-    let speed = get_stance_speed(
-        STANCE_SPEED_ACTOR_SCALE,
-        stance_speed(stance, t),
-        STANCE_SPEED_VTABLE_SCALE,
-    ) * drive;
+    let speed = if input.aim_yaw.is_some() {
+        // Aiming (stance[2]): every direction moves at the aim run slot. The
+        // runtime factors of GetStanceSpeed are not traced; AIM_SPEED_SCALE is
+        // measured in the retail game (notes/telemetry/moves_session3.csv:
+        // 1.50 m/s steady in all four directions vs aimRunSpeed 0.5).
+        sane(t.aim_run) * AIM_SPEED_SCALE * drive
+    } else {
+        get_stance_speed(
+            STANCE_SPEED_ACTOR_SCALE,
+            stance_speed(stance, t),
+            STANCE_SPEED_VTABLE_SCALE,
+        ) * drive
+    };
 
     // 3. movement delta angles from desired-vs-current basis, clamped to
     //    max_delta. Mouse deltas are added *after* the clamp below
@@ -738,7 +754,10 @@ pub fn step(
     let local_y = dir_x * basis[1][0] + dir_y * basis[1][1];
     let local_z = 0.0f32;
     let mut pitch_delta = sane(local_z.clamp(-1.0, 1.0).asin());
-    let mut yaw_delta = if dir_x != 0.0 || dir_y != 0.0 {
+    let mut yaw_delta = if let Some(aim) = input.aim_yaw {
+        // Aiming: turn toward the aim direction, not the movement direction.
+        wrap_angle(sane(aim) - state.yaw)
+    } else if dir_x != 0.0 || dir_y != 0.0 {
         wrap_angle(local_y.atan2(local_x))
     } else {
         0.0
@@ -1170,8 +1189,7 @@ mod tests {
             mouse_dy: 0.0,
             crouch: false,
             sprint: false,
-            dt,
-        }
+            dt, aim_yaw: None }
     }
 
     /// Rotate a 2D vector by `a` about Z (radians), matching
@@ -1581,8 +1599,7 @@ mod tests {
             mouse_dy: f32::INFINITY,
             crouch: false,
             sprint: false,
-            dt: f32::NAN,
-        };
+            dt: f32::NAN, aim_yaw: None };
         update_normal(&mut s, &i, &t, &g, &[]);
         assert!(s.pos.iter().all(|v| v.is_finite()), "pos={:?}", s.pos);
         assert!(s.vel.iter().all(|v| v.is_finite()), "vel={:?}", s.vel);
@@ -1859,8 +1876,7 @@ mod tests {
             mouse_dy: f32::INFINITY,
             crouch: false,
             sprint: false,
-            dt: f32::NAN,
-        };
+            dt: f32::NAN, aim_yaw: None };
         c.update_normal(&i, &g, &[]);
         assert!(c.state.pos.iter().all(|v| v.is_finite()), "pos={:?}", c.state.pos);
         assert!(c.state.vel.iter().all(|v| v.is_finite()), "vel={:?}", c.state.vel);

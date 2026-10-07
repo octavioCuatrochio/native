@@ -381,6 +381,7 @@ pub fn replay_movement(samples: &[MovementSample], sc: &MoveScenario) -> Option<
             crouch: sc.crouch,
             sprint: sc.sprint,
             dt,
+            aim_yaw: None,
         };
         class3_move::update_normal(&mut state, &input, &tuning, &ground, &[]);
         sim_speed[i] = (state.vel[0] * state.vel[0] + state.vel[1] * state.vel[1]).sqrt();

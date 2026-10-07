@@ -2872,7 +2872,9 @@ fn move_player(
         else if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) { -1.0 } else { 0.0 };
     let strafe: f32 = if keys.pressed(KeyCode::KeyD) { 1.0 } else if keys.pressed(KeyCode::KeyA) { -1.0 } else { 0.0 };
     let crouch = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) || keys.pressed(KeyCode::KeyC);
-    let sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // Right mouse = aim: body faces the camera, moves at the aim stance speed.
+    let aiming = mouse.pressed(MouseButton::Right);
+    let sprint = !aiming && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight));
     // Demo-only auto-walk for screenshots; deliberately NOT named SOD_WALK so a
     // stray env var can't make the player walk without input.
     let auto = std::env::var("SOD_AUTOWALK").is_ok();
@@ -2892,7 +2894,7 @@ fn move_player(
     let (fwd_l, strafe_l) = (rel.cos() * mag, rel.sin() * mag);
 
     // 1:1 Class3 controller: CPlayerMovementController::UpdateNormal + CPlayerRotation.
-    let input = sod_core::class3_move::MoveInput { forward: fwd_l, strafe: strafe_l, mouse_dx: 0.0, mouse_dy: 0.0, crouch, sprint, dt };
+    let input = sod_core::class3_move::MoveInput { forward: fwd_l, strafe: strafe_l, mouse_dx: 0.0, mouse_dy: 0.0, crouch, sprint, dt, aim_yaw: aiming.then_some(cam_yaw) };
     use sod_core::class3_physics::{PLAYER_CAPSULE_HEIGHT, PLAYER_CAPSULE_RADIUS, STEP_HEIGHT};
     let feet_z = player.mstate.pos[2];
     // Ground = the first surface below the feet, reachable within one step up
@@ -3062,6 +3064,7 @@ fn move_player(
             body_yaw: sod_core::class3_move::render_yaw(player.mstate.yaw),
             pseudo_speed: sod_core::class3_move::pseudo_speed_from_speed(actual_speed, t.run),
             stance: if crouch { "crouch".into() } else { "relaxed".into() },
+            aiming: if aiming { 1.0 } else { 0.0 },
             ..Default::default()
         };
         // Resolve every candidate state's animation once (cached per state).

@@ -125,6 +125,11 @@ pub struct Ctx {
     pub cvars: Rc<RefCell<HashMap<String, String>>>,
     /// Actor-system state (`self.actor`), by entity.
     pub actors: Rc<RefCell<HashMap<EntityId, super::actor::ActorState>>>,
+    /// Game-rules registries (`self.game` on the rules entity).
+    pub game_rules: Rc<RefCell<super::gamerules::GameRulesState>>,
+    /// Per-sound state set by `Sound.*` (playback not implemented yet).
+    pub sounds: Rc<RefCell<HashMap<u64, super::binds_sound::SoundState>>>,
+    pub master_volume: Rc<RefCell<f32>>,
     /// Engine events delivered to a script handler, by event name.
     pub delivered: Rc<RefCell<BTreeMap<String, u64>>>,
     /// Echo `System.Log` output to stdout.
@@ -547,6 +552,9 @@ impl ScriptHost {
             cvars: Default::default(),
             delivered: Default::default(),
             actors: Default::default(),
+            game_rules: Default::default(),
+            sounds: Default::default(),
+            master_volume: Rc::new(RefCell::new(1.0)),
             echo_log: std::env::var("SOD_LUA_LOG").is_ok(),
         };
 
@@ -594,6 +602,8 @@ impl ScriptHost {
         super::binds_system::install(&host.lua, &host.ctx)?;
         super::binds_entity::install(&host.lua, &host.ctx)?;
         super::actor::install(&host.lua, &host.ctx)?;
+        super::gamerules::install(&host.lua, &host.ctx)?;
+        super::binds_sound::install(&host.lua, &host.ctx)?;
         host.load_class_registry();
         Ok(host)
     }
@@ -722,6 +732,9 @@ impl ScriptHost {
         if let Some(is_player) = actor {
             super::actor::attach(lua, ctx, id, &inst, is_player)?;
         }
+        if class.eq_ignore_ascii_case("SinglePlayer") {
+            super::gamerules::attach(lua, &inst)?;
+        }
 
         let cb: Function = lua.globals().get("__host_callback")?;
         let ev: Function = lua.globals().get("__host_event")?;
@@ -808,7 +821,28 @@ impl ScriptHost {
     /// player, whose class the game module registers with a fixed script).
     pub fn spawn_actor(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3], is_player: bool) -> Result<EntityId> {
         self.actor_classes.borrow_mut().insert(class.to_ascii_lowercase(), is_player);
-        self.spawn_scripted(class, script, name, pos)
+        let id = self.spawn_scripted(class, script, name, pos)?;
+        if is_player {
+            // The actor system publishes the local client actor after its
+            // script init (post-init), so the first `OnReset` inside `OnInit`
+            // still sees `g_localActor ~= self`.
+            if let Some(inst) = self.ctx.instance(id) {
+                self.lua.globals().set("g_localActor", inst)?;
+                self.lua.globals().set("g_localActorId", id_value(id))?;
+            }
+        }
+        Ok(id)
+    }
+
+    /// Create the single-player game rules entity (`SinglePlayer`, named
+    /// `GameRules`) and publish it as `g_gameRules`, as the game-rules system
+    /// does before the level's entities are loaded.
+    pub fn spawn_game_rules(&mut self) -> Result<EntityId> {
+        let id = self.spawn_scripted("SinglePlayer", "scripts/gamerules/singleplayer.lua", "GameRules", [0.0; 3])?;
+        if let Some(inst) = self.ctx.instance(id) {
+            self.lua.globals().set("g_gameRules", inst)?;
+        }
+        Ok(id)
     }
 
     pub fn spawn_scripted(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3]) -> Result<EntityId> {
@@ -842,9 +876,9 @@ impl ScriptHost {
 
     /// Area enter/leave: within one group (> 0) only the highest-priority
     /// containing area counts, as the CryEngine area manager does.
-    /// Linked entities get `OnEnterArea(entity, areaId)`,
+    /// Linked entities get `OnEnterArea(entity, areaId, fade)`,
     /// `OnProceedFadeArea(entity, areaId, fade)` each frame while inside, and
-    /// `OnLeaveArea(entity, areaId)`.
+    /// `OnLeaveArea(entity, areaId, fade)`.
     pub fn update_areas(&self) -> Result<()> {
         let listeners = self.area_listeners.borrow().clone();
         let mut events: Vec<(Vec<u32>, &'static str, EntityId, i32)> = Vec::new();
@@ -889,11 +923,13 @@ impl ScriptHost {
         for (targets, ev, l, area_id) in events {
             let Some(who) = self.ctx.instance(l) else { continue };
             for t in targets {
-                if ev == "OnProceedFadeArea" {
-                    self.event(t, ev, (who.clone(), area_id, 1.0f64))?;
-                } else {
-                    self.event(t, ev, (who.clone(), area_id))?;
-                }
+                // The engine passes a fade coefficient with every area event
+                // (`AmbientVolume:OnEnterArea(player, areaId, fFade)`). For the
+                // zero-proximity areas in this level the listener is fully
+                // inside (1) or outside (0). Unverified: the value for areas
+                // with Proximity > 0 and when the engine sends -1 ("no fade").
+                let fade = if ev == "OnLeaveArea" { 0.0f64 } else { 1.0f64 };
+                self.event(t, ev, (who.clone(), area_id, fade))?;
             }
         }
         Ok(())

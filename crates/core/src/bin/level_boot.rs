@@ -41,6 +41,8 @@ fn main() {
 
     let mut host = ScriptHost::new(vfs.clone()).expect("script host");
     host.boot().expect("boot");
+    let rules = host.spawn_game_rules().expect("game rules");
+    println!("[rules] GameRules id {rules} instance={}", host.ctx.instance(rules).is_some());
     println!("[boot] scripts loaded: {}  errors: {}", host.ctx.loaded_scripts.borrow().len(), host.ctx.errors.borrow().len());
 
     let xml = ["mission_mission0.xml", "levels/class3/mission_mission0.xml"]

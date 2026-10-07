@@ -69,6 +69,9 @@ pub fn build_host(game_dir: &str, spawn: [f32; 3]) -> Option<CryHost> {
     if let Err(e) = host.boot() {
         eprintln!("[cry] boot failed: {e}");
     }
+    if let Err(e) = host.spawn_game_rules() {
+        eprintln!("[cry] game rules failed: {e}");
+    }
     let xml = ["mission_mission0.xml", "levels/class3/mission_mission0.xml"].iter().find_map(|p| vfs.read(p))?;
     let ents = parse_level_entities(&xml);
     for le in &ents {

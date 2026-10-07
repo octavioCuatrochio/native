@@ -47,6 +47,7 @@ pub mod mesh;
 pub mod parity;
 pub mod physics;
 pub mod player_locomotion;
+pub mod render_light;
 pub mod script;
 pub mod skin;
 pub mod sm_payload;

@@ -447,36 +447,125 @@ pub fn process_actor_damage(
     }
 }
 
-/// Melee damage a zombie deals per landed strike.
+/// The melee damage tier named by a zombie/freak attack state's own
+/// `CombatDamage` / `CombatCollisionMode` action, recovered from the shipped
+/// ULSM (`libs/statemachines/zombie/general.win.sm`; see
+/// [`crate::sm_runtime::combat_damage_profile_text`]).
 ///
-/// The exact scalar is C++-side and absent from both the shipped Lua and the
-/// decompiled subset (`notes/ai-combat.md` §4.4, `notes/ghidra/combat.md`
-/// §3.5). These values are calibrated against the 200 HP player pool so a normal
-/// grunt takes many bites, freaks hit harder and the Juggernaut is worst.
-pub fn zombie_melee_damage(kind: ZombieKind) -> f32 {
-    match kind {
-        ZombieKind::Grunt => 10.0,
-        ZombieKind::Screamer => 8.0,
-        ZombieKind::ArmyZombie => 15.0,
-        ZombieKind::Bloater => 20.0,
-        ZombieKind::Feral => 25.0,
-        ZombieKind::Juggernaut => 50.0,
+/// The tier strings name the strike class directly:
+///
+/// | profile | attack |
+/// |---|---|
+/// | `Zombie, DamageLight` | slow claw (`Combat.Slow.Strike.*`) |
+/// | `Zombie, DamageStandard` | fast claw (`Combat.Fast.Strike.*`) |
+/// | `Zombie, DamageHeavy` / `BiteHit` | bite / grab (`Combat.BiteAttack.*`) |
+/// | `KillCredit` / `KillCredit_Grab` | finisher |
+/// | `DamageStamina_Light` / `DamageStamina_Heavy` | stamina drain, no health |
+///
+/// The magnitude of each tier is [C++-SIDE] (`notes/ghidra/combat.md` §3.5): the
+/// SM only names the profile, the engine resolves the number. The bases below
+/// are tied to the player pool ([`PLAYER_MAX_HEALTH`] 200) so the light tier
+/// takes ~29 bites and the heavy tier ~12, while the class scale keeps freaks
+/// worse; a finisher is lethal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeleeProfile {
+    Light,
+    Standard,
+    Heavy,
+    Bite,
+    KillCredit,
+    StaminaLight,
+    StaminaHeavy,
+    Unknown,
+}
+
+impl MeleeProfile {
+    /// Parse a profile string from the SM (case-insensitive, substring).
+    pub fn parse(name: &str) -> MeleeProfile {
+        let l = name.to_ascii_lowercase();
+        if l.contains("killcredit") {
+            MeleeProfile::KillCredit
+        } else if l.contains("stamina_heavy") {
+            MeleeProfile::StaminaHeavy
+        } else if l.contains("stamina_light") {
+            MeleeProfile::StaminaLight
+        } else if l.contains("bite") {
+            MeleeProfile::Bite
+        } else if l.contains("damageheavy") {
+            MeleeProfile::Heavy
+        } else if l.contains("damagestandard") {
+            MeleeProfile::Standard
+        } else if l.contains("damagelight") {
+            MeleeProfile::Light
+        } else {
+            MeleeProfile::Unknown
+        }
+    }
+
+    /// Health damage a normal (scale 1.0) zombie deals for this tier, before the
+    /// per-class scale. Finishers are lethal.
+    pub fn base_damage(self) -> f32 {
+        match self {
+            MeleeProfile::Light => 7.0,
+            MeleeProfile::Standard => 10.0,
+            MeleeProfile::Heavy => 16.0,
+            MeleeProfile::Bite => 12.0,
+            MeleeProfile::KillCredit => 1_000_000.0,
+            MeleeProfile::StaminaLight | MeleeProfile::StaminaHeavy => 0.0,
+            MeleeProfile::Unknown => 10.0,
+        }
+    }
+
+    /// Recovery before the same zombie may strike again. The state machine's
+    /// strike fragment already paces the swing; this is the small gap the SM's
+    /// `Timer_CombatCooldown` adds (`0.1`..`0.3` s window plus the clip tail).
+    pub fn recovery(self) -> f32 {
+        match self {
+            MeleeProfile::Light => 0.6,
+            MeleeProfile::Standard => 0.8,
+            MeleeProfile::Heavy => 1.2,
+            MeleeProfile::Bite => 1.0,
+            MeleeProfile::KillCredit => 1.5,
+            MeleeProfile::StaminaLight | MeleeProfile::StaminaHeavy => 0.8,
+            MeleeProfile::Unknown => 0.8,
+        }
+    }
+
+    pub fn is_lethal(self) -> bool {
+        matches!(self, MeleeProfile::KillCredit)
     }
 }
 
-/// Seconds between a zombie's melee strikes. The native manager has no attack
-/// cooldown (`notes/ghidra/zombie_ai.md` §4); the CryAI combat state's
-/// `Timer_CombatCooldown` owns the cadence, so this mirrors the recovered
-/// strike timing (`[BEST-EFFORT]`).
-pub fn zombie_melee_cooldown(kind: ZombieKind) -> f32 {
+/// Per-class melee scale applied to [`MeleeProfile::base_damage`]. Freaks
+/// strike harder than a grunt; the Juggernaut's `Combat.Slam` reaches the
+/// recovered 50-point endpoint (10 x 5.0).
+pub fn melee_damage_scale(kind: ZombieKind) -> f32 {
     match kind {
-        ZombieKind::Grunt => 1.5,
-        ZombieKind::Screamer => 2.0,
-        ZombieKind::ArmyZombie => 1.4,
-        ZombieKind::Bloater => 2.5,
-        ZombieKind::Feral => 0.8,
-        ZombieKind::Juggernaut => 2.8,
+        ZombieKind::Grunt => 1.0,
+        ZombieKind::Screamer => 0.8,
+        ZombieKind::ArmyZombie => 1.5,
+        ZombieKind::Bloater => 2.0,
+        ZombieKind::Feral => 2.5,
+        ZombieKind::Juggernaut => 5.0,
     }
+}
+
+/// Health a zombie of `kind` deals for one landed strike of `profile`.
+///
+/// Source: the attack state's own damage profile in the shipped ULSM, scaled by
+/// the class; the numeric magnitude is the [C++-SIDE] scalar bounded by the
+/// player pool (the report's `grunt 10 .. juggernaut 50` calibration endpoints
+/// are reproduced by `Standard x 1.0` and the Juggernaut's `Unknown x 5.0`).
+pub fn melee_damage(kind: ZombieKind, profile: MeleeProfile) -> f32 {
+    if profile.is_lethal() {
+        return profile.base_damage();
+    }
+    (profile.base_damage() * melee_damage_scale(kind)).round()
+}
+
+/// Seconds before the zombie may strike again for `profile`.
+pub fn melee_recovery(profile: MeleeProfile) -> f32 {
+    profile.recovery()
 }
 
 /// English helper for the frag-band distance; `dir` is overloaded by the caller
@@ -661,5 +750,30 @@ mod tests {
         assert_eq!(DamageTarget::from_class("FreshGrunt"), DamageTarget::Zombie(ZombieKind::Grunt));
         assert_eq!(DamageTarget::from_class("ArmyZombie"), DamageTarget::Zombie(ZombieKind::ArmyZombie));
         assert_eq!(DamageTarget::from_class("Survivor"), DamageTarget::Player);
+    }
+
+    #[test]
+    fn melee_profiles_parse_the_sm_tiers() {
+        assert_eq!(MeleeProfile::parse("Zombie, DamageLight"), MeleeProfile::Light);
+        assert_eq!(MeleeProfile::parse("Zombie, DamageStandard, Mid"), MeleeProfile::Standard);
+        assert_eq!(MeleeProfile::parse("Zombie, DamageHeavy"), MeleeProfile::Heavy);
+        assert_eq!(MeleeProfile::parse("StumbleForward, BiteHit"), MeleeProfile::Bite);
+        assert_eq!(MeleeProfile::parse("KillCredit"), MeleeProfile::KillCredit);
+        assert_eq!(MeleeProfile::parse("KillCredit_Grab"), MeleeProfile::KillCredit);
+        assert_eq!(MeleeProfile::parse("DamageStamina_Heavy"), MeleeProfile::StaminaHeavy);
+        assert_eq!(MeleeProfile::parse("whatever"), MeleeProfile::Unknown);
+    }
+
+    #[test]
+    fn melee_damage_keeps_the_calibration_endpoints() {
+        // Slow grunt claw = the light tier; fast claw = standard.
+        assert_eq!(melee_damage(ZombieKind::Grunt, MeleeProfile::Light), 7.0);
+        assert_eq!(melee_damage(ZombieKind::Grunt, MeleeProfile::Standard), 10.0);
+        // Juggernaut slam is unscored by the SM -> Unknown x 5.0 = 50.
+        assert_eq!(melee_damage(ZombieKind::Juggernaut, MeleeProfile::Unknown), 50.0);
+        // Finishers are lethal regardless of class, stamina tiers are harmless.
+        assert!(melee_damage(ZombieKind::Grunt, MeleeProfile::KillCredit) > PLAYER_MAX_HEALTH);
+        assert_eq!(melee_damage(ZombieKind::Grunt, MeleeProfile::StaminaLight), 0.0);
+        assert!(melee_recovery(MeleeProfile::Heavy) > melee_recovery(MeleeProfile::Light));
     }
 }

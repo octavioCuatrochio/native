@@ -350,6 +350,96 @@ pub struct SmActionCommand {
     pub code: Vec<u8>,
 }
 
+/// Longest run of printable ASCII bytes in an action's `code` operand.
+///
+/// Action code operands are heterogeneous (floats, indices, slot copies, but
+/// also embedded NUL-terminated names). The textual payload of a
+/// `CombatDamage` / `CombatCollisionMode` / `FxMaterialEffect` action is the
+/// longest printable run (e.g. `Zombie, DamageLight`, `zed_clawattack`); a
+/// minimum length of 3 rejects the incidental `33`/`>` fragments of a binary
+/// transform block. Returns `None` when nothing long enough is present.
+pub fn action_code_text(code: &[u8]) -> Option<&str> {
+    let mut best = (0usize, 0usize);
+    let mut i = 0usize;
+    while i < code.len() {
+        if (0x20..0x7f).contains(&code[i]) {
+            let start = i;
+            while i < code.len() && (0x20..0x7f).contains(&code[i]) {
+                i += 1;
+            }
+            if i - start > best.1 - best.0 {
+                best = (start, i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if best.1 - best.0 >= 3 {
+        std::str::from_utf8(&code[best.0..best.1]).ok()
+    } else {
+        None
+    }
+}
+
+/// The melee damage-profile text carried by a `CombatDamage` (descriptor 29) or
+/// `CombatCollisionMode` (descriptors 27/28) action, when it names one of the
+/// engine's damage tiers. The zombie/freak combat states name the tier they
+/// strike with, e.g. `Zombie, DamageLight` (slow claw), `Zombie,
+/// DamageStandard` (fast claw), `Zombie, DamageHeavy`/`BiteHit` (bite/grab) and
+/// `KillCredit` (finishers). Tier strings carry a `, ` separator; the bare
+/// names are listed explicitly.
+pub fn combat_damage_profile_text(descriptor_id: u8, code: &[u8]) -> Option<&str> {
+    if !matches!(descriptor_id, 27 | 28 | 29) {
+        return None;
+    }
+    let text = action_code_text(code)?;
+    if text.contains(", ")
+        || matches!(
+            text,
+            "DamageLight"
+                | "DamageStandard"
+                | "DamageHeavy"
+                | "DamageStamina_Light"
+                | "DamageStamina_Heavy"
+                | "BiteHit"
+                | "KillCredit"
+                | "KillCredit_Grab"
+        )
+    {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Convenience wrapper over [`combat_damage_profile_text`] for a tick command.
+pub fn combat_damage_profile(cmd: &SmActionCommand) -> Option<&str> {
+    combat_damage_profile_text(cmd.descriptor_id, &cmd.code)
+}
+
+/// The material-effect name fired by an `FxMaterialEffect` action (descriptor
+/// 75). `zed_clawattack` is the basic/feral claw contact moment and
+/// `jugg_swipe_attack` the juggernaut slam; the action fires in the strike
+/// state's block, so it is the per-state strike event.
+pub fn fx_material_effect_name(cmd: &SmActionCommand) -> Option<&str> {
+    if cmd.descriptor_id != 75 {
+        return None;
+    }
+    action_code_text(&cmd.code)
+}
+
+/// Whether a state name is one of the `MachineDriven` melee attack states whose
+/// fragment is a strike. Such states drive the zombie's hit timing: they play a
+/// `ZombieMelee_*` / `Combat_*` strike fragment and run the strike effect in
+/// their action block (see [`fx_material_effect_name`]).
+pub fn is_strike_state_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains(".combat.")
+        && ["strike", "swipe", "slam", "leap", "biteattack", "jumpattack", "dive", "double"]
+            .iter()
+            .any(|k| n.contains(k))
+}
+
 /// A typed command emitted by a tick. The engine would apply these to the
 /// actor; the re-implementation publishes them so the caller owns the policy.
 #[derive(Debug, Clone, PartialEq)]
@@ -1200,6 +1290,72 @@ mod tests {
         // An empty operand has no name.
         let empty = SmActionCommand { code: vec![0u8; 128], ..other };
         assert_eq!(animation_graph_input_name(&empty), None);
+    }
+
+    #[test]
+    fn action_code_text_extracts_the_longest_printable_run() {
+        // A CombatDamage code operand: length byte + NUL-terminated profile.
+        let mut code = vec![0x01u8];
+        code.extend_from_slice(b"Zombie, DamageLight");
+        code.push(0);
+        code.resize(136, 0);
+        assert_eq!(action_code_text(&code), Some("Zombie, DamageLight"));
+        assert_eq!(
+            combat_damage_profile_text(29, &code),
+            Some("Zombie, DamageLight")
+        );
+        // A 'KillCredit' CombatDamage profile.
+        let mut kc = vec![0x0a_u8];
+        kc.extend_from_slice(b"KillCredit");
+        kc.push(0);
+        assert_eq!(action_code_text(&kc), Some("KillCredit"));
+        assert_eq!(combat_damage_profile_text(29, &kc), Some("KillCredit"));
+        // A binary transform block must not yield the incidental `33`/`>` run.
+        let bin = [0u8, 0, 0, 0, 0x33, 0x33, 0xb3, 0x3e, 2, 0, 0, 0];
+        assert_eq!(action_code_text(&bin), None);
+        // A non-damage descriptor is rejected.
+        assert_eq!(combat_damage_profile_text(13, b"Zombie, DamageLight"), None);
+    }
+
+    #[test]
+    fn fx_material_effect_name_reads_claw_and_slam() {
+        let mk = |code: &[u8]| SmActionCommand {
+            state: 88,
+            block: 39,
+            index: 2,
+            action_id: 409,
+            descriptor_id: 75,
+            name: "FxMaterialEffect",
+            kind: SmActionKind::Other,
+            flags: 0,
+            data: Vec::new(),
+            code: code.to_vec(),
+        };
+        let mut claw = b"zed_clawattack".to_vec();
+        claw.push(0);
+        assert_eq!(fx_material_effect_name(&mk(&claw)), Some("zed_clawattack"));
+        let mut jugg = b"jugg_swipe_attack".to_vec();
+        jugg.push(0);
+        assert_eq!(fx_material_effect_name(&mk(&jugg)), Some("jugg_swipe_attack"));
+        // An Animation action (descriptor 13) is not an FX event.
+        let anim = SmActionCommand { descriptor_id: 13, name: "Animation", ..mk(&claw) };
+        assert_eq!(fx_material_effect_name(&anim), None);
+    }
+
+    #[test]
+    fn strike_states_are_the_machine_driven_combat_attacks() {
+        assert!(is_strike_state_name(
+            "MachineDriven.Combat.Slow.Strike.TargetStand.Left"
+        ));
+        assert!(is_strike_state_name(
+            "MachineDriven.Combat.Fast.RunningSwipe.LeftStart"
+        ));
+        assert!(is_strike_state_name("MachineDriven.Combat.Basic.DoubleSwipe"));
+        assert!(is_strike_state_name("MachineDriven.Combat.Slam.Normal"));
+        assert!(is_strike_state_name("MachineDriven.Combat.BiteAttack.HitFront"));
+        assert!(!is_strike_state_name("MachineDriven.Combat.Logic.ContextTest"));
+        assert!(!is_strike_state_name("MachineDriven.Combat.Fast.Evaluate"));
+        assert!(!is_strike_state_name("GraphDriven.Observer"));
     }
 
     #[test]

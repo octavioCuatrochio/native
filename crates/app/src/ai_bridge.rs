@@ -31,7 +31,7 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use std::path::{Path, PathBuf};
 use sod_core::cry::ai;
 use sod_core::cry::ai_data::AiState;
-use sod_core::cry::combat::{self as cry_combat, DamageTarget, HitMaterial};
+use sod_core::cry::combat::{self as cry_combat, DamageTarget, HitMaterial, MeleeProfile};
 use sod_core::cry::combat_perception::{self as perception, Senses, SoundStimulus};
 use sod_core::game::ZombieKind;
 use sod_core::cry::navmesh::{self, NavMesh};
@@ -44,6 +44,8 @@ use sod_core::crypak::Vfs;
 use sod_core::material::MaterialSlot;
 use sod_core::mesh::DecodedModel;
 use sod_core::skin::{self, BoneWeight, Skeleton};
+use sod_core::sm_runtime::{self, SmCommand, SmEnv, SmInstance};
+use sod_core::statemachine::StateMachine;
 use sod_core::anim;
 use std::collections::{HashMap, HashSet};
 
@@ -78,12 +80,28 @@ struct ZombieTemplate {
 /// Per-live-handle combat state driven by the native perception/attack loop.
 #[derive(Clone, Debug, Default)]
 struct ZombieCombat {
-    /// Seconds until the next melee strike is allowed.
+    /// Seconds until the next melee strike is allowed (the strike gap).
     attack_cd: f32,
     /// True once the zombie's perception acquired the player.
     alerted: bool,
     /// Hit-reaction timer (seconds); drives the visible knock-back.
     reaction: f32,
+}
+
+/// One in-flight state-machine strike for a live zombie. The machine is forced
+/// into an attack state (chosen by perception + range) and the hit is emitted
+/// when that state's strike action (`FxMaterialEffect`, e.g. `zed_clawattack`)
+/// runs; after the strike window the machine is handed back to the graph.
+#[derive(Clone, Debug)]
+struct SmStrike {
+    /// Attack state the machine was forced into.
+    state: u32,
+    /// Seconds left in the forced strike window.
+    left: f32,
+    /// The strike event has fired this swing (the hit is applied once).
+    struck: bool,
+    /// Damage tier named by the attack state's own action block.
+    profile: MeleeProfile,
 }
 
 /// Player attack intent published by `main.rs::player_attack` and resolved by
@@ -133,6 +151,16 @@ pub struct ZombieBridge {
     tried_init: bool,
     /// Per-live-handle perception/attack state.
     combat: HashMap<u32, ZombieCombat>,
+    /// Leaked parsed state machines, keyed by actor family (`zombie`,
+    /// `freak_feral`, ...). Each live zombie runs the machine for its class.
+    sm_machines: HashMap<&'static str, &'static StateMachine>,
+    /// Logical handle -> the zombie's running ULSM instance.
+    sm_instances: HashMap<u32, SmInstance<'static>>,
+    /// Logical handle -> the in-flight attack (present while a strike runs).
+    sm_strikes: HashMap<u32, SmStrike>,
+    /// Logical handle -> strike clip to start on the visual (drained by
+    /// `animate_zombie_visuals`).
+    pending_strikes: HashMap<u32, anim::Caf>,
     /// Dead handles kept as corpses for this many seconds before despawn.
     dead: HashMap<u32, f32>,
     /// Handles killed this run; never re-promoted (the director does not model
@@ -159,12 +187,17 @@ struct ZombieVisual {
     walk: anim::Caf,
     death: Option<anim::Caf>,
     react: Option<anim::Caf>,
+    /// One-shot strike clip requested by the zombie's own state machine
+    /// (a `MachineDriven.Combat.*` fragment). Played over the graph.
+    strike: Option<anim::Caf>,
     time: f32,
     moving: bool,
     /// True once the actor is dead (plays the death clip, then holds).
     dying: bool,
     /// True while a hit-reaction clip is playing.
     reacting: bool,
+    /// True while the state-machine strike fragment is playing.
+    striking: bool,
     /// Previous frame's reaction timer (to restart the clip on a fresh hit).
     last_react: f32,
 }
@@ -241,6 +274,32 @@ fn ensure_init(br: &mut ZombieBridge, cry: &CryHost) -> bool {
         br.nav.is_some()
     );
     br.rt = Some(rt);
+
+    // The shipped per-class ULSM machines. A live zombie runs its own class's
+    // machine so its `MachineDriven.Combat.*` attack states drive the strike.
+    for (family, rel) in [
+        ("zombie", "libs/statemachines/zombie/general.win.sm"),
+        ("freak_feral", "libs/statemachines/freak_feral/general.win.sm"),
+        ("freak_juggernaut", "libs/statemachines/freak_juggernaut/general.win.sm"),
+        ("freak_bloater", "libs/statemachines/freak_bloater/general.win.sm"),
+        ("freak_screamer", "libs/statemachines/freak_screamer/general.win.sm"),
+    ] {
+        let bytes = vfs.read(rel).or_else(|| vfs.read(&format!("gamedata/{rel}")));
+        match bytes.and_then(|b| sod_core::statemachine::parse_sm(&b)) {
+            Some(sm) => {
+                let leaked: &'static StateMachine = Box::leak(Box::new(sm));
+                println!(
+                    "[zombie] state machine {}: {} states, start [{}] {}",
+                    family,
+                    leaked.states.len(),
+                    leaked.start_state,
+                    leaked.states.get(leaked.start_state as usize).map(|s| s.name.as_str()).unwrap_or("?")
+                );
+                br.sm_machines.insert(family, leaked);
+            }
+            None => eprintln!("[zombie] WARNING: state machine {rel} unavailable"),
+        }
+    }
     true
 }
 
@@ -448,6 +507,14 @@ fn zombie_bridge_tick(
         }
     }
 
+    // Drop state-machine state for handles the director has removed.
+    {
+        let present: HashSet<u32> =
+            bridge.rt.as_ref().unwrap().zombies.iter().map(|z| z.handle).collect();
+        bridge.sm_instances.retain(|h, _| present.contains(h));
+        bridge.sm_strikes.retain(|h, _| present.contains(h));
+    }
+
     log_transitions(&mut bridge);
     bridge.log_timer += dt;
     if bridge.log_timer >= 2.0 {
@@ -548,6 +615,132 @@ const CORPSE_TIME: f32 = 6.0;
 const PLAYER_MELEE_REACH: f32 = 2.2;
 /// Maximum firearm range the resolver will target.
 const PLAYER_GUN_RANGE: f32 = 45.0;
+/// Range at which the perception loop lets a zombie's state machine strike:
+/// `melee.damageRadius` (1.1 m) plus the actor reach band.
+const ZOMBIE_STRIKE_RANGE: f32 = 2.2;
+/// How long a forced `MachineDriven.Combat.*` strike state may run before the
+/// machine is handed back to the graph. Covers the longest strike fragment.
+const STRIKE_WINDOW: f32 = 1.6;
+
+/// Which leaked machine a zombie class runs.
+fn machine_family(class: &str) -> &'static str {
+    match class {
+        "Feral" => "freak_feral",
+        "Juggernaut" => "freak_juggernaut",
+        "Bloater" => "freak_bloater",
+        "Screamer" => "freak_screamer",
+        _ => "zombie",
+    }
+}
+
+/// The `MachineDriven.Combat.*` attack state this class uses, in preference
+/// order. Feral swipes, the Juggernaut slams, the rest use the slow or fast
+/// claw strike (`fast` = the `Fast` context tag / hunt pipe scale).
+fn pick_strike_state(inst: &SmInstance, family: &str, fast: bool) -> Option<u32> {
+    let candidates: &[&str] = match family {
+        "freak_feral" => &[
+            "Combat.Basic.DoubleSwipe",
+            "Combat.Basic.JumpAttack",
+            "Combat.TargetDown.Attacks",
+        ],
+        "freak_juggernaut" => &[
+            "Combat.Slam.Normal",
+            "Combat.Slam.Walking",
+            "Combat.Charge.FollowupSlam",
+        ],
+        _ if fast => &[
+            "Combat.Fast.Strike.TargetStand.Left",
+            "Combat.Fast.Strike.TargetStand.Right",
+        ],
+        _ => &[
+            "Combat.Slow.Strike.TargetStand.Left",
+            "Combat.Slow.Strike.TargetStand.Right",
+        ],
+    };
+    candidates.iter().find_map(|c| inst.find_state(c))
+}
+
+/// The damage tier named by `state`'s own action block. Only the strike tiers
+/// (`Zombie, Damage*` / `BiteHit`) are accepted; the shared reaction blocks'
+/// `KillCredit` / stamina profiles are ignored.
+fn strike_profile(sm: &StateMachine, state: u32) -> MeleeProfile {
+    for a in sm.payloads.actions.iter().filter(|a| a.state == state) {
+        if let Some(t) = sm_runtime::combat_damage_profile_text(a.descriptor_id, &a.code) {
+            let p = MeleeProfile::parse(t);
+            if matches!(
+                p,
+                MeleeProfile::Light | MeleeProfile::Standard | MeleeProfile::Heavy | MeleeProfile::Bite
+            ) {
+                return p;
+            }
+        }
+    }
+    MeleeProfile::Unknown
+}
+
+/// Heuristic on a fragment clip name: the attack fragments are `ZombieMelee_*`
+/// strike/swipe/dive clips and the freak `Combat_*` / `Grab_*` clips, as opposed
+/// to locomotion loops.
+fn clip_looks_like_strike(clip: &str) -> bool {
+    let c = clip.to_ascii_lowercase();
+    [
+        "strike", "swipe", "slam", "tackle", "leap", "dive", "combo", "bite", "attack", "claw",
+    ]
+    .iter()
+    .any(|k| c.contains(k))
+}
+
+/// Resolve a state-machine fragment clip name (e.g.
+/// `ZombieMelee_strike_stand_high_left`, `Combat_combo_attacks`) to the shipped
+/// `.$caf`. The fragment names carry a `ZombieMelee_` / `Combat_` / `Grab_` /
+/// `Basic_` prefix the file path omits, so the trailing tokens are matched
+/// against the class rig (`characters/<rig>/...`).
+fn load_strike_clip(vfs: &Vfs, class: &str, clip: &str) -> Option<anim::Caf> {
+    let rig = zombie_actor::character_for_class(class).rig.to_ascii_lowercase();
+    let base = clip.to_ascii_lowercase();
+    let mut needles: Vec<String> = vec![base.clone()];
+    for p in ["zombiemelee_", "fastzombie_", "slowzombie_", "combat_", "grab_", "basic_"] {
+        if let Some(rest) = base.strip_prefix(p) {
+            needles.push(rest.to_string());
+        }
+    }
+    let mut paths: Vec<String> = vfs.paths_with_ext(".$caf");
+    paths.sort();
+    for needle in &needles {
+        for p in &paths {
+            let pl = p.to_ascii_lowercase();
+            if pl.contains(&rig) && pl.ends_with(&format!("/{needle}.$caf")) {
+                if let Some(b) = vfs.read(p) {
+                    if let Some(c) = anim::Caf::parse(&b) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Engine inputs for a zombie's ULSM. The native perception loop drives the
+/// machine (it forces the attack state with `go_to`), so the engine trigger
+/// inputs are inert; only the timers / phase are fed.
+struct ZedSmEnv {
+    dt: f32,
+    time: f32,
+    phase: f32,
+}
+
+impl SmEnv for ZedSmEnv {
+    fn delta_seconds(&self) -> f32 {
+        self.dt
+    }
+    fn time_seconds(&self) -> f32 {
+        self.time
+    }
+    fn animation_phase(&self) -> f32 {
+        self.phase
+    }
+}
 
 /// One-shot push of the player's `g_playerHealthValue` into the script actor.
 /// The zombie scripts call `BasicActor:ResetCommon` from `OnReset`, which the
@@ -804,15 +997,26 @@ fn combat_step(
         }
     }
 
-    // --- 1 + 2. zombie perception and melee ---
+    // --- 1 + 2. zombie perception and state-machine-driven melee ---
+    //
+    // The native perception loop decides *that* a zombie attacks (it feeds the
+    // hunt pipe's target and the `TO_FRESHMEAT` signal); the zombie's own ULSM
+    // decides *when the strike lands*. Each live actor runs its class machine
+    // (`libs/statemachines/<family>/general.win.sm`). When perception has the
+    // player in melee range the machine is forced into the matching
+    // `MachineDriven.Combat.*` attack state, which plays its `ZombieMelee_*` /
+    // `Combat_*` strike fragment and fires the strike action
+    // (`FxMaterialEffect`, e.g. `zed_clawattack` / `jugg_swipe_attack`). The hit
+    // is emitted on that action, using the damage tier the same state names.
     let gun_sound = gunshot.then_some(SoundStimulus { pos: player_pos, radius: perception::COMBAT_SOUND_DIST });
-    let mut player_hit: Option<([f32; 3], f32, ZombieKind, HitMaterial, EntityId)> = None;
+    let mut player_hit: Option<([f32; 3], f32, ZombieKind, HitMaterial, EntityId, MeleeProfile, String)> = None;
     {
+        let vfs = cry.host.ctx.vfs.clone();
         let rt = br.rt.as_mut().unwrap();
         for i in 0..rt.zombies.len() {
-            let (handle, entity, class, kind, zpos, heading) = {
+            let (handle, entity, class, kind, zpos, heading, walk_only) = {
                 let z = &rt.zombies[i];
-                (z.handle, z.entity, z.entity_class.clone(), z.kind, z.pos, z.heading)
+                (z.handle, z.entity, z.entity_class.clone(), z.kind, z.pos, z.heading, z.walk_only)
             };
             let Some(entity) = entity else { continue };
             if br.dead.contains_key(&handle) || br.killed.contains(&handle) {
@@ -822,28 +1026,131 @@ fn combat_step(
             let senses = Senses::for_class(&class);
             let los = |a: [f32; 3], b: [f32; 3]| line_of_sight(collision, a, b);
             let perc = perception::perceive(zpos, heading, &senses, player_pos, false, los, gun_sound);
-            let entry = br.combat.entry(handle).or_default();
-            if perc.has_target() {
-                if !entry.alerted {
-                    entry.alerted = true;
-                    println!("[combat] zombie #{} {class} acquired player at {dist:.1}m", handle);
-                    let _ = cry.host.event(entity, "OnSignal", ("TO_FRESHMEAT".to_string(), 0i64, 0i64));
+            {
+                let entry = br.combat.entry(handle).or_default();
+                if perc.has_target() {
+                    if !entry.alerted {
+                        entry.alerted = true;
+                        println!("[combat] zombie #{} {class} acquired player at {dist:.1}m", handle);
+                        let _ = cry.host.event(entity, "OnSignal", ("TO_FRESHMEAT".to_string(), 0i64, 0i64));
+                    }
+                    rt.zombies[i].target = Some(player_pos);
+                } else {
+                    entry.alerted = false;
+                    rt.zombies[i].target = None;
                 }
-                rt.zombies[i].target = Some(player_pos);
-            } else {
-                entry.alerted = false;
-                rt.zombies[i].target = None;
+                entry.attack_cd = (entry.attack_cd - dt).max(0.0);
             }
-            if entry.alerted && entry.attack_cd <= 0.0 && dist <= cry_combat::MELEE_DAMAGE_RADIUS + 1.1 {
-                let dmg = cry_combat::zombie_melee_damage(kind);
-                let material = hit_material(br.frame, handle);
-                entry.attack_cd = cry_combat::zombie_melee_cooldown(kind);
-                player_hit = Some((zpos, dmg, kind, material, entity));
+            let alerted = br.combat.get(&handle).map(|c| c.alerted).unwrap_or(false);
+            let ready = br.combat.get(&handle).map(|c| c.attack_cd <= 0.0).unwrap_or(false);
+
+            // --- the zombie's own state machine ---
+            let family = machine_family(&class);
+            let Some(machine) = br.sm_machines.get(family).copied() else { continue };
+            // Take the instance out of the map so the other per-handle maps are
+            // free to be borrowed while it ticks.
+            let mut inst = br
+                .sm_instances
+                .remove(&handle)
+                .unwrap_or_else(|| SmInstance::new(machine, handle.wrapping_mul(0x9e37_79b1) | 1));
+
+            // Force-enter the class's melee attack state when perception, range
+            // and the strike gap agree (the engine would reach it through the
+            // `TO_ATTACK` signal; the native loop exercises the same state).
+            let strike_active = br.sm_strikes.contains_key(&handle);
+            if alerted && !strike_active && ready && dist <= ZOMBIE_STRIKE_RANGE {
+                if let Some(st) = pick_strike_state(&inst, family, !walk_only) {
+                    let profile = strike_profile(machine, st);
+                    if std::env::var("SOD_ZEDSMDBG").is_ok() {
+                        println!(
+                            "[combat] zombie #{} {class} SM -> [{}] {} (profile {:?})",
+                            handle,
+                            st,
+                            machine.states.get(st as usize).map(|s| s.name.as_str()).unwrap_or("?"),
+                            profile
+                        );
+                    }
+                    inst.go_to(st);
+                    br.sm_strikes.insert(
+                        handle,
+                        SmStrike { state: st, left: STRIKE_WINDOW, struck: false, profile },
+                    );
+                }
             }
+
+            let env = ZedSmEnv { dt, time: inst.time, phase: 0.0 };
+            inst.tick(&env);
+            let mut struck = false;
+            for cmd in inst.take_commands() {
+                match cmd {
+                    SmCommand::PlayFragment { clip, .. } => {
+                        // Play the attack state's strike fragment on the zombie.
+                        if br.sm_strikes.contains_key(&handle) && clip_looks_like_strike(&clip) {
+                            if let Some(caf) = load_strike_clip(&vfs, &class, &clip) {
+                                if std::env::var("SOD_ZEDSMDBG").is_ok() {
+                                    println!(
+                                        "[combat] zombie #{} {class} strike fragment {clip} ({:.2}s) -> visual",
+                                        handle,
+                                        caf.duration_secs()
+                                    );
+                                }
+                                br.pending_strikes.insert(handle, caf);
+                            }
+                        }
+                    }
+                    SmCommand::Action(a) => {
+                        if sm_runtime::fx_material_effect_name(&a).is_some() {
+                            struck = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if struck {
+                if let Some(s) = br.sm_strikes.get_mut(&handle) {
+                    s.struck = true;
+                }
+            }
+
+            // End the strike: emit the hit once, then hand the machine back to
+            // the graph (locomotion) and start the strike gap.
+            let finish = match br.sm_strikes.get_mut(&handle) {
+                Some(s) => {
+                    s.left -= dt;
+                    s.struck || s.left <= 0.0
+                }
+                None => false,
+            };
+            if finish {
+                if let Some(s) = br.sm_strikes.remove(&handle) {
+                    inst.go_to(machine.start_state);
+                    if let Some(c) = br.combat.get_mut(&handle) {
+                        c.attack_cd = cry_combat::melee_recovery(s.profile);
+                    }
+                    if s.struck {
+                        let material = hit_material(br.frame, handle);
+                        let state_name = machine
+                            .states
+                            .get(s.state as usize)
+                            .map(|x| x.name.clone())
+                            .unwrap_or_default();
+                        player_hit = Some((
+                            zpos,
+                            cry_combat::melee_damage(kind, s.profile),
+                            kind,
+                            material,
+                            entity,
+                            s.profile,
+                            state_name,
+                        ));
+                    }
+                }
+            }
+            br.sm_instances.insert(handle, inst);
         }
     }
 
-    if let Some((zpos, dmg, kind, material, attacker)) = player_hit {
+    if let Some((zpos, dmg, kind, material, attacker, profile, state_name)) = player_hit {
         let dir = [player_pos[0] - zpos[0], player_pos[1] - zpos[1], 0.0];
         let hit = cry_combat::Hit::melee(player, attacker, dmg, material, zpos, dir);
         let cur = actor_health(cry, player).unwrap_or(cry_combat::PLAYER_MAX_HEALTH);
@@ -851,8 +1158,10 @@ fn combat_step(
         set_actor_health(cry, player, out.health);
         br.stats.hits_taken += 1;
         println!(
-            "[combat] zombie {} hit player for {:.0} ({:.0}->{:.0} hp){}",
+            "[combat] zombie {} {:?} strike [{}] -> player {:.0} dmg ({:.0}->{:.0} hp){}",
             kind.name(),
+            profile,
+            state_name,
             out.dealt,
             cur,
             out.health,
@@ -1082,10 +1391,12 @@ fn zombie_visual_sync(
                     walk,
                     death,
                     react,
+                    strike: None,
                     time: 0.0,
                     moving: false,
                     dying: false,
                     reacting: false,
+                    striking: false,
                     last_react: 0.0,
                 },
             ))
@@ -1204,11 +1515,14 @@ fn build_parts(t: &ZombieTemplate, meshes: &mut Assets<Mesh>) -> Vec<AnimPart> {
 /// clip on a corpse, and a brief knock-back lean on a hit reaction.
 fn animate_zombie_visuals(
     time: Res<Time>,
-    bridge: Res<ZombieBridge>,
+    mut bridge: ResMut<ZombieBridge>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut q: Query<(&mut Transform, &mut ZombieVisual)>,
 ) {
     let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    // Drain this frame's state-machine strike requests before taking the
+    // read-only borrows used by the loop below.
+    let mut pending: HashMap<u32, anim::Caf> = std::mem::take(&mut bridge.pending_strikes);
     let rt = bridge.rt.as_ref();
     for (mut tf, mut v) in &mut q {
         let mut yaw = 0.0f32;
@@ -1237,6 +1551,13 @@ fn animate_zombie_visuals(
             v.reacting = false;
         }
         v.last_react = reaction;
+        // A strike fragment requested by the zombie's own state machine: play
+        // it as a one-shot over the locomotion graph.
+        if let Some(caf) = pending.remove(&v.handle) {
+            v.strike = Some(caf);
+            v.striking = true;
+            v.time = 0.0;
+        }
         let lean = (reaction / 0.35).clamp(0.0, 1.0) * 0.5;
         tf.rotation = base * Quat::from_rotation_z(yaw) * Quat::from_rotation_x(-lean);
 
@@ -1244,6 +1565,17 @@ fn animate_zombie_visuals(
             continue;
         }
         v.time += time.delta_secs();
+        // A finished one-shot strike releases the machine-driven layer.
+        if v.striking {
+            let done = v
+                .strike
+                .as_ref()
+                .map(|s| v.time >= s.duration_secs().max(1.0 / 30.0))
+                .unwrap_or(true);
+            if done {
+                v.striking = false;
+            }
+        }
         let (caf, one_shot) = if v.dying {
             match &v.death {
                 Some(d) => (d, true),
@@ -1252,6 +1584,11 @@ fn animate_zombie_visuals(
         } else if v.reacting {
             match &v.react {
                 Some(r) => (r, true),
+                None => (&v.idle, false),
+            }
+        } else if v.striking {
+            match &v.strike {
+                Some(s) => (s, true),
                 None => (&v.idle, false),
             }
         } else if v.moving {

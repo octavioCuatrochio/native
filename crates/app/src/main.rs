@@ -15,6 +15,7 @@ mod particle_bridge;
 mod interact;
 mod content_bridge;
 mod vehicle_bridge;
+mod ui_flash;
 mod streaming;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -1795,6 +1796,10 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
             ));
             app.add_systems(PostUpdate, terrain_bridge::update_terrain_lod);
         }
+    }
+    // Flash HUD (workerU1): embedded Ruffle over the converted UI cache.
+    if play {
+        ui_flash::install(&mut app, Path::new(game), &vfs);
     }
     if let Some((table, skeleton)) = anim_parts {
         app.insert_resource(AnimCtx { table, skeleton, vfs });
@@ -3876,6 +3881,10 @@ fn hud_update(
     mut sbar: Query<&mut Node, (With<StaminaBarFill>, Without<HealthBarFill>, Without<RadarBlipNode>)>,
     mut lines: Query<(&mut Text, &HudLine)>,
     mut blips: Query<(&mut Node, &mut BackgroundColor, &RadarBlipNode), (Without<HealthBarFill>, Without<StaminaBarFill>)>,
+    menu: Option<Res<MenuRes>>,
+    mut flash_active: ResMut<ui_flash::FlashUiActive>,
+    mut flash_push: ResMut<ui_flash::FlashPush>,
+    mut hud_vis: Query<&mut Visibility, Or<(With<HudHide>, With<HudLine>)>>,
 ) {
     let Some(mut hud_res) = hud_res else { return };
     // Health is the authoritative actor health from the original combat
@@ -3954,6 +3963,48 @@ fn hud_update(
             }
             None => node.display = Display::None,
         }
+    }
+
+    // Flash HUD (workerU1): the converted SWF HUD replaces the placeholder text
+    // HUD while it is live; SOD_TEXT_HUD=1 keeps the text HUD for debugging.
+    let flash_live = flash_active.loaded;
+    let menu_up = menu.as_ref().map(|m| m.active).unwrap_or(false);
+    if flash_live {
+        flash_active.visible = !menu_up;
+    }
+    let hide_text = flash_live && std::env::var_os("SOD_TEXT_HUD").is_none();
+    if flash_live {
+        for mut v in &mut hud_vis {
+            *v = if hide_text { Visibility::Hidden } else { Visibility::Inherited };
+        }
+    }
+    if flash_live {
+        let has_gun = weapons.as_ref().map(|w| !w.gun.name.is_empty()).unwrap_or(false);
+        flash_push.0 = ui_flash::HudPush {
+            health: hp,
+            max_health: maxhp,
+            stamina: stam,
+            max_stamina: hud_res.0.vitals.max_stamina,
+            character_visible: true,
+            has_gun,
+            ammo: weapons.as_ref().map(|w| w.gun_state.in_mag as i32).unwrap_or(0),
+            ammo_reserve: weapons.as_ref().map(|w| w.gun_state.reserve as i32).unwrap_or(0),
+            fire_mode: 0,
+            yaw_deg: pyaw.to_degrees(),
+            zoom: 1.0,
+            zombies: count as i32,
+            zombies_killed: 0,
+            threat: 0,
+            objective: objective_txt.clone(),
+            location: String::new(),
+            prompt: prompt.clone(),
+            prompt_key: "E".to_string(),
+            banner_type: String::new(),
+            banner_name: String::new(),
+            banner_text: banner.clone(),
+            notification: notif.clone(),
+            ..Default::default()
+        };
     }
 }
 

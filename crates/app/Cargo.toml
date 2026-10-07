@@ -9,6 +9,17 @@ anyhow.workspace = true
 log.workspace = true
 cpal = "0.15"
 
+# Flash/ActionScript HUD runtime (workerU1). Pinned to the Ruffle 0.7.0
+# revision the ui_convert pipeline was validated against; see notes/ui-runtime.md.
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "f642e488dbff4df42553c454e143d493c53e3682", default-features = false, features = ["default_font"] }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "f642e488dbff4df42553c454e143d493c53e3682" }
+# SWF tag/AVM1 writer, used to append the ExternalInterface callback stub that
+# exposes the HUD's ActionScript functions to the host (same pinned revision).
+swf = { git = "https://github.com/ruffle-rs/ruffle", rev = "f642e488dbff4df42553c454e143d493c53e3682" }
+# `flash-lso` (transitive via ruffle_core) pins thiserror `=2.0.18`, so hold the
+# whole graph on it.
+thiserror = "=2.0.18"
+
 [dependencies.bevy]
 version = "0.19"
 default-features = false

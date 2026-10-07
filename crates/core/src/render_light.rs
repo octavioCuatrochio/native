@@ -615,10 +615,15 @@ pub struct LevelLightParams {
 /// indices.
 ///
 /// * Non-bounce lights always resolve.
-/// * Bounce lights blend their daytime and night-time style across the
-///   `[time_start, time_mid, time_end]` window (`FUN_015bb580`, `0x15bb580`).
-///   Outside the window the base (day) style is used; past the end the bounce
-///   (night) style is used. Returns `None` if the day style is absent.
+/// * Bounce lights are enabled only while
+///   `time_start <= hour < time_end`. `LSUpdate` (`0x15ba8a0`) computes
+///   `before = hour < time_start` and `past = hour >= time_end` and disables
+///   the light when either is true, so outside that half-open window this
+///   returns `None`. (The earlier reading — that the window only *blended*
+///   colour while the light stayed on all day — was wrong; it is what made the
+///   noon/midnight counts differ by one.)
+/// * Inside the window the colour blends the base and bounce styles with
+///   [`bounce_day_weight`] (`FUN_015bb580`, `0x15bb580`).
 pub fn level_light_params(
     lights: &LevelLights,
     light: &LevelLight,
@@ -646,7 +651,12 @@ pub fn level_light_params(
             projector_texture: texture,
         }),
         LightStyle::Bounce(b) => {
-            let (color, intensity) = bounce_style(b, hour);
+            // `LSUpdate` disables the light outside `[time_start, time_end)`
+            // (`0x15ba8a0`: `before = hour < start`, `past = hour >= end`).
+            if hour < b.time_start || hour >= b.time_end {
+                return None;
+            }
+            let (color, intensity) = bounce_style(light, b, hour);
             Some(LevelLightParams {
                 position: light.position,
                 color,
@@ -659,43 +669,57 @@ pub fn level_light_params(
     }
 }
 
-/// Blend a `BounceLightInfo` (17 floats) between its day (`color`,
-/// `base_intensity`) and night/bounce (`bounce_color`, `bounce_intensity`)
-/// halves over the `[time_start, time_mid, time_end]` window.
+/// Day weight for a bounce light inside its active window.
 ///
-/// Reconstructed from `FUN_015bb580` (`0x15bb580`): the two halves of the
-/// window are smoothstepped (the disassembly builds `3t^2 - 2t^3` from
-/// `t^2`/`t^3` with constants `3.0` at `0x1720210` and `2.0` at `0x172020c`),
-/// then the base ratio and bounce intensity scale the result.
-fn bounce_style(b: &BounceLightInfo, hour: f32) -> ([f32; 3], f32) {
-    let start = b.time_start;
-    let mid = b.time_mid;
-    let end = b.time_end;
-
-    // `w` is the blend toward the day/base colour: 1 before/at start, 0 at or
-    // after end.
-    let w = if end <= start {
-        1.0
-    } else if hour <= start {
-        1.0
-    } else if hour >= end {
-        0.0
-    } else if hour < mid {
-        let t = (hour - start) / (mid - start).max(f32::EPSILON);
-        1.0 - smoothstep(0.0, 1.0, t)
+/// Two independent factors from `FUN_015bb580` (`0x15bb580`) multiply:
+///
+/// * `w` — a tent peaking at `time_mid`: `smoothstep` from `time_start` up to
+///   `time_mid`, then `1 - smoothstep` down to `time_end` (the disassembly
+///   builds `3t^2 - 2t^3` from `t^2`/`t^3` with `3.0` at `0x1720210` and `2.0`
+///   at `0x172020c`). The earlier code had this inverted and treated the whole
+///   window as a day->night ramp, which is why midnight still lit almost
+///   everything.
+/// * `s` — a sun-angle factor `(2 + 3*param_34)^((1 + cos(a))/2)` where
+///   `a = 0.5 * (-2*pi*smoothstep(hour/24) + 0.4363 - 2*direction.z)` and the
+///   constants are `-2*pi` (`0x186ece0`), `0.4363` (`0x1898098`) and `0.5`
+///   (`0x17877c4`). `direction.z` is the record's third Euler angle, used here
+///   as the light's sun angle.
+///
+/// The product is clamped to `[0,1]` so the base/night term `(1 - d)` can
+/// never go negative (the engine writes the raw value into the light's HDR
+/// multiplier at `+0x120`, which can overshoot).
+fn bounce_day_weight(light: &LevelLight, b: &BounceLightInfo, hour: f32) -> f32 {
+    let (start, mid, end) = (b.time_start, b.time_mid, b.time_end);
+    if end <= start {
+        return 0.0;
+    }
+    let w = if hour <= mid {
+        smoothstep(0.0, 1.0, (hour - start) / (mid - start).max(f32::EPSILON))
     } else {
-        let t = (end - hour) / (end - mid).max(f32::EPSILON);
-        1.0 - smoothstep(0.0, 1.0, t)
+        1.0 - smoothstep(0.0, 1.0, (hour - mid) / (end - mid).max(f32::EPSILON))
     };
+    let day = smoothstep(0.0, 1.0, (hour / 24.0).clamp(0.0, 1.0));
+    let a = 0.5 * (-2.0 * std::f32::consts::PI * day + 0.4363 - 2.0 * light.direction[2]);
+    let s = (2.0 + 3.0 * b.param_34.max(0.0)).powf((1.0 + a.cos()) * 0.5);
+    (w * s).clamp(0.0, 1.0)
+}
 
-    let color = lerp3(b.color, b.bounce_color, 1.0 - w);
-    let day = b.base_intensity.max(0.0);
-    let night = b.bounce_intensity.max(0.0);
-    // `base_ratio` biases the daytime contribution, matching the shader's
-    // use of `[+0x04] * [+0x10]` and `param_3c` terms.
-    let day_term = day * b.base_ratio.max(0.0);
-    let intensity = lerp(day_term, night, 1.0 - w) * b.range_scale * 0.5;
-    (color, intensity)
+/// Blend a `BounceLightInfo` (17 floats) at `hour`.
+///
+/// `FUN_015bb580` writes the light colour at `+0xe0` as
+/// `base_color * base_intensity * (1 - d) + bounce_color * bounce_intensity * d`
+/// with `d` the day weight, and the range scale at `+0x15c` as
+/// `range_scale * 0.5` (`0x15bb8e0`). The engine's separate HDR ratio written
+/// to `+0x120` is not folded in here.
+fn bounce_style(light: &LevelLight, b: &BounceLightInfo, hour: f32) -> ([f32; 3], f32) {
+    let d = bounce_day_weight(light, b, hour);
+    let n = 1.0 - d;
+    let color = [
+        b.bounce_color[0] * b.bounce_intensity * d + b.color[0] * b.base_intensity * n,
+        b.bounce_color[1] * b.bounce_intensity * d + b.color[1] * b.base_intensity * n,
+        b.bounce_color[2] * b.bounce_intensity * d + b.color[2] * b.base_intensity * n,
+    ];
+    (color, b.range_scale * 0.5)
 }
 
 #[cfg(test)]
@@ -814,35 +838,50 @@ mod tests {
     }
 
     #[test]
-    fn bounce_window_blends_day_to_night() {
-        use crate::level_lights::BounceLightInfo;
+    fn bounce_window_is_a_daytime_tent() {
+        use crate::level_lights::{BounceLightInfo, LevelLight, FLAG_BOUNCE};
+        let light = LevelLight {
+            position: [0.0; 3],
+            direction: [0.0; 3],
+            radius: 1.0,
+            texture_offset: 0xffff,
+            geom_offset: 0xffff,
+            info_index: 0,
+            flags: FLAG_BOUNCE,
+            clip_volume: [0, 0],
+        };
+        // Day colour is carried on `bounce_color` and `bounce_intensity`; the
+        // base half is the night style (here blue, zero intensity).
         let b = BounceLightInfo {
             range_scale: 1.0,
-            color: [1.0, 1.0, 1.0],
+            color: [0.0, 0.0, 1.0],
             base_intensity: 1.0,
             base_ratio: 1.0,
             specular: 0.0,
-            bounce_color: [0.0, 0.0, 1.0],
+            bounce_color: [1.0, 1.0, 1.0],
             time_start: 6.0,
             time_mid: 12.0,
             time_end: 18.0,
             param_34: 0.0,
-            bounce_intensity: 0.0,
+            bounce_intensity: 4.0,
             param_3c: 0.0,
             param_40: 0.0,
         };
-        let (c_day, i_day) = bounce_style(&b, 5.0);
-        assert_eq!(c_day, [1.0, 1.0, 1.0]);
+
+        // Weight is zero at the window edges and peaks at the midpoint.
+        assert_eq!(bounce_day_weight(&light, &b, 6.0), 0.0);
+        assert_eq!(bounce_day_weight(&light, &b, 18.0), 0.0);
+        assert!(bounce_day_weight(&light, &b, 12.0) > 0.9);
+        assert!(bounce_day_weight(&light, &b, 9.0) > 0.0);
+        assert!(bounce_day_weight(&light, &b, 9.0) < bounce_day_weight(&light, &b, 12.0));
+
+        // Midday is the bright day colour; the window edges fall back to the
+        // base (night) colour with no bounce contribution.
+        let (c_day, i_day) = bounce_style(&light, &b, 12.0);
+        assert!(c_day[0] > 1.0, "day colour {c_day:?}");
         assert!(i_day > 0.0);
-
-        let (c_night, i_night) = bounce_style(&b, 20.0);
-        assert_eq!(c_night, [0.0, 0.0, 1.0]);
-        assert_eq!(i_night, 0.0);
-
-        // Mid-morning is part-way through the day half of the window.
-        let (c_mid, i_mid) = bounce_style(&b, 9.0);
-        assert!(c_mid[0] > 0.0 && c_mid[0] < 1.0, "got {c_mid:?}");
-        assert!(i_mid > 0.0 && i_mid < i_day, "got {i_mid}");
+        let (c_edge, _) = bounce_style(&light, &b, 6.0);
+        assert_eq!(c_edge, [0.0, 0.0, 1.0]);
     }
 
     // -- real level ---------------------------------------------------------
@@ -925,10 +964,17 @@ mod tests {
         };
         let noon = count(12.0);
         let midnight = count(0.0);
-        eprintln!("active lights: noon {noon}, midnight {midnight}");
-        assert!(noon > 0 && midnight > 0);
-        // Every bounce light's window is daytime, so noon must never be fewer.
-        assert!(noon >= midnight);
+        let bounce = lv.lights.iter().filter(|l| l.is_bounce()).count();
+        eprintln!(
+            "active lights: noon {noon}, midnight {midnight} ({bounce} bounce, {} always-on)",
+            lv.lights.len() - bounce
+        );
+        // Every bounce window in the shipped level lies in daytime, so all of
+        // them are off at midnight: the midnight count is exactly the
+        // non-bounce lights.
+        assert_eq!(midnight, lv.lights.len() - bounce);
+        assert!(noon > midnight);
+        assert!(noon <= lv.lights.len());
 
         // Also exercise the full frame build at both extremes.
         let env = env_default();

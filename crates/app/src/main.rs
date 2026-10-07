@@ -7,6 +7,7 @@
 
 mod cry_bridge;
 mod ai_bridge;
+mod light_bridge;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
@@ -84,16 +85,21 @@ struct World {
     ground_albedo: Option<(u32, u32, Vec<u8>)>,
 }
 
-/// Level lighting from the mission's time of day, at its start time.
-/// Only the sun DIRECTION is used (verified against the level's authored
-/// SunVector). TOD colours are HDR tints that the original runs through its
-/// multipliers, exposure, tone mapping and colour grading; applying the raw
-/// hue without that pipeline is less faithful than neutral light, so colours
-/// stay neutral until the HDR pipeline is ported.
+/// Level lighting from the mission's time of day, at its authored start time.
+///
+/// `light_bridge` turns this into Bevy lights: the recovered HDR frame drives
+/// the sun/ambient/fog/exposure/grade, and `lights`/`hour` drive the baked
+/// `.lights` spawns near `center`.
 #[derive(Resource)]
 struct LevelLighting {
-    /// Direction the sun's light travels, in Bevy space.
-    sun_dir: Vec3,
+    /// Recovered CryEngine lighting frame for the level time.
+    frame: sod_core::render_light::LightingFrame,
+    /// Level time in hours (0..24).
+    hour: f32,
+    /// Decoded `lights_win.lights`, if present.
+    lights: Option<sod_core::level_lights::LevelLights>,
+    /// Bevy-space player start, the anchor for level-light spawning.
+    center: Vec3,
 }
 
 /// The player's AnimationGraph (playerfullbody.xml) driven from movement.
@@ -719,9 +725,12 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         let tod = ml.time_of_day.sample(hour);
         let d = ml.environment.sun_direction(hour);
         let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-        let sun_dir = (base * Vec3::new(d[0], d[1], d[2])).normalize_or_zero();
-        println!("[world] time of day {hour:.2} h: sun dir (cry) {d:?}, sun {:?}, sky {:?}", tod.sun_color(), tod.sky_color());
-        LevelLighting { sun_dir }
+        let center = base * Vec3::new(start_cry[0], start_cry[1], start_cry[2]);
+        let frame = sod_core::render_light::LightingFrame::from_tod(&tod, &ml.environment, hour);
+        let lights = read("lights_win.lights").and_then(|b| sod_core::level_lights::parse(&b).ok());
+        println!("[world] time of day {hour:.2} h: sun dir (cry) {d:?}, sun {:?}, sky {:?}, level lights {}",
+            tod.sun_color(), tod.sky_color(), lights.as_ref().map(|l| l.lights.len()).unwrap_or(0));
+        LevelLighting { frame, hour, lights, center }
     });
 
     let player_graph = vfs
@@ -952,6 +961,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         // Compile the scene's render pipelines synchronously so the first
         // timed screenshots draw the world instead of an empty sky.
         .set(bevy::render::RenderPlugin { synchronous_pipeline_compilation: true, ..default() }))
+    .add_plugins(light_bridge::LightBridgePlugin)
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
     .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
@@ -1016,7 +1026,6 @@ fn setup_world(
     menu_font: Option<Res<MenuFont>>,
     cache: Option<Res<TextureCacheRes>>,
     world: Res<World>,
-    lighting: Option<Res<LevelLighting>>,
     player_setup: Option<Res<PlayerSetup>>,
     npc_template: Option<Res<NpcTemplate>>,
     follower_template: Option<Res<FollowerTemplate>>,
@@ -1436,8 +1445,9 @@ fn setup_world(
             });
     }
 
-    // Camera + lights. A bright key sun, a cool fill and a global ambient term
-    // so the static architecture is not left in shadow.
+    // Camera. The sun, sky ambient, fog, exposure and tone map are all driven
+    // from the level's recovered lighting frame by `light_bridge` once the
+    // camera exists (so the old hand-tuned key/fill/ambient lights are gone).
     // CryEngine's FOV (64) is *horizontal*; Bevy's Projection is vertical. Convert
     // through the 16:9 aspect so the framing matches the game. Tunable: SOD_FOV=<horizontal deg>.
     let hfov = std::env::var("SOD_FOV").ok().and_then(|s| s.parse::<f32>().ok())
@@ -1446,27 +1456,8 @@ fn setup_world(
     let vfov = 2.0 * ((hfov * 0.5).tan() * (720.0f32 / 1280.0)).atan();
     commands.spawn((Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { fov: vfov, ..default() }),
-        Transform::from_xyz(0.0, 100.0, 200.0).looking_at(Vec3::ZERO, Vec3::Y), Tonemapping::None,
-        AmbientLight { color: Color::srgb(0.55, 0.63, 0.78), brightness: 110.0, ..default() },
+        Transform::from_xyz(0.0, 100.0, 200.0).looking_at(Vec3::ZERO, Vec3::Y),
         MainCamera));
-    match lighting.as_ref() {
-        // The level's sun direction; neutral colour, plus the previous fill
-        // light until the sky-light / HDR pipeline is ported.
-        Some(l) => {
-            commands.spawn((
-                DirectionalLight { shadow_maps_enabled: false, illuminance: 3600.0, color: Color::srgb(1.0, 0.95, 0.85), ..default() },
-                Transform::default().looking_to(l.sun_dir, Vec3::Y),
-            ));
-            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 700.0, color: Color::srgb(0.7, 0.8, 1.0), ..default() },
-                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -2.2, 0.0))));
-        }
-        None => {
-            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 3600.0, color: Color::srgb(1.0, 0.95, 0.85), ..default() },
-                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 0.5, 0.0))));
-            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 700.0, color: Color::srgb(0.7, 0.8, 1.0), ..default() },
-                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -2.2, 0.0))));
-        }
-    }
     info!("scene ready");
 }
 

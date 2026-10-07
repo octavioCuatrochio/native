@@ -7,6 +7,7 @@
 
 mod cry_bridge;
 mod ai_bridge;
+mod char_material;
 mod light_bridge;
 mod particle_bridge;
 mod interact;
@@ -45,6 +46,7 @@ use sod_core::mesh::{self, DecodedMesh, DecodedModel};
 use sod_core::skin::{self, BoneWeight, Skeleton};
 use sod_core::terrain::{self, Terrain};
 use sod_core::anim;
+use char_material::{build_char_material, install_char_shader, CharMaterial};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +67,7 @@ struct AnimPart {
     bind_pos: Vec<[f32; 3]>,
     bind_nrm: Vec<[f32; 3]>,
     infl: Vec<[BoneWeight; 4]>,
-    mat: Handle<StandardMaterial>,
+    mat: Handle<CharMaterial>,
 }
 
 #[derive(Resource)]
@@ -1459,6 +1461,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         .set(bevy::render::RenderPlugin { synchronous_pipeline_compilation: true, ..default() }))
     .add_plugins(light_bridge::LightBridgePlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
+    .add_plugins(MaterialPlugin::<CharMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
     .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo, ground_layers })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
@@ -1532,6 +1535,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         app.insert_resource(ps);
     }
     install_terrain_shader(&mut app);
+    install_char_shader(&mut app);
     app.run();
 }
 
@@ -1539,6 +1543,7 @@ fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut char_materials: ResMut<Assets<CharMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut fonts: ResMut<Assets<Font>>,
@@ -1802,20 +1807,20 @@ fn setup_world(
     // spawns after startup and cannot reuse this function's locals.
     commands.insert_resource(PropAssets(built));
 
-    // Player (per-submesh palette materials).
+    // Player (per-submesh character materials: UL_Character / UL_Test_Skin).
     if let Some(ps) = player_setup {
-        let mut mat_handles: Vec<Handle<StandardMaterial>> = Vec::new();
+        let mut mat_handles: Vec<Handle<CharMaterial>> = Vec::new();
         for slot in &ps.slots {
-            let mut mat = StandardMaterial { base_color: Color::srgb(0.8, 0.72, 0.62), perceptual_roughness: 0.85, cull_mode: None, ..default() };
-            if let Some(tp) = slot.texture("Diffuse") {
-                if let Some(bytes) = ps.tex_bytes.get(tp) {
-                    if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) { mat.base_color_texture = Some(h); }
-                }
-            }
-            mat_handles.push(materials.add(mat));
+            let h = build_char_material(
+                &mut char_materials, &mut images, cache, &mut tex_memo, slot,
+                |p| ps.tex_bytes.get(p).map(|v| v.as_slice()),
+            );
+            mat_handles.push(h);
         }
         if mat_handles.is_empty() {
-            mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.8, 0.72, 0.62), perceptual_roughness: 0.85, cull_mode: None, ..default() }));
+            mat_handles.push(build_char_material(
+                &mut char_materials, &mut images, cache, &mut tex_memo, &MaterialSlot::default(), |_| None,
+            ));
         }
         let mut parts = Vec::new();
         let yaw = ps.yaw;
@@ -1834,11 +1839,15 @@ fn setup_world(
                 };
                 for (mat_i, idx) in groups {
                     if idx.is_empty() { continue; }
+                    let has_bump = ps.slots.get(mat_i)
+                        .map(|s| s.texture("Bumpmap").or_else(|| s.texture("Normal")).is_some())
+                        .unwrap_or(false);
                     let mut bm = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
                     bm.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(m.positions.clone()));
                     bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
                     if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
                     bm.insert_indices(Indices::U32(idx));
+                    if has_bump && m.uvs.len() == m.positions.len() { let _ = bm.generate_tangents(); }
                     let handle = meshes.add(bm);
                     let mh = mat_handles.get(mat_i).cloned().unwrap_or_else(|| mat_handles[0].clone());
                     parent.spawn((Mesh3d(handle.clone()), MeshMaterial3d(mh.clone())));
@@ -1862,17 +1871,12 @@ fn setup_world(
         // (`SOD_LEGACY_FOLLOWER`). The original spawn director only covers
         // zombies; there is no original-driven follower yet.
         if let Some(ft) = &follower_template {
-            let mut mat = StandardMaterial { base_color: Color::srgb(0.8, 0.72, 0.62), perceptual_roughness: 0.85, cull_mode: None, ..default() };
-            if let Some(slot) = ft.slots.iter().find(|s| s.texture("Diffuse").is_some()) {
-                if let Some(tp) = slot.texture("Diffuse") {
-                    if let Some(bytes) = ft.tex_bytes.get(tp) {
-                        if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) {
-                            mat.base_color_texture = Some(h);
-                        }
-                    }
-                }
-            }
-            let mat_h = materials.add(mat);
+            let follower_slot = ft.slots.iter().find(|s| s.texture("Diffuse").is_some());
+            let mat_h = build_char_material(
+                &mut char_materials, &mut images, cache, &mut tex_memo,
+                follower_slot.unwrap_or(&MaterialSlot::default()),
+                |p| ft.tex_bytes.get(p).map(|v| v.as_slice()),
+            );
             let cx = ps.spawn[0] + 2.5;
             let cy = ps.spawn[1] + 2.5;
             let h = height_at(&world.terrain, cx, cy);
@@ -2935,6 +2939,7 @@ fn run_model(vfs: Vfs, model_path: String) {
         primary_window: Some(Window { title: format!("sod-native — {model_path}"), resolution: (1280u32, 720u32).into(), ..default() }),
         ..default()
     }))
+    .add_plugins(MaterialPlugin::<CharMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
     .insert_resource(Scene { model, palette, tex_bytes })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
@@ -2943,6 +2948,7 @@ fn run_model(vfs: Vfs, model_path: String) {
     if let Some((sk, inf, caf)) = anim_setup {
         app.insert_resource(SingleAnim { skeleton: sk, influences: inf, caf, time: 0.0 });
     }
+    install_char_shader(&mut app);
     app.run();
 }
 
@@ -2978,7 +2984,7 @@ fn pick_caf_rig(vfs: &Vfs, skeleton: &Skeleton, rig_in: Option<&str>) -> Option<
 }
 
 /// Decode a texture (disk-cached, memoised) and return a GPU handle.
-fn cached_tex(
+pub(crate) fn cached_tex(
     images: &mut Assets<Image>,
     cache: Option<&cache::TextureCache>,
     memo: &mut HashMap<String, Handle<Image>>,
@@ -3021,22 +3027,20 @@ fn load_dds(images: &mut Assets<Image>, bytes: &[u8], srgb: bool) -> Option<Hand
     Some(images.add(img))
 }
 
-fn make_material(materials: &mut Assets<StandardMaterial>, images: &mut Assets<Image>, scene: &Scene, slot: Option<&MaterialSlot>, fallback: Color) -> Handle<StandardMaterial> {
-    let mut sm = StandardMaterial { base_color: fallback, perceptual_roughness: 0.9, cull_mode: None, ..default() };
-    if let Some(slot) = slot {
-        if let Some(path) = slot.texture("Diffuse") {
-            if let Some(bytes) = scene.tex_bytes.get(path) {
-                if let Some(h) = load_dds(images, bytes, true) { sm.base_color_texture = Some(h); }
-            }
-        }
-    }
-    materials.add(sm)
+fn make_material(char_materials: &mut Assets<CharMaterial>, images: &mut Assets<Image>, scene: &Scene, slot: Option<&MaterialSlot>, _fallback: Color) -> Handle<CharMaterial> {
+    let mut memo: HashMap<String, Handle<Image>> = HashMap::new();
+    let default_slot = MaterialSlot::default();
+    let slot = slot.unwrap_or(&default_slot);
+    build_char_material(
+        char_materials, images, None, &mut memo, slot,
+        |p| scene.tex_bytes.get(p).map(|v| v.as_slice()),
+    )
 }
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut char_materials: ResMut<Assets<CharMaterial>>,
     mut images: ResMut<Assets<Image>>,
     scene: Res<Scene>,
     anim_setup: Option<Res<SingleAnim>>,
@@ -3051,14 +3055,18 @@ fn setup(
     let mut parts = Vec::new();
     commands.spawn((base, Visibility::default(), Spinner)).with_children(|parent| {
         for (mi, m) in scene.model.meshes.iter().enumerate() {
-            let mat = make_material(&mut materials, &mut images, &scene, textured_slot, Color::srgb(0.78, 0.74, 0.68));
+            let mat = make_material(&mut char_materials, &mut images, &scene, textured_slot, Color::srgb(0.78, 0.74, 0.68));
             for sm in &m.submeshes {
                 if sm.indices.is_empty() || m.positions.is_empty() { continue; }
+                let has_bump = scene.palette.get(sm.material as usize)
+                    .map(|s| s.texture("Bumpmap").or_else(|| s.texture("Normal")).is_some())
+                    .unwrap_or(false);
                 let mut bm = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
                 bm.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(m.positions.clone()));
                 bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
                 if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
                 bm.insert_indices(Indices::U32(sm.indices.clone()));
+                if has_bump && m.uvs.len() == m.positions.len() { let _ = bm.generate_tangents(); }
                 let handle = meshes.add(bm);
                 parent.spawn((Mesh3d(handle.clone()), MeshMaterial3d(mat.clone())));
                 parts.push(AnimPart { handle, bind_pos: m.positions.clone(), bind_nrm: m.normals.clone(), infl: Vec::new(), mat: mat.clone() });

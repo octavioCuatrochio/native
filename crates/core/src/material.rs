@@ -12,6 +12,73 @@ use crate::crypak::Vfs;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+/// Character shader `PublicParams` (`UL_Character` / `UL_Test_Skin`).
+///
+/// The garment/skin shaders recolour a near-neutral `Diffuse` texture by the
+/// four regions encoded in the `Custom` mask map's blue channel. Region
+/// `i = round(Custom.b * 3)` selects `(Brightness_i, Contrast_i, Saturation_i,
+/// Hue_i)` as a brightness/contrast/saturation/hue-rotation composite applied in
+/// linear space, plus its own specular fresnel. `UL_Test_Skin` instead multiplies
+/// the diffuse by the decal and applies a melanin tint.
+#[derive(Debug, Clone)]
+pub struct CharParams {
+    /// `Brightness0..3`.
+    pub brightness: [f32; 4],
+    /// `Contrast0..3`.
+    pub contrast: [f32; 4],
+    /// `Saturation0..3`.
+    pub saturation: [f32; 4],
+    /// `Hue0..3` (radians, rotation about the (1,1,1) axis).
+    pub hue: [f32; 4],
+    /// `FresnelBias0..3`.
+    pub fresnel_bias: [f32; 4],
+    /// `FresnelScale0..3`.
+    pub fresnel_scale: [f32; 4],
+    /// `FresnelPower0..3`.
+    pub fresnel_power: [f32; 4],
+    /// `Glossiness1..3` (region 0 uses `Material Shininess`).
+    pub glossiness: [f32; 4],
+    /// `SpecColor1..3` (region 0 uses `Material Specular`).
+    pub spec_color: [[f32; 3]; 4],
+    /// `BloodBlendStart` / `BloodBlendEnd` (Custom.g blood alpha window).
+    pub blood_blend_start: f32,
+    pub blood_blend_end: f32,
+    /// `AlphaRef` (load/blood alpha cut).
+    pub alpha_ref: f32,
+    /// `DecalMaskIdChoice` / `DetailMaskIdChoice` (region the overlay applies to).
+    pub decal_mask_id: f32,
+    pub detail_mask_id: f32,
+    /// `Melanin` (skin shader tint).
+    pub melanin: f32,
+    /// `SpecularStrenght` / `RimStrenght` (skin shader multipliers).
+    pub specular_strength: f32,
+    pub rim_strength: f32,
+}
+
+impl Default for CharParams {
+    fn default() -> Self {
+        Self {
+            brightness: [1.0; 4],
+            contrast: [0.0; 4],
+            saturation: [1.0; 4],
+            hue: [0.0; 4],
+            fresnel_bias: [0.25; 4],
+            fresnel_scale: [1.0; 4],
+            fresnel_power: [4.0; 4],
+            glossiness: [1.0; 4],
+            spec_color: [[0.32, 0.02, 0.02]; 4],
+            blood_blend_start: 0.5,
+            blood_blend_end: 1.0,
+            alpha_ref: 0.0,
+            decal_mask_id: 0.0,
+            detail_mask_id: 0.0,
+            melanin: 0.0,
+            specular_strength: 1.0,
+            rim_strength: 0.3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MaterialSlot {
     pub name: String,
@@ -35,6 +102,14 @@ pub struct MaterialSlot {
     /// `med_sleeve_vNN` skins use `X=64` to hide the torso/upper-arm geometry
     /// that the outer garments already cover).
     pub vert_color_mask: [u8; 4],
+    /// `Material Diffuse=` (MatDifColor), default white.
+    pub diffuse_color: [f32; 4],
+    /// `Material Specular=` rgb (MatSpecColor), region-0 specular tint.
+    pub specular_color: [f32; 4],
+    /// Character shader public parameters (region recolour, blood, skin).
+    pub char: CharParams,
+    /// Per-texture `TexMod` offset (map lowercased, off U, off V).
+    pub texture_offsets: Vec<(String, f32, f32)>,
 }
 
 impl MaterialSlot {
@@ -52,6 +127,15 @@ impl MaterialSlot {
             .find(|(m, _, _)| m.eq_ignore_ascii_case(map))
             .map(|(_, u, v)| (*u, *v))
             .unwrap_or((1.0, 1.0))
+    }
+
+    /// `TexMod` offset for `map`, defaulting to `(0.0, 0.0)` when unauthored.
+    pub fn texture_offset(&self, map: &str) -> (f32, f32) {
+        self.texture_offsets
+            .iter()
+            .find(|(m, _, _)| m.eq_ignore_ascii_case(map))
+            .map(|(_, u, v)| (*u, *v))
+            .unwrap_or((0.0, 0.0))
     }
 
     /// A `NoDraw` material (physics proxy / editor helper): never rendered.
@@ -126,6 +210,15 @@ fn attr_map(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
     out
 }
 
+/// Parse a `"r,g,b"` (or `"r,g,b,a"`) colour attribute.
+fn parse_color3(s: &str) -> Option<[f32; 3]> {
+    let mut it = s.split(',').map(|p| p.trim().parse::<f32>());
+    let r = it.next()?.ok()?;
+    let g = it.next()?.ok()?;
+    let b = it.next()?.ok()?;
+    Some([r, g, b])
+}
+
 /// Parse `.mtl` bytes into the ordered material palette.
 ///
 /// Palette rule (verified against `tools/mat_dump.py`, see
@@ -183,6 +276,17 @@ impl MtlState {
     fn apply(&mut self, name: &str, attrs: &[(String, String)], opening: bool, vfs: &Vfs) {
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
         let alpha_test = || get("alphatest").and_then(|v| v.trim().parse::<f32>().ok());
+        let diffuse = || parse_color3(&get("diffuse").unwrap_or_default()).unwrap_or([1.0, 1.0, 1.0]);
+        let specular = || {
+            parse_color3(&get("specular").unwrap_or_default()).unwrap_or([0.32, 0.02, 0.02])
+        };
+        let char_params = || {
+            let mut c = CharParams::default();
+            c.glossiness[0] = get("shininess")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(1.0);
+            c
+        };
         match name {
             "material" => {
                 // Both `<Material ...>` and self-closing `<Material .../>` sit one
@@ -197,6 +301,9 @@ impl MtlState {
                         name: get("name").unwrap_or_default(),
                         shader: get("shader").unwrap_or_default(),
                         alpha_test: alpha_test(),
+                        diffuse_color: [diffuse()[0], diffuse()[1], diffuse()[2], 1.0],
+                        specular_color: [specular()[0], specular()[1], specular()[2], 1.0],
+                        char: char_params(),
                         ..Default::default()
                     });
                 } else if self.in_sub && d == 2 {
@@ -204,6 +311,9 @@ impl MtlState {
                         name: get("name").unwrap_or_default(),
                         shader: get("shader").unwrap_or_default(),
                         alpha_test: alpha_test(),
+                        diffuse_color: [diffuse()[0], diffuse()[1], diffuse()[2], 1.0],
+                        specular_color: [specular()[0], specular()[1], specular()[2], 1.0],
+                        char: char_params(),
                         ..Default::default()
                     });
                     self.last_slot = Some(self.slots.len() - 1);
@@ -244,11 +354,12 @@ impl MtlState {
                 }
             }
             "publicparams" => {
-                // Character part-selection mask. `PublicParams` sits inside the
-                // `<Material>` it belongs to, so a child material's params target
-                // `last_slot` while a root container's (no SubMaterials) target
-                // the root slot.
-                let set_mask = |s: &mut MaterialSlot| {
+                // Character part-selection mask + colour pipeline. `PublicParams`
+                // sits inside the `<Material>` it belongs to, so a child
+                // material's params target `last_slot` while a root container's
+                // (no SubMaterials) target the root slot.
+                let pf = |key: &str| get(key).and_then(|v| v.trim().parse::<f32>().ok());
+                let set_params = |s: &mut MaterialSlot| {
                     for (i, key) in ["vertcolormaskx", "vertcolormasky", "vertcolormaskz", "vertcolormaskw"]
                         .iter()
                         .enumerate()
@@ -259,34 +370,99 @@ impl MtlState {
                             }
                         }
                     }
+                    for i in 0..4 {
+                        if let Some(v) = pf(&format!("brightness{i}")) {
+                            s.char.brightness[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("contrast{i}")) {
+                            s.char.contrast[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("saturation{i}")) {
+                            s.char.saturation[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("hue{i}")) {
+                            s.char.hue[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("fresnelbias{i}")) {
+                            s.char.fresnel_bias[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("fresnelscale{i}")) {
+                            s.char.fresnel_scale[i] = v;
+                        }
+                        if let Some(v) = pf(&format!("fresnelpower{i}")) {
+                            s.char.fresnel_power[i] = v;
+                        }
+                        if i > 0 {
+                            if let Some(v) = pf(&format!("glossiness{i}")) {
+                                s.char.glossiness[i] = v;
+                            }
+                        }
+                        if i > 0 {
+                            if let Some(c) = get(&format!("speccolor{i}")).and_then(|v| parse_color3(&v)) {
+                                s.char.spec_color[i] = c;
+                            }
+                        }
+                    }
+                    if let Some(v) = pf("bloodblendstart") {
+                        s.char.blood_blend_start = v;
+                    }
+                    if let Some(v) = pf("bloodblendend") {
+                        s.char.blood_blend_end = v;
+                    }
+                    if let Some(v) = pf("alpharef") {
+                        s.char.alpha_ref = v;
+                    }
+                    if let Some(v) = pf("decalmaskidchoice") {
+                        s.char.decal_mask_id = v;
+                    }
+                    if let Some(v) = pf("detailmaskidchoice") {
+                        s.char.detail_mask_id = v;
+                    }
+                    if let Some(v) = pf("melanin") {
+                        s.char.melanin = v;
+                    }
+                    if let Some(v) = pf("specularstrenght").or_else(|| pf("specularstrength")) {
+                        s.char.specular_strength = v;
+                    }
+                    if let Some(v) = pf("rimstrenght").or_else(|| pf("rimstrength")) {
+                        s.char.rim_strength = v;
+                    }
                 };
                 if self.depth >= 2 {
                     if let Some(i) = self.last_slot {
                         if let Some(s) = self.slots.get_mut(i) {
-                            set_mask(s);
+                            set_params(s);
                         }
                     }
                 } else if let Some(rs) = self.root_slot.as_mut() {
-                    set_mask(rs);
+                    set_params(rs);
                 }
             }
             "texmod" => {
                 let Some(map) = self.last_tex_map.clone() else { return };
                 let tu = get("tileu").and_then(|v| v.trim().parse::<f32>().ok());
                 let tv = get("tilev").and_then(|v| v.trim().parse::<f32>().ok());
+                let ou = get("offsetu").and_then(|v| v.trim().parse::<f32>().ok());
+                let ov = get("offsetv").and_then(|v| v.trim().parse::<f32>().ok());
                 let (u, v) = match (tu, tv) {
                     (Some(u), Some(v)) => (u, v),
                     (Some(u), None) => (u, u),
                     (None, Some(v)) => (v, v),
-                    (None, None) => return,
+                    (None, None) => (1.0, 1.0),
                 };
+                let (ou, ov) = (ou.unwrap_or(0.0), ov.unwrap_or(0.0));
                 let slot = if self.last_tex_root {
                     self.root_slot.as_mut()
                 } else {
                     self.last_slot.and_then(|i| self.slots.get_mut(i))
                 };
                 if let Some(s) = slot {
-                    s.texture_tiles.push((map, u, v));
+                    if !s.texture_tiles.iter().any(|(m, _, _)| m.eq_ignore_ascii_case(&map)) {
+                        s.texture_tiles.push((map.clone(), u, v));
+                    }
+                    if ou != 0.0 || ov != 0.0 {
+                        s.texture_offsets.push((map, ou, ov));
+                    }
                 }
             }
             _ => {}
@@ -462,6 +638,62 @@ mod tests {
         );
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].texture_tile("Diffuse"), (0.2, 0.2));
+    }
+
+    #[test]
+    fn captures_character_public_params() {
+        let slots = parse(
+            br#"<Material>
+                 <SubMaterials>
+                   <Material Name="shirtShader" Shader="UL_Character"
+                             Diffuse="0.8,0.8,0.8" Specular="0.1,0.2,0.3" Shininess="16">
+                     <PublicParams Brightness0="0.3" Brightness1="0.12" Contrast1="0.01"
+                        Saturation2="0.05" Hue1="-2.577" BloodBlendStart="0.219"
+                        BloodBlendEnd="0.781" AlphaRef="0.024" DecalMaskIdChoice="1"
+                        SpecColor1="0.1,0.2,0.3" Glossiness1="2" Melanin="0.4"
+                        SpecularStrenght="0.6" RimStrenght="0.2"/>
+                   </Material>
+                 </SubMaterials>
+               </Material>"#,
+        );
+        let s = &slots[0];
+        assert_eq!(s.shader, "UL_Character");
+        assert_eq!(s.diffuse_color[0], 0.8);
+        assert_eq!(s.specular_color[1], 0.2);
+        assert_eq!(s.char.brightness[0], 0.3);
+        assert_eq!(s.char.brightness[1], 0.12);
+        assert_eq!(s.char.contrast[1], 0.01);
+        assert_eq!(s.char.saturation[2], 0.05);
+        assert!((s.char.hue[1] + 2.577).abs() < 1e-3);
+        assert_eq!(s.char.blood_blend_start, 0.219);
+        assert_eq!(s.char.blood_blend_end, 0.781);
+        assert_eq!(s.char.alpha_ref, 0.024);
+        assert_eq!(s.char.decal_mask_id, 1.0);
+        assert_eq!(s.char.spec_color[1], [0.1, 0.2, 0.3]);
+        assert_eq!(s.char.glossiness[0], 16.0);
+        assert_eq!(s.char.glossiness[1], 2.0);
+        assert_eq!(s.char.melanin, 0.4);
+        assert_eq!(s.char.specular_strength, 0.6);
+        assert_eq!(s.char.rim_strength, 0.2);
+    }
+
+    #[test]
+    fn captures_tex_mod_offsets() {
+        let slots = parse(
+            br#"<Material>
+                 <SubMaterials>
+                   <Material Name="x" Shader="UL_Character">
+                     <Textures>
+                       <Texture Map="Decal" File="characters/textures/blank.tif">
+                         <TexMod OffsetU="-0.95" OffsetV="-0.8" TileU="7" TileV="3.5"/>
+                       </Texture>
+                     </Textures>
+                   </Material>
+                 </SubMaterials>
+               </Material>"#,
+        );
+        assert_eq!(slots[0].texture_tile("Decal"), (7.0, 3.5));
+        assert_eq!(slots[0].texture_offset("Decal"), (-0.95, -0.8));
     }
 
     #[test]

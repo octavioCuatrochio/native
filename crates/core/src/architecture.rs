@@ -62,6 +62,13 @@ pub struct PlacedBrush {
     pub rot: [f32; 4],
     /// Best-effort uniform scale (mean of the three `Matrix34` row norms).
     pub scale: f32,
+    /// Radius of the stored world-space AABB (`SRenderNodeChunk` bytes 0..24), the
+    /// radius CryEngine's view-distance and LOD rules use.
+    pub bbox_radius: f32,
+    /// Per-object `ViewDistRatio` (chunk byte 34; 100 = normal).
+    pub view_dist_ratio: u8,
+    /// Per-object `LodRatio` (chunk byte 35; 100 = normal).
+    pub lod_ratio: u8,
 }
 
 /// Parsed `STerrainChunkHeader` + `STerrainInfo`, exposed for introspection.
@@ -427,11 +434,16 @@ fn parse_object_block(dat: &[u8], start: usize, end: usize, names: &[String], ou
                 if let Some(model) = names.get(proto as usize) {
                     if let Some(m) = read_matrix34(dat, q + 36) {
                         let (pos, rot, scale) = brush_transform(m);
+                        let f = |o: usize| rd_f32(dat, q + o).unwrap_or(0.0);
+                        let d = [f(12) - f(0), f(16) - f(4), f(20) - f(8)];
                         out.push(PlacedBrush {
                             model: model.clone(),
                             pos,
                             rot,
                             scale,
+                            bbox_radius: 0.5 * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(),
+                            view_dist_ratio: dat[q + 34],
+                            lod_ratio: dat[q + 35],
                         });
                     }
                 }

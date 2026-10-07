@@ -90,6 +90,8 @@ struct World {
     tex_bytes: HashMap<String, Vec<u8>>,
     /// Static architecture (buildings, walls, rocks) around the tutorial zone.
     brushes: Vec<(String, [f32; 3], [f32; 4], f32)>,
+    /// Per brush: world AABB radius, ViewDistRatio, LodRatio (index-aligned with `brushes`).
+    brush_info: Vec<(f32, u8, u8)>,
     /// Vegetation (trees/bushes): model, cry position, scale, yaw radians.
     vegetation: Vec<(String, [f32; 3], f32, f32)>,
     /// Raw `.dds` bytes for the tiled ground diffuse texture (fallback).
@@ -138,12 +140,13 @@ fn world_radius() -> f32 {
 
 /// Shipped object view-distance settings (`Config/CVarGroups/sys_spec_objectdetail.cfg`,
 /// group 3 = High, which uses the `[default]` values; `SOD_SPEC=1..4` picks another group).
-struct ViewDist { min: f32, ratio: f32, ratio_veg: f32 }
+struct ViewDist { min: f32, ratio: f32, ratio_veg: f32, lod_ratio: f32, lod_comp_max: f32 }
 
 fn view_dist_spec() -> ViewDist {
     let spec = std::env::var("SOD_SPEC").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
-    let (ratio, ratio_veg) = match spec { 1 => (25.0, 30.0), 2 => (30.0, 40.0), 4 => (50.0, 70.0), _ => (35.0, 50.0) };
-    ViewDist { min: 10.0, ratio, ratio_veg }
+    let (ratio, ratio_veg, lod_ratio) = match spec { 1 => (25.0, 30.0, 5.0), 2 => (30.0, 40.0, 6.0), 4 => (50.0, 70.0, 12.0), _ => (35.0, 50.0, 10.0) };
+    // e_LodCompMaxSize is not overridden by the shipped configs: registration default 10.
+    ViewDist { min: 10.0, ratio, ratio_veg, lod_ratio, lod_comp_max: 10.0 }
 }
 
 /// CryEngine 3 `IRenderNode::GetMaxViewDist` for brushes/vegetation:
@@ -153,12 +156,36 @@ fn max_view_dist(radius: f32, ratio: f32, min: f32) -> f32 {
     (radius * ratio).max(min)
 }
 
-/// Hard cut at `end`, measured to the object's bounding box like CryEngine's
-/// distance to the render node's AABB.
-fn vis_range(end: f32) -> bevy::camera::visibility::VisibilityRange {
-    let mut r = bevy::camera::visibility::VisibilityRange::abrupt(0.0, end);
-    r.use_aabb = true;
-    r
+fn lod_path(model: &str, n: u32) -> String {
+    format!("{}_lod{n}.cgf", model.strip_suffix(".cgf").unwrap_or(model))
+}
+
+/// Spawn a model with its shipped LOD chain. CryEngine 3 `GetObjectLOD`:
+/// `lod = floor(dist / (e_LodRatio * min(radius, e_LodCompMaxSize) * LodRatio/100))`,
+/// so LOD `n` starts at `n` times that step; the last LOD runs to the view distance.
+#[allow(clippy::too_many_arguments)]
+fn spawn_lod_chain(
+    root: &mut ChildSpawnerCommands,
+    built: &HashMap<String, Vec<(Handle<Mesh>, Handle<StandardMaterial>)>>,
+    model: &str, tf: Transform, radius: f32, view_dist: f32, lod_ratio: u8, vd: &ViewDist,
+) {
+    let Some(lod0) = built.get(model) else { return };
+    let mut chain = vec![lod0];
+    // `SOD_LOD=0` draws LOD0 only (A/B runs).
+    if std::env::var("SOD_LOD").map_or(true, |v| v != "0") {
+        for n in 1..=3 {
+            match built.get(&lod_path(model, n)) { Some(l) => chain.push(l), None => break }
+        }
+    }
+    let step = (vd.lod_ratio * radius.min(vd.lod_comp_max) * lod_ratio.max(1) as f32 / 100.0).max(0.001);
+    for (i, list) in chain.iter().enumerate() {
+        let start = i as f32 * step;
+        if start >= view_dist { break; }
+        let end = if i + 1 < chain.len() { ((i + 1) as f32 * step).min(view_dist) } else { view_dist };
+        let mut r = bevy::camera::visibility::VisibilityRange::abrupt(start, end);
+        r.use_aabb = true;
+        for (mh, mat) in list.iter() { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, r.clone())); }
+    }
 }
 
 /// Bounding-sphere radius of a model's meshes (unscaled), from their AABBs.
@@ -1195,7 +1222,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     // Static architecture (buildings/walls/rocks) around the zone.
     let arch_radius = world_radius();
     let mut brushes: Vec<(String, [f32; 3], [f32; 4], f32)> = Vec::new();
+    let mut brush_info: Vec<(f32, u8, u8)> = Vec::new();
     for b in architecture::brushes_in_region(&terrain_bytes, start_cry, arch_radius) {
+        brush_info.push((b.bbox_radius, b.view_dist_ratio, b.lod_ratio));
         brushes.push((b.model, b.pos, b.rot, b.scale));
     }
     let mut unique_brush_models: Vec<String> = brushes.iter().map(|b| b.0.clone()).collect();
@@ -1275,6 +1304,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     // this pass; prebuild their `props.xml` models so the runtime spawn can
     // reuse the level's mesh/material handles (see `interact.rs`).
     wanted.extend(interact::searchable_wanted_models(&vfs));
+    // Shipped LOD models sit next to the full model as `<name>_lod<N>.cgf`.
+    let lods: Vec<String> = wanted.iter().flat_map(|m| (1..=3).map(move |n| lod_path(m, n))).collect();
+    wanted.extend(lods);
     wanted.sort();
     wanted.dedup();
     let mut models: HashMap<String, Vec<DecodedMesh>> = HashMap::new();
@@ -1502,7 +1534,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(MaterialPlugin::<CharMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
-    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo, ground_layers })
+    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, brush_info, vegetation, ground_tex, ground_albedo, ground_layers })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
     .insert_resource(MenuFont(vfs.read("fonts/veramono.ttf").unwrap_or_default()))
     .insert_resource(TextureCacheRes(cache::TextureCache::new("target/texture-cache")))
@@ -1814,23 +1846,22 @@ fn setup_world(
                 rotation: Quat::from_xyzw(p.rot[0], p.rot[1], p.rot[2], p.rot[3]),
                 scale: Vec3::new(p.scale[0], p.scale[1], p.scale[2]),
             };
-            let vr = vis_range(
-                max_view_dist(model_radius(&meshes, list) * p.scale[0].max(p.scale[1]).max(p.scale[2]), vd.ratio, vd.min));
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
+            let r = model_radius(&meshes, list) * p.scale[0].max(p.scale[1]).max(p.scale[2]);
+            spawn_lod_chain(root, &built, path, tf, r, max_view_dist(r, vd.ratio, vd.min), 100, &vd);
             spawned += 1;
         }
         // Static architecture (buildings, walls, rocks) as instances.
         let mut bspawned = 0;
-        for (model, pos, rot, scale) in &world.brushes {
+        for ((model, pos, rot, scale), (bradius, vdr, lodr)) in world.brushes.iter().zip(&world.brush_info) {
             let Some(list) = built.get(model) else { continue };
             let tf = Transform {
                 translation: Vec3::new(pos[0], pos[1], pos[2]),
                 rotation: Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]),
                 scale: Vec3::splat(*scale),
             };
-            let vr = vis_range(
-                max_view_dist(model_radius(&meshes, list) * *scale, vd.ratio, vd.min));
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
+            // ViewDistRatio/100 scales the distance (CryEngine GetViewDistRatioNormilized).
+            let vdist = max_view_dist(*bradius, vd.ratio * *vdr as f32 / 100.0, vd.min);
+            spawn_lod_chain(root, &built, model, tf, *bradius, vdist, *lodr, &vd);
             bspawned += 1;
         }
         // Vegetation (trees/bushes).
@@ -1842,9 +1873,9 @@ fn setup_world(
                 rotation: Quat::from_rotation_z(*yaw),
                 scale: Vec3::splat(*scale),
             };
-            let vr = vis_range(
-                max_view_dist(model_radius(&meshes, list) * *scale, vd.ratio_veg, vd.min));
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
+            // Vegetation group ratios are not decoded yet: default 100.
+            let r = model_radius(&meshes, list) * *scale;
+            spawn_lod_chain(root, &built, model, tf, r, max_view_dist(r, vd.ratio_veg, vd.min), 100, &vd);
             vspawned += 1;
         }
         info!("[world] spawned {} props, {} brushes, {} vegetation", spawned, bspawned, vspawned);

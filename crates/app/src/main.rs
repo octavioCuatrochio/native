@@ -1061,10 +1061,16 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     println!("[world] placements: {} total, {} tag points; Mt. Tanner start {:?}",
         total, tag_points.as_ref().map(|t| t.len()).unwrap_or(0), start_cry);
 
-    // Drawn terrain: a coarse 8 m grid for the far hills plus a native-2 m inset
-    // around the player, so the foreground keeps the authored detail at roughly
-    // the triangle budget of the old uniform 8 m mesh (see `build_terrain_lod`).
-    // `SOD_TERRAIN_STRIDE` forces a uniform stride for A/B tests.
+    // Drawn terrain: the original's `CTerrainNode` sector quadtree. Every
+    // rendered node is meshed at a mip level picked from its baked
+    // `pGeomErrors[]` against the camera distance (`CTerrainNode::SetLOD`),
+    // scaled by the shipped `e_TerrainLodRatio` (1.0), so the foreground keeps
+    // the native 2 m samples while distant sectors coarsen. Adjacent nodes are
+    // index-snapped onto the coarser neighbour's lattice, which is the engine's
+    // crack fix. `SOD_TERRAIN_STRIDE` still forces a uniform stride for A/B
+    // tests, `SOD_TERRAIN_LOD=0` forces the old near/far inset, and the old
+    // inset is also the fallback if the tree fails to decode.
+    let qtree = terrain::decode_quadtree(&terrain_bytes);
     let (tverts, tindex) = match std::env::var("SOD_TERRAIN_STRIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
         Some(stride) => {
             let m = terrain::build_mesh(&ter, stride);
@@ -1072,9 +1078,25 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
             m
         }
         None => {
-            let m = build_terrain_lod(&ter, start_cry, 160.0, 1, 4);
-            println!("[world] terrain mesh: {} verts (near 160 m inset @ 2 m, far 8 m)", m.0.len());
-            m
+            // `SOD_TERRAIN_LOD=0` forces the previous near/far inset for A/B runs.
+            let old = std::env::var("SOD_TERRAIN_LOD").ok().as_deref() == Some("0");
+            match &qtree {
+                Some(root) if !old => {
+                    let params = terrain::TerrainLodParams { camera: start_cry, ..Default::default() };
+                    let lod = terrain::build_quadtree_lod(&ter, root, &params);
+                    println!(
+                        "[world] terrain mesh: {} verts, {} tris (sector quadtree LOD: {} sectors, max LOD {}, e_TerrainLodRatio {})",
+                        lod.positions.len(), lod.indices.len() / 3, lod.sectors, lod.max_lod,
+                        terrain::TERRAIN_LOD_RATIO_DEFAULT
+                    );
+                    (lod.positions, lod.indices)
+                }
+                _ => {
+                    let m = build_terrain_lod(&ter, start_cry, 160.0, 1, 4);
+                    println!("[world] terrain mesh: {} verts (near 160 m inset @ 2 m, far 8 m)", m.0.len());
+                    m
+                }
+            }
         }
     };
     // Tint the (textured) ground by surface type, mixed toward white so the

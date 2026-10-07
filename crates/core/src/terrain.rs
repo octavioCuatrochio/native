@@ -594,6 +594,445 @@ pub fn build_mesh(t: &Terrain, stride: usize) -> (Vec<[f32; 3]>, Vec<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// sector quadtree LOD (CryEngine `CTerrainNode`)
+// ---------------------------------------------------------------------------
+//
+// The shipping engine does not draw one uniform terrain grid: `CTerrainNode` is
+// the serialized `terrain.dat` quadtree itself, and each visible node is meshed
+// at a per-node mip level (`m_cNewGeomMML`) chosen from the node's baked
+// geometry errors and the camera distance. Reimplemented here:
+//
+// * `CTerrainNode::SetLOD` (`terrain_sector.cpp`) — `fAllowedError =
+//   e_TerrainLodRatio * fDist / 180 * 2.5`, then the coarsest level whose
+//   `pGeomErrors[level]` is below it; sectors closer than 1.25x their size are
+//   forced to level 0.
+// * `CTerrainNode::CheckVis` (`terrain_node.cpp`) — a node subdivides while the
+//   camera is closer than `e_TerrainLodDistRatio * nodeSize` or the chosen LOD
+//   is finer than the node's quadtree level.
+// * `CTerrainNode::BuildIndices` / `AddIndexAliased`
+//   (`terrain_sector_render.cpp`) — the crack fix: a fine node's border indices
+//   are snapped onto the coarser neighbouring node's lattice, so shared border
+//   vertices land on exactly the same world position (T-junctions collapse into
+//   harmless degenerate triangles).
+//
+// The `pGeomErrors[5]` array is exactly the one stored per node in the source
+// quadtree (see `walk_node`, which currently reads past it).
+
+/// Shipped default of `e_TerrainLodRatio`: scales the heightmap LOD error
+/// threshold. Recovered from the executable — registered with default `1`
+/// (`crates/core/src/cry/cvar_table.rs:1131`, name string at exe VA
+/// `0x13244bc`) — and it matches CRYENGINE's `e_TerrainLodRatio, 1.f`.
+pub const TERRAIN_LOD_RATIO_DEFAULT: f32 = 1.0;
+
+/// Default of CryEngine's `e_TerrainLodDistRatio` (`1.f`, CRYENGINE 3.8
+/// `Cry3DEngine/cvars.cpp`): distance-only LOD ratio that decides quadtree
+/// subdivision. SoD (CE 3.0) does not register the cvar, so the engine's
+/// built-in default is what ships here.
+pub const TERRAIN_LOD_DIST_RATIO_DEFAULT: f32 = 1.0;
+
+/// Number of LOD levels stored per node (`m_nUnitsToSectorBitShift`; 5 for a
+/// 64 m sector of 2 m units).
+const GEOM_LEVELS: usize = 5;
+
+/// One node of the serialized `CTerrainNode` quadtree: its world AABB, its
+/// quadtree level, its native heightmap sample shift and the per-LOD geometry
+/// errors the terrain compiler baked into `STerrainNodeChunk.pGeomErrors[5]`.
+#[derive(Debug, Clone)]
+pub struct TerrainSector {
+    /// World AABB minimum `(x, y, z)` in metres.
+    pub min: [f32; 3],
+    /// World AABB maximum `(x, y, z)` in metres.
+    pub max: [f32; 3],
+    /// Quadtree level: the node side is `64 m << tree_level`.
+    pub tree_level: u32,
+    /// Native sample shift: side is `spacing << shift` samples. Internal nodes
+    /// take the finest child shift (as `CTerrainNode::UpdateRangeInfoShift`).
+    pub shift: u32,
+    /// `pGeomErrors[5]`, indexed by LOD level; `[0]` is always 0.
+    pub geom_errors: [f32; GEOM_LEVELS],
+    /// Empty for a leaf, otherwise exactly four children in `+X/+Y` order.
+    pub children: Vec<TerrainSector>,
+}
+
+impl TerrainSector {
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+    /// World side length in metres.
+    pub fn size(&self) -> f32 {
+        (self.max[0] - self.min[0]).max(0.0)
+    }
+}
+
+/// Parameters controlling the sector-LOD mesh (`e_Terrain*` cvars).
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainLodParams {
+    /// Camera position in CryEngine world space (metres, Z-up).
+    pub camera: [f32; 3],
+    /// `e_TerrainLodRatio` (shipped default [`TERRAIN_LOD_RATIO_DEFAULT`]).
+    pub lod_ratio: f32,
+    /// `e_TerrainLodDistRatio` (default [`TERRAIN_LOD_DIST_RATIO_DEFAULT`]).
+    pub dist_ratio: f32,
+    /// Camera zoom factor (`1` for the normal first-person/third-person view).
+    pub zoom: f32,
+}
+
+impl Default for TerrainLodParams {
+    fn default() -> Self {
+        Self {
+            camera: [0.0; 3],
+            lod_ratio: TERRAIN_LOD_RATIO_DEFAULT,
+            dist_ratio: TERRAIN_LOD_DIST_RATIO_DEFAULT,
+            zoom: 1.0,
+        }
+    }
+}
+
+/// A sector-LOD mesh plus the stats the renderer reports.
+#[derive(Debug, Clone)]
+pub struct TerrainLod {
+    pub positions: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    /// Number of rendered quadtree nodes.
+    pub sectors: usize,
+    /// Coarsest LOD level actually drawn.
+    pub max_lod: u32,
+}
+
+/// Native sample shift of a leaf with `size` samples per side (`size - 1` steps
+/// across a sector of `1 << geom` heightmap units). Mirrors
+/// `SRangeInfo::UpdateBitShift`.
+fn leaf_shift(size: usize, geom: usize) -> u32 {
+    let units_per_sector = 1usize << geom;
+    let mut n = size.saturating_sub(1);
+    let mut shift = 0u32;
+    while n > 0 && units_per_sector > n {
+        shift += 1;
+        n *= 2;
+    }
+    shift
+}
+
+/// Quadtree level of a node of side `size` metres.
+fn sector_tree_level(size: f32, sector: f32) -> u32 {
+    if size <= 0.0 || sector <= 0.0 {
+        return 0;
+    }
+    let ratio = (size / sector).round();
+    if ratio < 1.0 {
+        0
+    } else {
+        (ratio.log2().round() as i32).max(0) as u32
+    }
+}
+
+fn parse_sector(
+    dat: &[u8],
+    pos: &mut usize,
+    geom: usize,
+    sector: f32,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<TerrainSector> {
+    if depth > MAX_DEPTH || *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+
+    let base = *pos;
+    if base.checked_add(TERRAIN_NODE_LEN)? > dat.len() {
+        return None;
+    }
+    let min_x = rd_f32(dat, base + 4)?;
+    let min_y = rd_f32(dat, base + 8)?;
+    let min_z = rd_f32(dat, base + 0x0C)?;
+    let max_x = rd_f32(dat, base + 0x10)?;
+    let max_y = rd_f32(dat, base + 0x14)?;
+    let max_z = rd_f32(dat, base + 0x18)?;
+    let n_size = rd_i32(dat, base + 0x24)?;
+    let n_surf = rd_i32(dat, base + 0x28)?;
+    if n_size < 0 || n_surf < 0 {
+        return None;
+    }
+    let size = n_size as usize;
+    let nsurf = n_surf as usize;
+    if size > (1 << 20) || nsurf > dat.len() {
+        return None;
+    }
+
+    let mut p = base + TERRAIN_NODE_LEN;
+    let mut geom_errors = [0f32; GEOM_LEVELS];
+    let mut shift = 0u32;
+
+    if size > 0 {
+        let count = size.checked_mul(size)?;
+        let bytes = count.checked_mul(2)?;
+        if p.checked_add(bytes)? > dat.len() {
+            return None;
+        }
+        let geom_off = align4(p.checked_add(bytes)?);
+        let types_off = geom_off.checked_add(4 * geom)?;
+        let end = align4(types_off.checked_add(nsurf)?);
+        if end > dat.len() {
+            return None;
+        }
+        for (k, slot) in geom_errors.iter_mut().enumerate().take(geom.min(GEOM_LEVELS)) {
+            *slot = rd_f32(dat, geom_off + 4 * k)?;
+        }
+        shift = leaf_shift(size, geom);
+        p = end;
+    } else {
+        let geom_off = p;
+        let types_off = geom_off.checked_add(4 * geom)?;
+        let end = align4(types_off.checked_add(nsurf)?);
+        if end > dat.len() {
+            return None;
+        }
+        for (k, slot) in geom_errors.iter_mut().enumerate().take(geom.min(GEOM_LEVELS)) {
+            *slot = rd_f32(dat, geom_off + 4 * k)?;
+        }
+        p = end;
+    }
+
+    let node_size = (max_x - min_x).max(0.0);
+    let mut node = TerrainSector {
+        min: [min_x, min_y, min_z],
+        max: [max_x, max_y, max_z],
+        tree_level: sector_tree_level(node_size, sector),
+        shift,
+        geom_errors,
+        children: Vec::new(),
+    };
+
+    if size == 0 {
+        for _ in 0..4 {
+            let child = parse_sector(dat, &mut p, geom, sector, depth + 1, budget)?;
+            node.children.push(child);
+        }
+        node.shift = node.children.iter().map(|c| c.shift).min().unwrap_or(0);
+    }
+
+    *pos = p;
+    Some(node)
+}
+
+/// Reconstruct the `CTerrainNode` runtime quadtree, with the baked
+/// `pGeomErrors[5]` per node. `None` for malformed input.
+pub fn decode_quadtree(dat: &[u8]) -> Option<TerrainSector> {
+    let hdr = Header::parse(dat)?;
+    let start = data_offset(dat)?;
+    let mut pos = start;
+    let mut budget = MAX_TERRAIN_NODES;
+    parse_sector(dat, &mut pos, hdr.geom_shift, hdr.sector as f32, 0, &mut budget)
+}
+
+/// Shortest distance from a point to a node's world AABB (0 when inside),
+/// matching `GetPointToBoxDistance` (`terrain_node.cpp`).
+fn point_to_box(p: [f32; 3], s: &TerrainSector) -> f32 {
+    let mut d2 = 0f32;
+    for i in 0..3 {
+        let v = p[i];
+        let d = if v < s.min[i] {
+            s.min[i] - v
+        } else if v > s.max[i] {
+            v - s.max[i]
+        } else {
+            0.0
+        };
+        d2 += d * d;
+    }
+    d2.sqrt()
+}
+
+/// `CTerrainNode::SetLOD`: the mip level a node is drawn at for this camera.
+fn sector_lod(s: &TerrainSector, dist: f32, p: &TerrainLodParams) -> u32 {
+    let size = s.size();
+    if dist < size + size * 0.25 {
+        return 0;
+    }
+    // fAllowedError = (zoom * e_TerrainLodRatio * fDist) / 180 * 2.5
+    let allowed = p.zoom * p.lod_ratio * dist / 180.0 * 2.5;
+    let mut level = GEOM_LEVELS as i32 - 1;
+    while level > s.shift as i32 {
+        if s.geom_errors[level as usize] < allowed {
+            break;
+        }
+        level -= 1;
+    }
+    // m_cNewGeomMML = min(nGeomMML, int(fDist / 32))
+    let by_distance = (dist / 32.0).floor() as i32;
+    level.min(by_distance).clamp(0, GEOM_LEVELS as i32 - 1) as u32
+}
+
+/// `CTerrainNode::CheckVis`: collect the rendered (recursion leaf) nodes.
+fn collect_sectors<'a>(
+    s: &'a TerrainSector,
+    params: &TerrainLodParams,
+    out: &mut Vec<(&'a TerrainSector, u32)>,
+) {
+    let dist = point_to_box(params.camera, s);
+    let lod = sector_lod(s, dist, params);
+    let recurse = !s.is_leaf()
+        && (dist < params.dist_ratio * s.size() || lod < s.tree_level);
+    if recurse {
+        for c in &s.children {
+            collect_sectors(c, params, out);
+        }
+    } else {
+        out.push((s, lod));
+    }
+}
+
+/// Smallest leaf world side (the quadtree's finest tiling, 64 m on SoD).
+fn min_leaf_size(s: &TerrainSector) -> f32 {
+    if s.is_leaf() {
+        return s.size().max(1.0);
+    }
+    s.children
+        .iter()
+        .map(min_leaf_size)
+        .fold(f32::INFINITY, f32::min)
+}
+
+/// Snap a border index `k` (in the node's own LOD steps) onto a coarser
+/// neighbour's step lattice (`AddIndexAliased`). A neighbour that is not
+/// coarser leaves the index untouched.
+fn snap_index(k: usize, own_lod: u32, neighbour_lod: u32) -> usize {
+    if neighbour_lod <= own_lod {
+        return k;
+    }
+    let factor = 1usize << (neighbour_lod - own_lod);
+    ((k + factor / 2) / factor) * factor
+}
+
+/// Build a crack-free sector-LOD mesh for `camera` from the source quadtree.
+///
+/// Heights come from the already reconstructed [`Terrain`] lattice, so the
+/// drawn surface stays exactly the one the rest of the app (feet, physics,
+/// material weights) uses. The mesh tiles the world with one grid per rendered
+/// quadtree node; border vertices are snapped to coarser neighbours so there
+/// are no cracks between LOD levels.
+pub fn build_quadtree_lod(
+    t: &Terrain,
+    root: &TerrainSector,
+    params: &TerrainLodParams,
+) -> TerrainLod {
+    let mut rendered: Vec<(&TerrainSector, u32)> = Vec::new();
+    collect_sectors(root, params, &mut rendered);
+
+    if rendered.is_empty() || t.samples == 0 || t.spacing <= 0.0 {
+        return TerrainLod { positions: Vec::new(), indices: Vec::new(), sectors: 0, max_lod: 0 };
+    }
+
+    // Occupancy grid at the finest tiling resolution, holding the rendered LOD
+    // of whichever node covers each base cell (nodes are aligned to it).
+    let base = min_leaf_size(root).max(t.spacing);
+    let world = t.samples as f32 * t.spacing;
+    let cells = (world / base).round().max(1.0) as usize;
+    let mut occupancy = vec![u8::MAX; cells * cells];
+    let cell_of = |v: f32| -> i32 { (v / base).floor() as i32 };
+    for (s, lod) in &rendered {
+        let x0 = cell_of(s.min[0]).max(0);
+        let y0 = cell_of(s.min[1]).max(0);
+        let x1 = cell_of(s.max[0]).min(cells as i32);
+        let y1 = cell_of(s.max[1]).min(cells as i32);
+        for cy in y0..y1 {
+            for cx in x0..x1 {
+                occupancy[cy as usize * cells + cx as usize] = *lod as u8;
+            }
+        }
+    }
+    let neighbour_lod = |x: f32, y: f32, fallback: u32| -> u32 {
+        let cx = cell_of(x);
+        let cy = cell_of(y);
+        if cx < 0 || cy < 0 || cx >= cells as i32 || cy >= cells as i32 {
+            return fallback;
+        }
+        let v = occupancy[cy as usize * cells + cx as usize];
+        if v == u8::MAX {
+            fallback
+        } else {
+            v as u32
+        }
+    };
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut max_lod = 0u32;
+
+    for (s, lod) in &rendered {
+        let step = t.spacing * (1u32 << lod) as f32;
+        let count = (s.size() / step).round() as usize;
+        if count == 0 {
+            continue;
+        }
+        let nv = count + 1;
+        max_lod = max_lod.max(*lod);
+        let base_index = positions.len() as u32;
+
+        // World position of the fine lattice vertex (ki, kj). The sampling
+        // origin is offset by half a base cell so vertices land on the same
+        // cell centres as `build_mesh` (and so on the reconstructed samples).
+        let pos_of = |ki: usize, kj: usize| -> [f32; 3] {
+            let x = s.min[0] + ki as f32 * step + t.spacing * 0.5;
+            let y = s.min[1] + kj as f32 * step + t.spacing * 0.5;
+            [x, y, t.height_interp(x, y)]
+        };
+
+        // Neighbour LODs along each border, sampled just outside it.
+        let left: Vec<u32> = (0..=count)
+            .map(|j| neighbour_lod(s.min[0] - base * 0.5, s.min[1] + j as f32 * step + 0.5, *lod))
+            .collect();
+        let right: Vec<u32> = (0..=count)
+            .map(|j| neighbour_lod(s.max[0] + base * 0.5, s.min[1] + j as f32 * step + 0.5, *lod))
+            .collect();
+        let bottom: Vec<u32> = (0..=count)
+            .map(|i| neighbour_lod(s.min[0] + i as f32 * step + 0.5, s.min[1] - base * 0.5, *lod))
+            .collect();
+        let top: Vec<u32> = (0..=count)
+            .map(|i| neighbour_lod(s.min[0] + i as f32 * step + 0.5, s.max[1] + base * 0.5, *lod))
+            .collect();
+
+        for kj in 0..=count {
+            for ki in 0..=count {
+                positions.push(pos_of(ki, kj));
+            }
+        }
+
+        // Vertex index, snapping border coordinates onto coarser neighbours.
+        let snapped = |ki: usize, kj: usize| -> u32 {
+            let mut xi = ki;
+            let mut yj = kj;
+            if ki == 0 {
+                yj = snap_index(yj, *lod, left[kj]);
+            }
+            if ki == count {
+                yj = snap_index(yj, *lod, right[kj]);
+            }
+            if kj == 0 {
+                xi = snap_index(xi, *lod, bottom[ki]);
+            }
+            if kj == count {
+                xi = snap_index(xi, *lod, top[ki]);
+            }
+            base_index + (yj * nv + xi) as u32
+        };
+
+        for cj in 0..count {
+            for ci in 0..count {
+                let a = snapped(ci, cj);
+                let b = snapped(ci + 1, cj);
+                let c = snapped(ci + 1, cj + 1);
+                let d = snapped(ci, cj + 1);
+                indices.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+    }
+
+    TerrainLod { positions, indices, sectors: rendered.len(), max_lod }
+}
+
+// ---------------------------------------------------------------------------
 // static-object octree
 // ---------------------------------------------------------------------------
 
@@ -1103,5 +1542,109 @@ mod tests {
             "Class3 surfaces: distinct={distinct} defined={defined} undefined={} ids>=32={ids_ge_32}",
             hist[SURFACE_UNDEFINED as usize]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // sector quadtree LOD tests
+    // -----------------------------------------------------------------------
+
+    fn count_leaves(s: &TerrainSector) -> usize {
+        if s.is_leaf() {
+            1
+        } else {
+            s.children.iter().map(count_leaves).sum()
+        }
+    }
+
+    fn all_errors_zero_at_level0(s: &TerrainSector) -> bool {
+        s.geom_errors[0] == 0.0 && s.children.iter().all(all_errors_zero_at_level0)
+    }
+
+    #[test]
+    fn class3_quadtree_geom_errors() {
+        let Some(dat) = load(CLASS3) else { return };
+        let root = decode_quadtree(&dat).expect("quadtree");
+        // The source tree is a full 64-sector quadtree: 6 internal levels + 4096
+        // 64 m leaves (terrain-decode.md).
+        assert_eq!(count_leaves(&root), 4096);
+        assert_eq!(root.tree_level, 6);
+        assert!(all_errors_zero_at_level0(&root), "pGeomErrors[0] must be 0");
+        // Native shifts must be one of the authored resolutions {0,1,2,3,4}.
+        fn check(s: &TerrainSector) {
+            if s.is_leaf() {
+                assert!(s.shift <= 4);
+            } else {
+                s.children.iter().for_each(check);
+            }
+        }
+        check(&root);
+    }
+
+    #[test]
+    fn class3_quadtree_lod_is_crackfree_near() {
+        let Some(dat) = load(CLASS3) else { return };
+        let t = decode_terrain_hires(&dat).expect("hires");
+        let root = decode_quadtree(&dat).expect("quadtree");
+        // Mt. Tanner player start (same tag as the app).
+        let params = TerrainLodParams { camera: [3246.8, 3256.2, 217.2], ..Default::default() };
+        let lod = build_quadtree_lod(&t, &root, &params);
+        assert!(!lod.positions.is_empty());
+        assert!(lod.max_lod >= 1, "far terrain should coarsen, max_lod={}", lod.max_lod);
+        assert!(lod.sectors > 0);
+
+        // Every index is in range and every triangle is non-degenerate or a
+        // stitching sliver; the mesh must not contain NaNs.
+        for &i in &lod.indices {
+            assert!((i as usize) < lod.positions.len());
+        }
+        for p in &lod.positions {
+            assert!(p.iter().all(|c| c.is_finite()));
+        }
+
+        // Near the camera the surface is LOD0: exactly the reconstructed 2 m
+        // samples, so it matches the previous uniform-detail mesh.
+        let cam = params.camera;
+        let mut near = 0usize;
+        for p in &lod.positions {
+            let d = ((p[0] - cam[0]).powi(2) + (p[1] - cam[1]).powi(2)).sqrt();
+            if d < 60.0 {
+                near += 1;
+                let gi = |v: f32| -> usize {
+                    ((v / t.spacing) - 0.5).round().clamp(0.0, t.samples as f32 - 1.0) as usize
+                };
+                let ix = gi(p[0]);
+                let iy = gi(p[1]);
+                assert!((p[2] - t.heights[iy * t.samples + ix]).abs() < 1e-3);
+            }
+        }
+        assert!(near > 100, "expected full-detail vertices near the camera, got {near}");
+
+        // The LOD mesh should be much cheaper than drawing the whole 2 m grid
+        // (2048^2 vertices).
+        assert!(lod.positions.len() < 2048 * 2048 / 8, "verts {}", lod.positions.len());
+        println!(
+            "Class3 quadtree LOD: sectors={} verts={} tris={} max_lod={}",
+            lod.sectors,
+            lod.positions.len(),
+            lod.indices.len() / 3,
+            lod.max_lod
+        );
+    }
+
+    #[test]
+    fn quadtree_lod_malformed_is_total() {
+        assert!(decode_quadtree(&[]).is_none());
+        assert!(decode_quadtree(&[0u8; 64]).is_none());
+        let empty = Terrain { samples: 0, spacing: 2.0, world_min: [0.0; 3], heights: vec![], surfaces: vec![], min: 0.0, max: 0.0 };
+        let root = decode_quadtree(&[0u8; 64]).unwrap_or_else(|| TerrainSector {
+            min: [0.0; 3],
+            max: [0.0; 3],
+            tree_level: 0,
+            shift: 0,
+            geom_errors: [0.0; GEOM_LEVELS],
+            children: Vec::new(),
+        });
+        let lod = build_quadtree_lod(&empty, &root, &TerrainLodParams::default());
+        assert!(lod.positions.is_empty());
     }
 }

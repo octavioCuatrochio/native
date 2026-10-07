@@ -83,6 +83,18 @@ struct World {
     ground_albedo: Option<(u32, u32, Vec<u8>)>,
 }
 
+/// Level lighting from the mission's time of day, at its start time.
+/// Only the sun DIRECTION is used (verified against the level's authored
+/// SunVector). TOD colours are HDR tints that the original runs through its
+/// multipliers, exposure, tone mapping and colour grading; applying the raw
+/// hue without that pipeline is less faithful than neutral light, so colours
+/// stay neutral until the HDR pipeline is ported.
+#[derive(Resource)]
+struct LevelLighting {
+    /// Direction the sun's light travels, in Bevy space.
+    sun_dir: Vec3,
+}
+
 /// Static collision world (CryPhysics replacement): terrain plus the physics
 /// proxies of every placed brush and script-loaded prop.
 #[derive(Resource)]
@@ -522,9 +534,7 @@ fn load_any_character(vfs: &Vfs, path: &str, rig: Option<&str>) -> Option<Loaded
 }
 
 fn height_at(t: &Terrain, x: f32, y: f32) -> f32 {
-    let ix = ((x / t.spacing).round() as isize).clamp(0, t.samples as isize - 1) as usize;
-    let iy = ((y / t.spacing).round() as isize).clamp(0, t.samples as isize - 1) as usize;
-    t.heights[iy * t.samples + ix]
+    t.height_interp(x, y)
 }
 
 fn run_world(game: &str, vfs: Vfs, play: bool) {
@@ -539,7 +549,11 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     // Terrain surface palette (leveldata.xml) -> per-vertex colour by surface type.
     let surface_types = read("leveldata.xml").map(|b| surfaces::parse_surface_types(&b)).unwrap_or_default();
     println!("[world] surface types: {}", surface_types.len());
-    let (tverts, tindex) = terrain::build_mesh(&ter, 4);
+    // The feet stand on the interpolated 4 m heightmap; the drawn ground uses
+    // an 8 m grid by default (full res cost ~40 ms on p90 frames in debug).
+    // Proper fix: near-player terrain LOD. SOD_TERRAIN_STRIDE overrides.
+    let terrain_stride = std::env::var("SOD_TERRAIN_STRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize);
+    let (tverts, tindex) = terrain::build_mesh(&ter, terrain_stride);
     // Tint the (textured) ground by surface type, mixed toward white so the
     // tiled diffuse detail stays visible.
     let tcolors: Vec<[f32; 4]> = tverts.iter().map(|p| {
@@ -622,6 +636,19 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     brushes.truncate(24000);
     println!("[world] architecture: {} brush instances / {} models within {:.0}m",
         brushes.len(), unique_brush_models.len(), arch_radius);
+
+    // Lighting from the level's own time of day (sun from the engine's TOD
+    // formula, colours from the TOD splines) at its authored start time.
+    let level_lighting = read("mission_mission0.xml").map(|b| {
+        let ml = sod_core::tod::parse_mission_lighting(&b);
+        let hour = ml.time_of_day.time;
+        let tod = ml.time_of_day.sample(hour);
+        let d = ml.environment.sun_direction(hour);
+        let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let sun_dir = (base * Vec3::new(d[0], d[1], d[2])).normalize_or_zero();
+        println!("[world] time of day {hour:.2} h: sun dir (cry) {d:?}, sun {:?}, sky {:?}", tod.sun_color(), tod.sky_color());
+        LevelLighting { sun_dir }
+    });
 
     // Collision from the same geometry the renderer draws.
     let collision = if std::env::var("SOD_NOCOLLIDE").is_ok() {
@@ -835,6 +862,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if let Some(c) = collision {
         app.insert_resource(c);
     }
+    if let Some(l) = level_lighting {
+        app.insert_resource(l);
+    }
     if let Some(t) = npc_template {
         app.insert_resource(t);
     }
@@ -849,7 +879,11 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         app.insert_resource(player_state);
         app.insert_resource(game_state);
         app.add_systems(Update, (
-            menu_input, move_player, animate_player, follow_camera,
+            // Fixed order: the camera must read this frame's player position.
+            // Unordered, Bevy ran them either way round per frame, so the
+            // camera alternately saw zero and double movement (a vertical jerk
+            // on slopes).
+            menu_input, move_player, animate_player.after(move_player), follow_camera.after(move_player),
             npc_ai, animate_npcs, player_attack, npc_attack,
             follower_ai, animate_followers,
             player_vitals, search_system, tutorial_system, hud_update, auto_screenshot,
@@ -873,6 +907,7 @@ fn setup_world(
     menu_font: Option<Res<MenuFont>>,
     cache: Option<Res<TextureCacheRes>>,
     world: Res<World>,
+    lighting: Option<Res<LevelLighting>>,
     player_setup: Option<Res<PlayerSetup>>,
     npc_template: Option<Res<NpcTemplate>>,
     follower_template: Option<Res<FollowerTemplate>>,
@@ -1303,11 +1338,26 @@ fn setup_world(
     commands.spawn((Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { fov: vfov, ..default() }),
         Transform::from_xyz(0.0, 100.0, 200.0).looking_at(Vec3::ZERO, Vec3::Y), Tonemapping::None,
-        AmbientLight { color: Color::srgb(0.55, 0.63, 0.78), brightness: 110.0, ..default() }, MainCamera));
-    commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 3600.0, color: Color::srgb(1.0, 0.95, 0.85), ..default() },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 0.5, 0.0))));
-    commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 700.0, color: Color::srgb(0.7, 0.8, 1.0), ..default() },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -2.2, 0.0))));
+        AmbientLight { color: Color::srgb(0.55, 0.63, 0.78), brightness: 110.0, ..default() },
+        MainCamera));
+    match lighting.as_ref() {
+        // The level's sun direction; neutral colour, plus the previous fill
+        // light until the sky-light / HDR pipeline is ported.
+        Some(l) => {
+            commands.spawn((
+                DirectionalLight { shadow_maps_enabled: false, illuminance: 3600.0, color: Color::srgb(1.0, 0.95, 0.85), ..default() },
+                Transform::default().looking_to(l.sun_dir, Vec3::Y),
+            ));
+            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 700.0, color: Color::srgb(0.7, 0.8, 1.0), ..default() },
+                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -2.2, 0.0))));
+        }
+        None => {
+            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 3600.0, color: Color::srgb(1.0, 0.95, 0.85), ..default() },
+                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 0.5, 0.0))));
+            commands.spawn((DirectionalLight { shadow_maps_enabled: false, illuminance: 700.0, color: Color::srgb(0.7, 0.8, 1.0), ..default() },
+                Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -2.2, 0.0))));
+        }
+    }
     info!("scene ready");
 }
 
@@ -1549,6 +1599,10 @@ fn follow_camera(
         Some(mut l) => l.0.step(cs.0.pos, cs.0.yaw, cs.0.pitch, camera::DEFAULT_LAG_SCALE, time.delta_secs()).0,
         None => cs.0.pos,
     };
+    if std::env::var("SOD_CAMDBG").is_ok() {
+        eprintln!("[camdbg] t={:.3} x={:.3} y={:.3} feet_z={:.4} target_z={:.4} cam_z={:.4} lag_z={:.4} vz={:.3} grounded={} vx={:.3} vy={:.3}",
+            time.elapsed_secs(), player.mstate.pos[0], player.mstate.pos[1], player.mstate.pos[2], target[2], cs.0.pos[2], cam_pos[2], player.mstate.vel[2], player.mstate.grounded, player.mstate.vel[0], player.mstate.vel[1]);
+    }
     let base_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let pos = base_rot * Vec3::new(cam_pos[0], cam_pos[1], cam_pos[2]);
     let tgt = base_rot * Vec3::new(target[0], target[1], target[2]);

@@ -502,6 +502,29 @@ impl Terrain {
 /// Coordinates are Z-up right-handed as described in the module docs: vertex
 /// `[x, y, z]`, `z` = height. Winding is counter-clockwise from `+Z` (up-facing).
 /// Vertices are laid out row-major with `x` fastest.
+impl Terrain {
+    /// Ground height at world `(x, y)`, bilinearly interpolated between the
+    /// four surrounding samples. Samples sit at cell centres
+    /// (`world_min + (i + 0.5) * spacing`), the same convention as
+    /// [`build_mesh`] and the collision world, so feet, physics and the drawn
+    /// ground agree. (A nearest-sample lookup steps by up to ~1 m every 4 m.)
+    pub fn height_interp(&self, x: f32, y: f32) -> f32 {
+        let s = self.samples;
+        if s == 0 || self.spacing <= 0.0 || self.heights.len() < s * s {
+            return 0.0;
+        }
+        let fx = ((x - self.world_min[0]) / self.spacing - 0.5).clamp(0.0, s as f32 - 1.0);
+        let fy = ((y - self.world_min[1]) / self.spacing - 0.5).clamp(0.0, s as f32 - 1.0);
+        let (i0, j0) = (fx.floor() as usize, fy.floor() as usize);
+        let (i1, j1) = ((i0 + 1).min(s - 1), (j0 + 1).min(s - 1));
+        let (tx, ty) = (fx - i0 as f32, fy - j0 as f32);
+        let h = |i: usize, j: usize| self.heights[j * s + i];
+        let top = h(i0, j0) * (1.0 - tx) + h(i1, j0) * tx;
+        let bot = h(i0, j1) * (1.0 - tx) + h(i1, j1) * tx;
+        top * (1.0 - ty) + bot * ty
+    }
+}
+
 pub fn build_mesh(t: &Terrain, stride: usize) -> (Vec<[f32; 3]>, Vec<u32>) {
     let stride = stride.max(1);
     let s = t.samples;

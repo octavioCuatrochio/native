@@ -3,29 +3,47 @@
 //! The graph XML is read at runtime from the game data. The runtime does what
 //! the engine's graph does each frame:
 //!
-//! 1. **Select**: from the current input values, pick the target state whose
-//!    effective `SelectWhen` criteria all match (only `allowSelect`,
-//!    `includeInGame` states can be targets).
-//! 2. **Path**: walk the `Link` graph from the current state to the target
+//! 1. **Select**: from the current input values, collect *every* state whose
+//!    effective `SelectWhen` criteria all match. `CAnimationGraph::LoadInputs`
+//!    (`0x68dd50`) turns each state's criteria into per-input ranges and
+//!    `CStateIndex::Query` (`0x7b3300`, driven by `FUN_007b7b50` from
+//!    `FUN_007bd3a0`) intersects those sets at runtime. Only `allowSelect` +
+//!    `includeInGame` states can be targets.
+//! 2. **Pick**: `FUN_007bd3a0` (`CAnimationGraphState` update) resolves the
+//!    candidate set. When the graph has `expensiveLocomotionSelection="1"`
+//!    (default, `graph+0xd2`) and the character is moving, it scores every
+//!    candidate in `FUN_007cb5f0` (`0x7cb5f0`) — how well the candidate's
+//!    animation movement profile matches the current desired movement, plus
+//!    transition penalties between IDLE/WALK/RUN/TROT — and `FUN_007cbaf0`
+//!    (`0x7cbaf0`) keeps the minimum. Otherwise it falls back to: keep the
+//!    *current* state if still valid (hysteresis, log `"Use hysteresis to
+//!    maintain current state"` at `0x7bd903`); else, with more than one
+//!    candidate, pick one with the per-instance RNG at `+0x688` (seeded from
+//!    `rand()` `0x403e80` at `0x7c0690`; log `"Choose a random state from the
+//!    set of valid states"` at `0x7bd866`); else take the lone candidate.
+//! 3. **Path**: walk the `Link` graph from the current state to the target
 //!    along the cheapest path; each link's `transitionTime` is the blend time.
+//!    `cost` is a transition-graph edge weight, not a selection key.
 //!
 //! State inheritance: `extend="Parent"` copies the parent's flags and
 //! criteria; the child's own entries override per input, and an empty
 //! criterion element (`<PseudoSpeed />`) removes the inherited constraint.
 //!
-//! Choices not settled by the data (marked `ASSUMPTION`, to be verified
-//! against the running game): float ranges are half-open `[min, max)` with the
-//! input's declared maximum inclusive; integer ranges are inclusive; ties
-//! between matching states go to the more specific state, weighted by input
-//! priority (approximating the engine's priority-ordered decision tree).
+//! Consequences for `playerfullbody.xml`: `RelaxedWalkNW` and `RelaxedRunNW`
+//! (and the `allowSelect=0` `RelaxedMoveNw`) have identical effective criteria
+//! — inherited `Item=nw` / `Stance=relaxed` / `UsingLookIK` from `RelaxedNW`
+//! plus the `MovementDecoupled` template's fixed `PseudoSpeed [0,1.5]`. The
+//! engine therefore cannot and does not distinguish them by speed: it picks
+//! one at random when the valid set changes and then holds it by hysteresis.
+//! The authored `select_speed_slow` / `select_speed_fast` template attributes
+//! are never read by the retail engine (those strings are absent from the
+//! binary), so they do not narrow the ranges.
 //!
-//! OPEN (blocks wiring this into the player): in `playerfullbody.xml` the
-//! locomotion states `RelaxedWalkNW`, `RelaxedRunNW` and `RelaxedMoveNw` have
-//! identical effective criteria, which also match at standing speed, so
-//! `SelectWhen` alone cannot be how the engine picks walk vs run. The engine's
-//! state query (decision tree built at load), template parameterization, or
-//! the ULSM `GraphDriven.*` states requesting graph states must be resolved
-//! first; until then `select` breaks such ties by document order.
+//! Float criteria are inclusive on both ends: `LoadInputs` quantises the input
+//! range and each criterion to integer steps of `precision` (default 1/1024,
+//! `0x68dd50` lines 682-732 / 792-817) and a criterion matches when the value's
+//! step lies in `[start, end]`. Integer criteria are inclusive too; key
+//! criteria are case-insensitive equality.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
@@ -159,6 +177,13 @@ fn criterion_from(a: &[(String, String)]) -> Criterion {
         return Criterion::Key(v.to_string());
     }
     Criterion::Range { min: num(a, "min"), max: num(a, "max") }
+}
+
+/// The MSVC C runtime `rand()` (`FUN_00403e80`, `0x403e80`): a 32-bit LCG with
+/// multiplier `0x343fd`, increment `0x269ec3`, returning bits 16..30.
+fn msvc_rand(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(0x343f_d).wrapping_add(0x269_ec3);
+    (*state >> 16) & 0x7fff
 }
 
 impl Graph {
@@ -352,51 +377,98 @@ impl Graph {
             Criterion::Range { min, max } => {
                 let Some(InputValue::Number(v)) = value else { return false };
                 let v = *v;
-                match decl.map(|d| &d.kind) {
-                    // ASSUMPTION: integer ranges are inclusive.
-                    Some(InputKind::Integer { .. }) => {
-                        min.map(|m| v >= m).unwrap_or(true) && max.map(|m| v <= m).unwrap_or(true)
-                    }
-                    // ASSUMPTION: float ranges are [min, max), except the
-                    // input's declared maximum, which is inclusive.
-                    Some(InputKind::Float { max: decl_max, .. }) => {
-                        let lo = min.map(|m| v >= m).unwrap_or(true);
-                        let hi = max.map(|m| v < m || (m >= *decl_max && v <= m)).unwrap_or(true);
-                        lo && hi
-                    }
-                    _ => min.map(|m| v >= m).unwrap_or(true) && max.map(|m| v <= m).unwrap_or(true),
-                }
+                // The engine stores float ranges as quantised integer steps
+                // (`LoadInputs` 0x68dd50) and tests the value's step for
+                // `start <= step <= end`, i.e. both ends inclusive. Using the
+                // raw value is equivalent at the graph's range boundaries.
+                min.map(|m| v >= m).unwrap_or(true) && max.map(|m| v <= m).unwrap_or(true)
             }
         }
     }
 
-    /// Specificity of a state's criteria, weighted by input priority.
-    fn specificity(&self, r: &Resolved) -> i64 {
-        r.criteria
-            .iter()
-            .filter(|(_, c)| **c != Criterion::Any)
-            .map(|(k, _)| 1000 + self.input(k).map(|i| i.priority as i64).unwrap_or(0))
-            .sum()
-    }
-
-    /// Every selectable state whose criteria match, best first.
+    /// Every selectable state whose criteria match, in document order.
+    ///
+    /// This mirrors `CStateIndex::Query` (`0x7b3300`) intersected by
+    /// `FUN_007b2f50` / `FUN_007b34b0`: the candidate set is the intersection
+    /// of the per-input criterion sets, *not* a priority/specificity sort.
     pub fn candidates(&self, values: &InputValues) -> Vec<usize> {
-        let mut c: Vec<(i64, usize)> = (0..self.states.len())
+        (0..self.states.len())
             .filter(|&i| {
                 let r = &self.resolved[i];
                 r.flag("allowSelect")
                     && r.flag("includeInGame")
                     && r.criteria.iter().all(|(k, c)| self.matches(k, c, values))
             })
-            .map(|i| (self.specificity(&self.resolved[i]), i))
-            .collect();
-        c.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        c.into_iter().map(|(_, i)| i).collect()
+            .collect()
     }
 
-    /// The target state for these inputs.
+    /// The deterministic target: the first candidate in document order.
+    ///
+    /// Prefer [`pick_candidate`](Graph::pick_candidate) when modelling the
+    /// engine, which breaks ties randomly.
     pub fn select(&self, values: &InputValues) -> Option<usize> {
         self.candidates(values).first().copied()
+    }
+
+    /// The engine's tie-break (`FUN_007bd3a0`, `0x7bd3a0`).
+    ///
+    /// Given the candidate set for the current inputs:
+    /// * keep `current` if it is still a candidate (hysteresis);
+    /// * else keep `next` if it is a candidate;
+    /// * else, with more than one candidate, pick `msvc_rand(rng) % n`;
+    /// * else take the sole candidate.
+    ///
+    /// `rng` is the per-instance seed the engine keeps at `+0x688`; it is only
+    /// advanced when a random pick is actually made.
+    pub fn pick_candidate(
+        &self,
+        candidates: &[usize],
+        current: Option<usize>,
+        next: Option<usize>,
+        rng: &mut u32,
+    ) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if let Some(c) = current {
+            if candidates.contains(&c) {
+                return Some(c);
+            }
+        }
+        if let Some(n) = next {
+            if candidates.contains(&n) {
+                return Some(n);
+            }
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0]);
+        }
+        let i = (msvc_rand(rng) as usize) % candidates.len();
+        Some(candidates[i])
+    }
+
+    /// The engine's *expensive locomotion selection* tie-break.
+    ///
+    /// When the graph has `expensiveLocomotionSelection="1"` (the default,
+    /// `graph+0xd2`; `CAnimationGraph::Init` `0x68d190` lines 26-32) and the
+    /// character is actually moving, `FUN_007bd3a0` does not use the random
+    /// fallback: it scores every candidate with `FUN_007cb5f0` (`0x7cb5f0`) —
+    /// a weighted difference between the candidate's animation movement
+    /// profile and the current desired movement, plus transition penalties for
+    /// IDLE/WALK/RUN/TROT token pairs — and `FUN_007cbaf0` (`0x7cbaf0`) keeps
+    /// the **minimum** score.
+    ///
+    /// This module only owns the graph, not the character's movement state, so
+    /// the caller supplies `cost`. Returns the lowest-cost candidate (ties keep
+    /// document order).
+    pub fn pick_candidate_by_cost<F>(&self, candidates: &[usize], cost: F) -> Option<usize>
+    where
+        F: Fn(usize) -> f32,
+    {
+        candidates
+            .iter()
+            .copied()
+            .min_by(|&a, &b| cost(a).partial_cmp(&cost(b)).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// Cheapest link path `from -> to` (link indices), or `None`.
@@ -451,6 +523,9 @@ pub struct GraphInstance {
     pub queue: Vec<usize>,
     /// Blend time of the most recent transition.
     pub blend: f32,
+    /// Per-instance RNG seed (`CAnimationGraphState+0x688`), used to break
+    /// ties between equally-valid states.
+    pub rng: u32,
 }
 
 impl GraphInstance {
@@ -458,7 +533,8 @@ impl GraphInstance {
     /// advance one link when `step` is true (the engine advances when the
     /// current state's animation allows leaving it).
     pub fn update(&mut self, g: &Graph, values: &InputValues, step: bool) {
-        let target = g.select(values);
+        let cands = g.candidates(values);
+        let target = g.pick_candidate(&cands, self.current, self.target, &mut self.rng);
         if target != self.target {
             self.target = target;
             self.queue = match (self.current, target) {
@@ -527,18 +603,84 @@ mod tests {
     }
 
     #[test]
-    fn selection_uses_ranges_and_specificity() {
+    fn selection_intersects_ranges_in_document_order() {
         let g = g();
+        let id = |i: usize| g.states[i].id.as_str();
         let mut v = g.default_inputs();
-        assert_eq!(g.select(&v).map(|i| g.states[i].id.as_str()), Some("Idle"));
+
+        // Defaults: Action=idle, PseudoSpeed=0. Only Idle matches (Base and
+        // Start are allowSelect=0, Hidden is includeInGame=0).
+        assert_eq!(g.candidates(&v).iter().map(|&i| id(i)).collect::<Vec<_>>(), ["Idle"]);
+        assert_eq!(g.select(&v).map(id), Some("Idle"));
+
         v.set_key("Action", "move");
         v.set_number("PseudoSpeed", 1.0);
-        // Walk and AnyMove both match; Walk constrains more.
-        assert_eq!(g.select(&v).map(|i| g.states[i].id.as_str()), Some("Walk"));
-        v.set_number("PseudoSpeed", 2.0); // half-open: 2.0 belongs to Run
-        assert_eq!(g.select(&v).map(|i| g.states[i].id.as_str()), Some("Run"));
-        v.set_number("PseudoSpeed", 3.0); // declared max is inclusive
-        assert_eq!(g.select(&v).map(|i| g.states[i].id.as_str()), Some("Run"));
+        // Walk and AnyMove (which clears the inherited PseudoSpeed range) both
+        // match; the set is in document order, not specificity order.
+        assert_eq!(
+            g.candidates(&v).iter().map(|&i| id(i)).collect::<Vec<_>>(),
+            ["Walk", "AnyMove"]
+        );
+
+        // Both float ends are inclusive, so 2.0 is in Walk's [0.2,2] *and*
+        // Run's [2,3]; AnyMove matches anything.
+        v.set_number("PseudoSpeed", 2.0);
+        assert_eq!(
+            g.candidates(&v).iter().map(|&i| id(i)).collect::<Vec<_>>(),
+            ["Walk", "Run", "AnyMove"]
+        );
+
+        v.set_number("PseudoSpeed", 2.5);
+        assert_eq!(
+            g.candidates(&v).iter().map(|&i| id(i)).collect::<Vec<_>>(),
+            ["Run", "AnyMove"]
+        );
+        v.set_number("PseudoSpeed", 3.0);
+        assert_eq!(
+            g.candidates(&v).iter().map(|&i| id(i)).collect::<Vec<_>>(),
+            ["Run", "AnyMove"]
+        );
+    }
+
+    #[test]
+    fn pick_keeps_current_then_randomises() {
+        let g = g();
+        let id = |i: usize| g.states[i].id.as_str();
+        let (walk, run, any) = (
+            g.state_index("Walk").unwrap(),
+            g.state_index("Run").unwrap(),
+            g.state_index("AnyMove").unwrap(),
+        );
+        let cands = [walk, run, any];
+
+        // Hysteresis: the current state wins even when others also match.
+        let mut rng = 0u32;
+        assert_eq!(g.pick_candidate(&cands, Some(run), None, &mut rng), Some(run));
+        assert_eq!(rng, 0, "hysteresis must not consume the RNG");
+
+        // No current/next in the set: the MSVC LCG picks a member.
+        let mut rng = 0u32;
+        let picked = g.pick_candidate(&cands, None, None, &mut rng).unwrap();
+        assert!(cands.contains(&picked));
+        assert_eq!(picked, cands[msvc_rand(&mut 0u32) as usize % cands.len()]);
+        assert_ne!(rng, 0, "a random pick advances the seed");
+
+        // A lone candidate is taken directly.
+        let mut rng = 0u32;
+        assert_eq!(g.pick_candidate(&[any], None, None, &mut rng), Some(any));
+        assert_eq!(rng, 0);
+        let _ = id;
+    }
+
+    #[test]
+    fn expensive_selection_takes_the_lowest_cost() {
+        let g = g();
+        let (walk, run) = (g.state_index("Walk").unwrap(), g.state_index("Run").unwrap());
+        let cands = [walk, run];
+        // The character layer decides via its movement cost; the graph only
+        // supplies the candidate set.
+        assert_eq!(g.pick_candidate_by_cost(&cands, |i| if i == walk { 1.0 } else { 3.0 }), Some(walk));
+        assert_eq!(g.pick_candidate_by_cost(&cands, |i| if i == run { 1.0 } else { 3.0 }), Some(run));
     }
 
     #[test]
@@ -560,5 +702,78 @@ mod tests {
         assert!((inst.blend - 0.1).abs() < 1e-6);
         inst.update(&g, &v, true);
         assert_eq!(inst.current, Some(walk));
+    }
+
+    /// The real `playerfullbody.xml`, when present: the relaxed "no weapon"
+    /// walk and run states share one `SelectWhen` range, so the graph cannot
+    /// order walk -> run by `PseudoSpeed`; that ordering comes from the
+    /// character's expensive-locomotion cost (`FUN_007cb5f0`), not the graph.
+    #[test]
+    fn real_playerfullbody_relaxed_nw_walk_and_run_are_speed_ambiguous() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted-game/animations/animations/graphs/playerfullbody.xml");
+        let Ok(xml) = std::fs::read(&path) else { return };
+        let g = Graph::parse(&xml).expect("parse playerfullbody");
+        let names = |vals: &InputValues| -> Vec<String> {
+            g.candidates(vals).iter().map(|&i| g.states[i].id.clone()).collect()
+        };
+
+        let mut v = g.default_inputs();
+        v.set_key("Action", "idle");
+        v.set_key("Stance", "relaxed");
+        v.set_key("Item", "nw");
+        v.set_number("Health", 100.0);
+
+        // Walking speed: both hand-authored locomotion states are valid. The
+        // `allowSelect=0` RelaxedMoveNw node is filtered out.
+        v.set_number("PseudoSpeed", 0.5);
+        let low = names(&v);
+        assert!(low.iter().any(|s| s == "RelaxedWalkNW"), "{low:?}");
+        assert!(low.iter().any(|s| s == "RelaxedRunNW"), "{low:?}");
+        assert!(!low.iter().any(|s| s == "RelaxedMoveNw"), "allowSelect=0 filtered: {low:?}");
+
+        // Running speed inside the shared band: still both.
+        v.set_number("PseudoSpeed", 1.0);
+        let mid = names(&v);
+        assert!(mid.iter().any(|s| s == "RelaxedWalkNW"), "{mid:?}");
+        assert!(mid.iter().any(|s| s == "RelaxedRunNW"), "{mid:?}");
+
+        // Past the shared [0,1.5] band the relaxed NW walk/run states drop out
+        // entirely; there is no relaxed >1.5 run state to move to.
+        v.set_number("PseudoSpeed", 2.0);
+        let high = names(&v);
+        assert!(!high.iter().any(|s| s == "RelaxedWalkNW"), "{high:?}");
+        assert!(!high.iter().any(|s| s == "RelaxedRunNW"), "{high:?}");
+
+        // The graph hands the same candidate set to the character layer for
+        // both speeds; only the caller's movement cost can order walk vs run.
+        v.set_number("PseudoSpeed", 1.0);
+        let cands = g.candidates(&v);
+        let walk = g.state_index("RelaxedWalkNW").unwrap();
+        let run = g.state_index("RelaxedRunNW").unwrap();
+        assert!(cands.contains(&walk) && cands.contains(&run));
+        let prefer_walk = |i: usize| match i {
+            x if x == walk => 1.0,
+            x if x == run => 3.0,
+            _ => 100.0,
+        };
+        let prefer_run = |i: usize| match i {
+            x if x == walk => 3.0,
+            x if x == run => 1.0,
+            _ => 100.0,
+        };
+        assert_eq!(g.pick_candidate_by_cost(&cands, prefer_walk), Some(walk));
+        assert_eq!(g.pick_candidate_by_cost(&cands, prefer_run), Some(run));
+
+        // With no character cost, the engine's fallback is hysteresis, then a
+        // random pick (FUN_007bd3a0 0x7bd866) when the valid set changes.
+        let mut rng = 0u32;
+        let picked = g.pick_candidate(&cands, None, None, &mut rng).unwrap();
+        assert!(cands.contains(&picked));
+        assert_eq!(
+            g.pick_candidate(&cands, Some(walk), None, &mut 0u32),
+            Some(walk),
+            "hysteresis holds the current locomotion state"
+        );
     }
 }

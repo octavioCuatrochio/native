@@ -52,6 +52,8 @@ pub struct PlacedVegetation {
     /// Table A model path, forward-slash normalised (e.g.
     /// `objects/landscape/vegetation/trees/maple_02/maple_02.cgf`).
     pub model: String,
+    /// Index into [`groups_a`] (the 16-bit `m_nObjectTypeIndex` of the node).
+    pub group: u16,
     /// World position `(x, y, z)` in metres.
     pub pos: [f32; 3],
     /// Uniform scale `m_fScale`.
@@ -253,6 +255,141 @@ pub fn prototypes_a(dat: &[u8]) -> Vec<String> {
             break;
         };
         out.push(decode_path(slot));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Table A `StatInstGroup` parameters (bytes `0x100..0x150`)
+// ---------------------------------------------------------------------------
+
+/// The per-group parameters of one Table A (`StatInstGroup`) record.
+///
+/// Table A keeps a 256-byte NUL-padded `.cgf` path at `+0`, then 20 4-byte
+/// fields at `+0x100`. The layout was recovered by aligning every record's
+/// fields against the same-`Index` `<Object …>` row in `leveldata.xml`
+/// (147/147 exact matches for each named field) and cross-checked against the
+/// engine's own class descriptor for `StatInstGroupChunk`, which registers the
+/// same 20 fields (17 floats at `0x100..0x140` and three trailing words) —
+/// see the exe at `0x57e2…`/`0x57e793`. `leveldata.xml` names them
+/// `Bending`, `SpriteDistRatio`, `Brightness`, `MaxViewDistRatio`, `Density`,
+/// `ElevationMin`/`ElevationMax`, `Size`, `SizeVar`, `SlopeMin`/`SlopeMax`,
+/// `LodDistRatio`, `CastShadow`, `RecvShadow`, `UseSprites`, `RandomRotation`,
+/// `AlignToTerrain` and `RecvDecals`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VegetationGroup {
+    /// Table A model path, forward-slash normalised.
+    pub model: String,
+    /// `Bending` (`+0x100`): wind-sway amount authored on the object.
+    pub bending: f32,
+    /// `SpriteDistRatio` (`+0x104`): sprite draw-distance multiplier.
+    pub sprite_dist_ratio: f32,
+    /// `Brightness` (`+0x108`).
+    pub brightness: f32,
+    /// `MaxViewDistRatio` (`+0x10c`): scales this group's maximum view distance.
+    pub max_view_dist_ratio: f32,
+    /// `Density` (`+0x118`): placement density (objects per unit area).
+    pub density: f32,
+    /// `ElevationMin` (`+0x120`) in metres (`-1e6` = unconstrained).
+    pub elevation_min: f32,
+    /// `ElevationMax` (`+0x11c`) in metres.
+    pub elevation_max: f32,
+    /// `Size` (`+0x124`): base instance scale.
+    pub size: f32,
+    /// `SizeVar` (`+0x128`): random scale variation.
+    pub size_var: f32,
+    /// `SlopeMin` (`+0x130`) / `SlopeMax` (`+0x12c`) as authored (0..255).
+    pub slope_min: f32,
+    /// `SlopeMax` (`+0x12c`).
+    pub slope_max: f32,
+    /// `LodDistRatio` (`+0x13c`): scales when this group switches LOD/sprite.
+    pub lod_dist_ratio: f32,
+    /// `CastShadow` (`+0x144` bit 7).
+    pub cast_shadow: bool,
+    /// `RecvShadow` (`+0x144` bit 8).
+    pub recv_shadow: bool,
+    /// `UseSprites` (`+0x144` bit 11): far instances may become sprites.
+    pub use_sprites: bool,
+    /// `RandomRotation` (`+0x144` bit 12).
+    pub random_rotation: bool,
+    /// `AlignToTerrain` (`+0x144` bit 0).
+    pub align_to_terrain: bool,
+    /// `RecvDecals` (`+0x144` bit 15).
+    pub recv_decals: bool,
+    /// Raw render flags at `+0x14c` (engine `m_dwRndFlags`; `0x800`/`0x808`).
+    pub rnd_flags: u32,
+}
+
+impl VegetationGroup {
+    /// The group's far-distance scale: the authored `MaxViewDistRatio` clamped to
+    /// a sane positive value. Used as the multiplier on
+    /// `radius * e_ViewDistRatioVegetation/100`.
+    pub fn view_dist_scale(&self) -> f32 {
+        if self.max_view_dist_ratio.is_finite() && self.max_view_dist_ratio > 0.0 {
+            self.max_view_dist_ratio
+        } else {
+            1.0
+        }
+    }
+
+    /// The LOD-distance scale. `LodDistRatio` > 1 keeps higher detail farther;
+    /// the engine applies it quadratically to the LOD distance (exe `0x465a40`).
+    pub fn lod_scale(&self) -> f32 {
+        if self.lod_dist_ratio.is_finite() && self.lod_dist_ratio > 0.0 {
+            self.lod_dist_ratio
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Decode all Table A (`StatInstGroup`) parameter records.
+///
+/// Returns one [`VegetationGroup`] per Table A record (path preserved), or an
+/// empty vector for a malformed/truncated image or the big-endian variant.
+pub fn groups_a(dat: &[u8]) -> Vec<VegetationGroup> {
+    let mut out = Vec::new();
+    match big_endian(dat) {
+        Some(false) => {}
+        _ => return out,
+    }
+    let Some(count) = rd_u32(dat, 0x20).map(|c| c as usize) else {
+        return out;
+    };
+    for i in 0..count {
+        let Some(o) = i
+            .checked_mul(STRIDE_A)
+            .and_then(|d| 0x24usize.checked_add(d))
+        else {
+            break;
+        };
+        let Some(slot) = o.checked_add(STRIDE_A).and_then(|e| dat.get(o..e)) else {
+            break;
+        };
+        let f = |off: usize| rd_f32(slot, off).unwrap_or(0.0);
+        let flags = rd_u32(slot, 0x144).unwrap_or(0);
+        out.push(VegetationGroup {
+            model: decode_path(slot),
+            bending: f(0x100),
+            sprite_dist_ratio: f(0x104),
+            brightness: f(0x108),
+            max_view_dist_ratio: f(0x10c),
+            density: f(0x118),
+            elevation_min: f(0x120),
+            elevation_max: f(0x11c),
+            size: f(0x124),
+            size_var: f(0x128),
+            slope_min: f(0x130),
+            slope_max: f(0x12c),
+            lod_dist_ratio: f(0x13c),
+            cast_shadow: flags & (1 << 7) != 0,
+            recv_shadow: flags & (1 << 8) != 0,
+            use_sprites: flags & (1 << 11) != 0,
+            random_rotation: flags & (1 << 12) != 0,
+            align_to_terrain: flags & 1 != 0,
+            recv_decals: flags & (1 << 15) != 0,
+            rnd_flags: rd_u32(slot, 0x14c).unwrap_or(0),
+        });
     }
     out
 }
@@ -475,6 +612,7 @@ fn parse_object_block(
                         let angle = dat.get(q + 53).copied().unwrap_or(0);
                         out.push(PlacedVegetation {
                             model: model.clone(),
+                            group: proto,
                             pos: [x, y, z],
                             scale,
                             rot_y: angle as f32 * (std::f32::consts::TAU / 256.0),
@@ -565,6 +703,8 @@ mod tests {
     fn malformed_is_total() {
         assert!(prototypes_a(&[]).is_empty());
         assert!(prototypes_a(&[0xff; 64]).is_empty());
+        assert!(groups_a(&[]).is_empty());
+        assert!(groups_a(&[0xff; 64]).is_empty());
         assert!(decode_vegetation(&[]).is_empty());
         assert!(decode_vegetation(&[0xff; 64]).is_empty());
         assert!(vegetation_in_region(&[], [0.0; 3], 100.0).is_empty());
@@ -621,6 +761,11 @@ mod tests {
             );
             assert!(v.scale.is_finite(), "non-finite scale");
             assert!(v.rot_y >= 0.0 && v.rot_y <= std::f32::consts::TAU, "yaw");
+            assert!(
+                (v.group as usize) < protos.len(),
+                "group index {} out of range",
+                v.group
+            );
         }
         assert!(
             veg.iter().any(|v| {
@@ -650,6 +795,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn class3_groups() {
+        let Some(dat) = load_class3() else {
+            eprintln!("Class3 terrain.dat absent; skipping real-data group test");
+            return;
+        };
+        let groups = groups_a(&dat);
+        assert_eq!(groups.len(), 147, "Class3 Table A parameter count");
+        assert_eq!(groups[0].model, prototypes_a(&dat)[0]);
+
+        // Group 0 is `maple_02.cgf`. `leveldata.xml` gives it Bending=4,
+        // MaxViewDistRatio=0.65, LodDistRatio=0.7, SpriteDistRatio=1,
+        // Brightness=1, Density=1, Size=1, SizeVar=0.2, ElevationMax=4096,
+        // ElevationMin=-1e6, SlopeMax=255, CastShadow=1.
+        let g0 = &groups[0];
+        assert!((g0.bending - 4.0).abs() < 1e-4, "bending {}", g0.bending);
+        assert!((g0.max_view_dist_ratio - 0.65).abs() < 1e-4, "maxvdr {}", g0.max_view_dist_ratio);
+        assert!((g0.lod_dist_ratio - 0.7).abs() < 1e-4, "lodr {}", g0.lod_dist_ratio);
+        assert!((g0.sprite_dist_ratio - 1.0).abs() < 1e-4);
+        assert!((g0.density - 1.0).abs() < 1e-4);
+        assert!((g0.size - 1.0).abs() < 1e-4);
+        assert!((g0.size_var - 0.2).abs() < 1e-4);
+        assert!((g0.elevation_max - 4096.0).abs() < 1.0);
+        assert!(g0.elevation_min < -1e5);
+        assert!(g0.cast_shadow, "maple_02 casts shadows");
+        assert!(g0.use_sprites);
+        assert!(g0.view_dist_scale() > 0.0 && g0.lod_scale() > 0.0);
+
+        // Every group must carry a model path (one unused slot is empty) and a
+        // finite, positive scale.
+        for g in &groups {
+            assert!(g.bending.is_finite() && g.density.is_finite());
+            assert!(g.view_dist_scale() > 0.0);
+            assert!(g.lod_scale() > 0.0);
+        }
+        // Trees have bigger view-distance ratios than ground cover in general.
+        let tree_ratio = groups
+            .iter()
+            .filter(|g| kind_for_model(&g.model) == VegetationKind::Tree)
+            .map(|g| g.max_view_dist_ratio)
+            .fold(0.0f32, f32::max);
+        assert!(tree_ratio >= 1.0);
+        println!("Class3 group0: {:?}", g0);
+    }
+
     // -----------------------------------------------------------------------
     // kind classification
     // -----------------------------------------------------------------------
@@ -657,6 +847,7 @@ mod tests {
     fn pv(model: &str) -> PlacedVegetation {
         PlacedVegetation {
             model: model.to_string(),
+            group: 0,
             pos: [0.0; 3],
             scale: 1.0,
             rot_y: 0.0,

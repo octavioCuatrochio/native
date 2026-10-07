@@ -614,6 +614,106 @@ fn brush_transform(m: [f32; 12]) -> ([f32; 3], [f32; 4], f32) {
 }
 
 // ---------------------------------------------------------------------------
+// CryEngine view-distance / LOD rules (engine-side, not data decode)
+// ---------------------------------------------------------------------------
+
+/// `IRenderNode::GetMaxViewDist` for a placed object (brush, prop or plant).
+///
+/// SoD's engine computes `bbox_radius * e_ViewDistRatio * ViewDistRatioNormilized`
+/// and floors it at `e_ViewDistMin`. The spec CVars (`e_ViewDistRatio` = 35 on
+/// High, `e_ViewDistRatioVegetation` = 50) are **direct radius multipliers** —
+/// the shipped cfgs' own values (25..70) only make sense that way: a 5 m tree
+/// stays drawable ~250 m, a 10 m building ~350 m. (exe registrations at
+/// `0x47184b`/`0x471945`; commit `4028712` used the same form.)
+///
+/// * `e_view_dist_ratio` — spec `e_ViewDistRatio` or `e_ViewDistRatioVegetation`.
+/// * `view_dist_ratio` — the normalised per-object ratio: `m_ucViewDistRatio/100`
+///   for brushes (chunk byte 34, default 100 → 1.0), `1.0` for props, or the
+///   vegetation group's `MaxViewDistRatio` (authored ~0.6..1.8).
+/// * `e_view_dist_min` — spec `e_ViewDistMin` (10 on High).
+/// * `e_max_view_distance` — spec `e_MaxViewDistance`; the shipped console
+///   default is `-1.0` (exe `0x46ff5e`, default at `0x171e22c`), meaning "no
+///   clamp". The level's `Fog ViewDistance` (6000 m) is separately large.
+pub fn max_view_dist(
+    bbox_radius: f32,
+    e_view_dist_ratio: f32,
+    view_dist_ratio: f32,
+    e_view_dist_min: f32,
+    e_max_view_distance: f32,
+) -> f32 {
+    let ratio = if view_dist_ratio.is_finite() { view_dist_ratio.max(0.0) } else { 1.0 };
+    let d = bbox_radius * e_view_dist_ratio * ratio;
+    let d = d.max(e_view_dist_min);
+    if e_max_view_distance >= 0.0 {
+        d.min(e_max_view_distance)
+    } else {
+        d
+    }
+}
+
+/// CryEngine `GetObjectLOD` LOD boundary distance from a per-object `LodRatio`
+/// percentage (chunk byte 35, 100 = normal).
+///
+/// SoD's engine (`0x465a40`, called from the LOD selection at `0x465444`)
+/// computes the LOD index as
+/// `dist * (lodRatio/100)^2 / (e_LodRatio * min(radius, e_LodCompMaxSize))`,
+/// so LOD `n` begins at `n * step` with
+/// `step = e_LodRatio * min(radius, e_LodCompMaxSize) / (lodRatio/100)^2`.
+///
+/// A larger `LodRatio` therefore switches to a lower LOD *sooner*, the opposite
+/// of the public-CE3 linear form used before `813b23f`.
+pub fn lod_step_object(
+    bbox_radius: f32,
+    lod_ratio_pct: f32,
+    e_lod_ratio: f32,
+    e_lod_comp_max_size: f32,
+) -> f32 {
+    let n = (lod_ratio_pct / 100.0).max(0.05);
+    (e_lod_ratio * bbox_radius.min(e_lod_comp_max_size) / (n * n)).max(0.001)
+}
+
+/// CryEngine `CStatObjInst` LOD boundary distance for vegetation, scaled by the
+/// group's `LodDistRatio` (authored 0.2..2.0, 1.0 = normal).
+///
+/// The sprite-distance code (`0x44787e`) multiplies the group distance by
+/// `LodDistRatio` directly, so a value > 1 keeps higher detail farther out.
+pub fn lod_step_vegetation(
+    bbox_radius: f32,
+    lod_dist_ratio: f32,
+    e_lod_ratio: f32,
+    e_lod_comp_max_size: f32,
+) -> f32 {
+    let scale = if lod_dist_ratio.is_finite() && lod_dist_ratio > 0.0 {
+        lod_dist_ratio
+    } else {
+        1.0
+    };
+    (e_lod_ratio * bbox_radius.min(e_lod_comp_max_size) * scale).max(0.001)
+}
+
+/// CryEngine's vegetation sprite-switch distance, used both for the far sprite
+/// billboard and to fade/cull dense ground cover.
+///
+/// Mirrors the engine's `CStatObjInst` sprite path (`0x447845`):
+/// `radius * e_VegetationSpritesDistanceRatio * LodDistRatio *
+/// max(customMin, groupSpriteRatio)`.
+pub fn vegetation_sprite_dist(
+    bbox_radius: f32,
+    e_vegetation_sprites_distance_ratio: f32,
+    lod_dist_ratio: f32,
+    sprite_dist_ratio: f32,
+    e_vegetation_sprites_distance_custom_ratio_min: f32,
+) -> f32 {
+    let custom = e_vegetation_sprites_distance_custom_ratio_min.max(0.0);
+    let grp = if sprite_dist_ratio.is_finite() {
+        sprite_dist_ratio.max(0.0)
+    } else {
+        1.0
+    };
+    bbox_radius * e_vegetation_sprites_distance_ratio * lod_dist_ratio * custom.max(grp)
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -699,5 +799,30 @@ mod tests {
             guardrail,
             some.model
         );
+    }
+
+    #[test]
+    fn max_view_dist_rules() {
+        // 10 m radius, e_ViewDistRatio 35 (direct multiplier) -> 350 m.
+        assert!((max_view_dist(10.0, 35.0, 1.0, 10.0, -1.0) - 350.0).abs() < 1e-3);
+        // Per-object / group ratio scales it.
+        assert!((max_view_dist(10.0, 35.0, 0.5, 10.0, -1.0) - 175.0).abs() < 1e-3);
+        // Floor at e_ViewDistMin.
+        assert!((max_view_dist(0.1, 35.0, 1.0, 10.0, -1.0) - 10.0).abs() < 1e-3);
+        // e_MaxViewDistance clamps only when >= 0.
+        assert!((max_view_dist(100.0, 35.0, 1.0, 10.0, 200.0) - 200.0).abs() < 1e-3);
+        assert!((max_view_dist(100.0, 35.0, 1.0, 10.0, -1.0) - 3500.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn lod_step_rules() {
+        // e_LodRatio 10, LodCompMaxSize 60: a 5 m object -> step 50.
+        assert!((lod_step_object(5.0, 100.0, 10.0, 60.0) - 50.0).abs() < 1e-3);
+        // Radius is capped at LodCompMaxSize (60), not the object radius.
+        assert!((lod_step_object(500.0, 100.0, 10.0, 60.0) - 600.0).abs() < 1e-3);
+        // A larger LodRatio lowers the step (switches sooner); it is quadratic.
+        assert!((lod_step_object(50.0, 200.0, 10.0, 60.0) - 125.0).abs() < 1e-3);
+        // Vegetation scales linearly and upward with LodDistRatio.
+        assert!((lod_step_vegetation(50.0, 2.0, 10.0, 60.0) - 1000.0).abs() < 1e-3);
     }
 }

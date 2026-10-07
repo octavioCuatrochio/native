@@ -13,6 +13,7 @@ mod particle_bridge;
 mod interact;
 mod content_bridge;
 mod vehicle_bridge;
+mod streaming;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{CompressedImageFormats, ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor, ImageType};
@@ -92,8 +93,19 @@ struct World {
     brushes: Vec<(String, [f32; 3], [f32; 4], f32)>,
     /// Per brush: world AABB radius, ViewDistRatio, LodRatio (index-aligned with `brushes`).
     brush_info: Vec<(f32, u8, u8)>,
-    /// Vegetation (trees/bushes): model, cry position, scale, yaw radians.
-    vegetation: Vec<(String, [f32; 3], f32, f32)>,
+    /// Vegetation (trees/shrubs/grass): model, cry position, scale, yaw radians,
+    /// and the Table A `StatInstGroup` index driving its view/LOD/sprite rules.
+    vegetation: Vec<(String, [f32; 3], f32, f32, u16)>,
+    /// Decoded Table A `StatInstGroup` parameters, indexed by the value above.
+    veg_groups: std::sync::Arc<Vec<vegetation::VegetationGroup>>,
+    /// Every placed instance keyed by model path, for the distance streamer.
+    stream_instances: std::sync::Arc<HashMap<String, Vec<streaming::StreamInstance>>>,
+    /// Model paths not decoded at startup, nearest-first.
+    stream_pending: Vec<String>,
+    /// Virtual file system shared with the background model decoder.
+    vfs: std::sync::Arc<Vfs>,
+    /// Streaming near/load/unload radii in metres.
+    stream_radii: streaming::StreamRadii,
     /// Raw `.dds` bytes for the tiled ground diffuse texture (fallback).
     ground_tex: Option<Vec<u8>>,
     /// Baked per-surface ground albedo (width, height, RGBA8), spanning the terrain.
@@ -140,36 +152,62 @@ fn world_radius() -> f32 {
 
 /// Shipped object view-distance settings (`Config/CVarGroups/sys_spec_objectdetail.cfg`,
 /// group 3 = High, which uses the `[default]` values; `SOD_SPEC=1..4` picks another group).
-struct ViewDist { min: f32, ratio: f32, ratio_veg: f32, lod_ratio: f32, lod_comp_max: f32 }
+///
+/// The CVar defaults the shipped cfgs do **not** override come from the exe's own
+/// registrations (all checked against `bin/StateOfDecay.unpacked.exe`):
+/// `e_LodCompMaxSize` = 60 (`0x47184b`, value at `0x172155c`), `e_MaxViewDistance`
+/// = -1 meaning unlimited (`0x46ff5e`, value at `0x171e22c`),
+/// `e_VegetationSpritesDistanceRatio` = 1 (`0x46ecbb`).
+struct ViewDist {
+    min: f32,
+    ratio: f32,
+    ratio_veg: f32,
+    lod_ratio: f32,
+    lod_comp_max: f32,
+    max_view_dist: f32,
+    /// `e_VegetationSpritesDistanceRatio` (sprite path; see `vegetation_sprite_dist`).
+    #[allow(dead_code)]
+    sprite_ratio: f32,
+    /// `e_VegetationSpritesDistanceCustomRatioMin` (sprite path).
+    #[allow(dead_code)]
+    sprite_min: f32,
+}
 
 fn view_dist_spec() -> ViewDist {
     let spec = std::env::var("SOD_SPEC").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
     let (ratio, ratio_veg, lod_ratio) = match spec { 1 => (25.0, 30.0, 5.0), 2 => (30.0, 40.0, 6.0), 4 => (50.0, 70.0, 12.0), _ => (35.0, 50.0, 10.0) };
-    // e_LodCompMaxSize is not overridden by the shipped configs: registration default 10.
-    ViewDist { min: 10.0, ratio, ratio_veg, lod_ratio, lod_comp_max: 10.0 }
-}
-
-/// CryEngine 3 `IRenderNode::GetMaxViewDist` for brushes/vegetation:
-/// `max(e_ViewDistMin, bbox_radius * ratio * ViewDistRatio/100)`. The per-object
-/// ViewDistRatio is not decoded yet, so its default of 100 (normalised 1.0) is used.
-fn max_view_dist(radius: f32, ratio: f32, min: f32) -> f32 {
-    (radius * ratio).max(min)
+    ViewDist {
+        min: 10.0,
+        ratio,
+        ratio_veg,
+        lod_ratio,
+        // Registration defaults, not overridden by `sys_spec_objectdetail.cfg`.
+        lod_comp_max: 60.0,
+        // `e_MaxViewDistance` default -1 = unlimited; `SOD_MAXVIEWDIST` clamps.
+        max_view_dist: std::env::var("SOD_MAXVIEWDIST").ok().and_then(|v| v.parse().ok()).unwrap_or(-1.0),
+        // `e_VegetationSpritesDistanceRatio` / `...CustomRatioMin` (cfg `[default]`).
+        sprite_ratio: std::env::var("SOD_SPRITEDIST").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+        sprite_min: 0.3,
+    }
 }
 
 fn lod_path(model: &str, n: u32) -> String {
     format!("{}_lod{n}.cgf", model.strip_suffix(".cgf").unwrap_or(model))
 }
 
-/// Spawn a model with its shipped LOD chain. CryEngine 3 `GetObjectLOD`:
-/// `lod = floor(dist / (e_LodRatio * min(radius, e_LodCompMaxSize) * LodRatio/100))`,
-/// so LOD `n` starts at `n` times that step; the last LOD runs to the view distance.
-#[allow(clippy::too_many_arguments)]
+/// Spawn a model with its shipped LOD chain.
+///
+/// `lod_step` is the CryEngine `GetObjectLOD` boundary distance for one LOD
+/// level (`sod_core::architecture::lod_step_object` for brushes/props and
+/// `lod_step_vegetation` for foliage); LOD `n` starts at `n * lod_step` and the
+/// last available LOD runs to `view_dist`.
 fn spawn_lod_chain(
     root: &mut ChildSpawnerCommands,
     built: &HashMap<String, Vec<(Handle<Mesh>, Handle<StandardMaterial>)>>,
-    model: &str, tf: Transform, radius: f32, view_dist: f32, lod_ratio: u8, vd: &ViewDist,
-) {
-    let Some(lod0) = built.get(model) else { return };
+    model: &str, tf: Transform, view_dist: f32, lod_step: f32,
+) -> Vec<Entity> {
+    let mut spawned = Vec::new();
+    let Some(lod0) = built.get(model) else { return spawned };
     let mut chain = vec![lod0];
     // `SOD_LOD=0` draws LOD0 only (A/B runs).
     if std::env::var("SOD_LOD").map_or(true, |v| v != "0") {
@@ -177,15 +215,42 @@ fn spawn_lod_chain(
             match built.get(&lod_path(model, n)) { Some(l) => chain.push(l), None => break }
         }
     }
-    let step = (vd.lod_ratio * radius.min(vd.lod_comp_max) * lod_ratio.max(1) as f32 / 100.0).max(0.001);
+    let step = lod_step.max(0.001);
     for (i, list) in chain.iter().enumerate() {
         let start = i as f32 * step;
         if start >= view_dist { break; }
         let end = if i + 1 < chain.len() { ((i + 1) as f32 * step).min(view_dist) } else { view_dist };
         let mut r = bevy::camera::visibility::VisibilityRange::abrupt(start, end);
         r.use_aabb = true;
-        for (mh, mat) in list.iter() { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, r.clone())); }
+        for (mh, mat) in list.iter() {
+            spawned.push(root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, r.clone())).id());
+        }
     }
+    spawned
+}
+
+/// The streaming runtime: a background model decoder plus the bookkeeping for
+/// which models are resident and which entities they spawned. Inserted by
+/// `setup_world`; driven by [`update_streaming`].
+#[derive(Resource)]
+struct Streaming {
+    decoder: streaming::ModelDecoder,
+    /// Not-yet-requested model paths, nearest-first.
+    pending: Vec<String>,
+    requested: std::collections::HashSet<String>,
+    /// Resident models -> spawned entities, for distance unloading.
+    spawned: HashMap<String, Vec<Entity>>,
+    /// Shared placement index (also held by `World`).
+    instances: std::sync::Arc<HashMap<String, Vec<streaming::StreamInstance>>>,
+    /// Shared Table A group parameters for vegetation distances.
+    veg_groups: std::sync::Arc<Vec<vegetation::VegetationGroup>>,
+    /// World root entity the streamed instances are parented under.
+    root: Entity,
+    radii: streaming::StreamRadii,
+    enabled: bool,
+    /// Frames since startup; unloading is suppressed until the player transform
+    /// is known so an uninitialised anchor cannot evict everything at frame 0.
+    frames: u32,
 }
 
 /// Bounding-sphere radius of a model's meshes (unscaled), from their AABBs.
@@ -197,6 +262,93 @@ fn model_radius(meshes: &Assets<Mesh>, list: &[(Handle<Mesh>, Handle<StandardMat
         }
     }
     if lo.x > hi.x { 1.0 } else { (hi - lo).length() * 0.5 }
+}
+
+/// Build the renderable meshes + materials for one decoded model.
+///
+/// One material per palette slot, one mesh per submesh, so complex
+/// multi-material models texture correctly. `mat_handles` stays index-aligned
+/// with the palette, so a NoDraw slot still occupies its position but is never
+/// drawn. Shared by the eager startup pass and the background streamer
+/// (`streaming.rs`).
+#[allow(clippy::too_many_arguments)]
+fn build_model_assets(
+    dmeshes: &[DecodedMesh],
+    slots: &[MaterialSlot],
+    tex_bytes: &HashMap<String, Vec<u8>>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    cache: Option<&cache::TextureCache>,
+    tex_memo: &mut HashMap<String, Handle<Image>>,
+) -> Vec<(Handle<Mesh>, Handle<StandardMaterial>)> {
+    let mut mat_handles: Vec<Handle<StandardMaterial>> = Vec::new();
+    let mut nodraw: Vec<bool> = Vec::new();
+    let mut has_normal = false;
+    for slot in slots {
+        if slot.is_nodraw() {
+            mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
+            nodraw.push(true);
+            continue;
+        }
+        // Authored cutout threshold for foliage/decals (material.rs); the
+        // old fixed 0.5 punched holes in the wrong texels.
+        let alpha_mode = AlphaMode::Mask(slot.alpha_test.unwrap_or(0.5));
+        let mut mat = StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, alpha_mode, ..default() };
+        if let Some(tp) = slot.texture("Diffuse") {
+            if let Some(bytes) = tex_bytes.get(tp) {
+                if let Some(h) = cached_tex(images, cache, tex_memo, tp, bytes, true) {
+                    mat.base_color_texture = Some(h);
+                }
+            }
+        }
+        // Normal map (linear, not sRGB); needs tangents, generated below.
+        if let Some(tp) = slot.texture("Bumpmap").or_else(|| slot.texture("Normal")) {
+            if let Some(bytes) = tex_bytes.get(tp) {
+                let key = format!("{tp}#normal");
+                if let Some(h) = cached_tex(images, cache, tex_memo, &key, bytes, false) {
+                    mat.normal_map_texture = Some(h);
+                    has_normal = true;
+                }
+            }
+        }
+        mat_handles.push(materials.add(mat));
+        nodraw.push(false);
+    }
+    if mat_handles.is_empty() {
+        mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
+        nodraw.push(false);
+    }
+    let mut list = Vec::new();
+    for m in dmeshes {
+        if m.positions.is_empty() { continue; }
+        let build_mesh = |indices: &[u32]| {
+            let mut bm = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+            bm.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(m.positions.clone()));
+            bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
+            if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
+            bm.insert_indices(Indices::U32(indices.to_vec()));
+            // Bevy only applies a normal map when the mesh carries tangents
+            // (`VERTEX_TANGENTS`); derive them for models with one.
+            if has_normal && m.uvs.len() == m.positions.len() {
+                let _ = bm.generate_tangents();
+            }
+            bm
+        };
+        if m.submeshes.is_empty() {
+            if m.indices.is_empty() || nodraw.first().copied().unwrap_or(false) { continue; }
+            list.push((meshes.add(build_mesh(&m.indices)), mat_handles[0].clone()));
+        } else {
+            for sm in &m.submeshes {
+                if sm.indices.is_empty() { continue; }
+                let mi = sm.material as usize;
+                if nodraw.get(mi).copied().unwrap_or(false) { continue; }
+                let mat = mat_handles.get(mi).cloned().unwrap_or_else(|| mat_handles[0].clone());
+                list.push((meshes.add(build_mesh(&sm.indices)), mat));
+            }
+        }
+    }
+    list
 }
 
 /// Uniform block for [`TerrainMaterialExt`]: terrain extent in `params.xy`, the
@@ -448,7 +600,7 @@ impl SmEnv for PlayerSmEnv {
 #[derive(Resource)]
 struct AnimCtx {
     table: sod_core::anim_alias::AnimNameTable,
-    vfs: Vfs,
+    vfs: std::sync::Arc<Vfs>,
     skeleton: Skeleton,
 }
 
@@ -1057,6 +1209,9 @@ fn coarse_height(t: &terrain::Terrain, si: usize, sj: usize, far: usize) -> f32 
 /// Load a level, resolve its terrain/objects, build the render world and run
 /// the Bevy app (`play` = third-person survivor, otherwise an orbit overview).
 fn run_world(game: &str, vfs: Vfs, play: bool) {
+    // Shared with the streaming worker (`streaming::ModelDecoder`), which reads
+    // and decodes distant models on a background thread.
+    let vfs = std::sync::Arc::new(vfs);
     let level_pak_path = Path::new(game).join("Game/levels/Class3/level.pak");
     let level_pak = sod_core::Pak::open(&level_pak_path).expect("open level.pak");
     println!("[world] level.pak: {} entries", level_pak.len());
@@ -1276,27 +1431,104 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         Some(Collision(cw))
     };
 
-    // Trees / bushes (vegetation) from the same octree.
+    // Trees, shrubs and grass/ground cover from the same octree. Table A's
+    // per-group `MaxViewDistRatio` / `LodDistRatio` (decoded in
+    // `vegetation::groups_a`) drives culling instead of a blanket kind filter,
+    // so the grass/clutter layer is back; a budget below bounds its entity count.
     let veg_radius = world_radius();
-    let mut vegetation: Vec<(String, [f32; 3], f32, f32)> = Vec::new();
+    let veg_groups = vegetation::groups_a(&terrain_bytes);
+    let mut vegetation: Vec<(String, [f32; 3], f32, f32, u16)> = Vec::new();
     if std::env::var("SOD_NOVEG").is_err() {
         for v in vegetation::vegetation_in_region(&terrain_bytes, start_cry, veg_radius) {
-            vegetation.push((v.model, v.pos, v.scale, v.rot_y));
+            vegetation.push((v.model, v.pos, v.scale, v.rot_y, v.group));
         }
     }
-    // Keep trees/shrubs; the flat grass/clutter cards are numerous and clutter
-    // the view (and cost frame time) for little benefit.
-    vegetation.retain(|v| matches!(
-        vegetation::kind_for_model(&v.0),
-        vegetation::VegetationKind::Tree | vegetation::VegetationKind::Shrub
-    ));
     let mut unique_veg_models: Vec<String> = vegetation.iter().map(|v| v.0.clone()).collect();
     unique_veg_models.sort();
     unique_veg_models.dedup();
-    println!("[world] vegetation: {} instances / {} models within {:.0}m",
-        vegetation.len(), unique_veg_models.len(), veg_radius);
+    let mut kind_counts = [0usize; 4];
+    for v in &vegetation {
+        kind_counts[match vegetation::kind_for_model(&v.0) {
+            vegetation::VegetationKind::Tree => 0,
+            vegetation::VegetationKind::Shrub => 1,
+            vegetation::VegetationKind::Grass => 2,
+            vegetation::VegetationKind::Other => 3,
+        }] += 1;
+    }
+    println!("[world] vegetation: {} instances / {} models within {:.0}m (tree {}, shrub {}, grass {}, other {})",
+        vegetation.len(), unique_veg_models.len(), veg_radius,
+        kind_counts[0], kind_counts[1], kind_counts[2], kind_counts[3]);
 
-    // Decode every unique model (props + architecture + vegetation) once.
+    // Frame-time guard: the ground-cover layer is by far the densest. Keep the
+    // whole tree/shrub layer and the nearest `SOD_VEGBUDGET` (default 45k)
+    // grass/clutter; the per-group view distances still cull the rest per frame.
+    // `SOD_VEGBUDGET=0` disables the budget.
+    let budget = std::env::var("SOD_VEGBUDGET").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(45_000);
+    if budget > 0 && vegetation.len() > budget {
+        let d2 = |p: &[f32; 3]| (p[0] - start_cry[0]).powi(2) + (p[1] - start_cry[1]).powi(2);
+        let keep_tree = |m: &str| matches!(vegetation::kind_for_model(m),
+            vegetation::VegetationKind::Tree | vegetation::VegetationKind::Shrub);
+        let mut keep: Vec<usize> = (0..vegetation.len()).filter(|&i| keep_tree(&vegetation[i].0)).collect();
+        let mut rest: Vec<usize> = (0..vegetation.len()).filter(|&i| !keep_tree(&vegetation[i].0)).collect();
+        rest.sort_by(|&a, &b| d2(&vegetation[a].1)
+            .partial_cmp(&d2(&vegetation[b].1))
+            .unwrap_or(std::cmp::Ordering::Equal));
+        let room = budget.saturating_sub(keep.len());
+        keep.extend(rest.into_iter().take(room));
+        keep.sort_unstable();
+        let kept: Vec<_> = keep.into_iter().map(|i| vegetation[i].clone()).collect();
+        println!("[world] vegetation budget {}: kept {} of {} (all tree/shrub + nearest grass/clutter)",
+            budget, kept.len(), vegetation.len());
+        vegetation = kept;
+    }
+
+    // Build the streaming index: every placed instance grouped by model, plus
+    // each model's nearest instance distance to the start. Models with an
+    // instance close to the start are decoded eagerly; the rest are handed to
+    // the background streamer, nearest-first (`streaming.rs`). `SOD_STREAM=0`
+    // falls back to the previous decode-everything-at-startup path.
+    let stream_radii = streaming::StreamRadii::from_env();
+    let streaming_on = std::env::var("SOD_STREAM").map(|v| v != "0").unwrap_or(true);
+    let mut stream_instances: HashMap<String, Vec<streaming::StreamInstance>> = HashMap::new();
+    for p in &with_models {
+        if let Some(model) = &p.model {
+            stream_instances.entry(model.clone()).or_default().push(streaming::StreamInstance {
+                model: model.clone(), pos: p.pos, rot: p.rot, scale: p.scale,
+                vegetation: false, group: 0, view_dist_ratio: 1.0, lod_ratio: 1.0,
+            });
+        }
+    }
+    for ((model, pos, rot, scale), (_, vdr, lodr)) in brushes.iter().zip(&brush_info) {
+        stream_instances.entry(model.clone()).or_default().push(streaming::StreamInstance {
+            model: model.clone(), pos: *pos, rot: *rot, scale: [*scale; 3],
+            vegetation: false, group: 0,
+            view_dist_ratio: *vdr as f32 / 100.0, lod_ratio: *lodr as f32 / 100.0,
+        });
+    }
+    for (model, pos, scale, yaw, group) in &vegetation {
+        stream_instances.entry(model.clone()).or_default().push(streaming::StreamInstance {
+            model: model.clone(), pos: *pos,
+            rot: Quat::from_rotation_z(*yaw).to_array(),
+            scale: [*scale; 3], vegetation: true, group: *group,
+            view_dist_ratio: 1.0, lod_ratio: 1.0,
+        });
+    }
+    let nearest = streaming::nearest_distance(&stream_instances, start_cry);
+    let near = if streaming_on { stream_radii.near } else { f32::INFINITY };
+    let mut deferred: Vec<String> = nearest
+        .iter()
+        .filter(|(_, &d)| d > near)
+        .map(|(m, _)| m.clone())
+        .collect();
+    deferred.sort_by(|a, b| nearest[a].partial_cmp(&nearest[b]).unwrap_or(std::cmp::Ordering::Equal));
+    println!("[world] streaming: {} models ({} eager within {:.0}m, {} pending; load {:.0}m unload {:.0}m)",
+        stream_instances.len(), stream_instances.len() - deferred.len(),
+        if streaming_on { stream_radii.near } else { f32::INFINITY },
+        deferred.len(), stream_radii.load, stream_radii.unload);
+    let deferred_set: std::collections::HashSet<String> = deferred.iter().cloned().collect();
+
+    // Decode every unique model (props + architecture + vegetation) not deferred
+    // to the streamer.
     let mut wanted: Vec<String> = with_models.iter().filter_map(|p| p.model.clone()).collect();
     wanted.extend(unique_brush_models.iter().cloned());
     wanted.extend(unique_veg_models.iter().cloned());
@@ -1313,7 +1545,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     let mut slots: HashMap<String, Vec<MaterialSlot>> = HashMap::new();
     let mut tex_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     for path in &wanted {
-        if models.contains_key(path) {
+        if models.contains_key(path) || deferred_set.contains(path) {
             continue;
         }
         let Some(bytes) = vfs.read(path) else { continue };
@@ -1534,7 +1766,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(MaterialPlugin::<CharMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
-    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, brush_info, vegetation, ground_tex, ground_albedo, ground_layers })
+    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, brush_info, vegetation, veg_groups: std::sync::Arc::new(veg_groups), stream_instances: std::sync::Arc::new(stream_instances), stream_pending: deferred, vfs: vfs.clone(), stream_radii, ground_tex, ground_albedo, ground_layers })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
     .insert_resource(MenuFont(vfs.read("fonts/veramono.ttf").unwrap_or_default()))
     .insert_resource(TextureCacheRes(cache::TextureCache::new("target/texture-cache")))
@@ -1605,9 +1837,150 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if let Some(ps) = player_setup {
         app.insert_resource(ps);
     }
+    // Distance streaming: no-op until `setup_world` inserts the `Streaming`
+    // resource (i.e. when some models were deferred).
+    app.add_systems(Update, update_streaming);
     install_terrain_shader(&mut app);
     install_char_shader(&mut app);
     app.run();
+}
+
+/// Stream models and instances in/out by distance from the player.
+///
+/// Runs every frame but does nothing until `setup_world` has inserted the
+/// [`Streaming`] resource. Work per frame is bounded: at most a handful of
+/// model requests, and at most ~5 ms total spent draining builds and spawning
+/// (so the frame is never blocked on file I/O or CGF decoding).
+#[allow(clippy::too_many_arguments)]
+fn update_streaming(
+    stream: Option<ResMut<Streaming>>,
+    mut props: ResMut<PropAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    cache: Option<Res<TextureCacheRes>>,
+    cam: Option<Res<CameraStateRes>>,
+    player: Query<&GlobalTransform, With<PlayerRoot>>,
+    mut commands: Commands,
+    mut tex_memo: Local<HashMap<String, Handle<Image>>>,
+) {
+    let Some(mut stream) = stream else { return };
+    if !stream.enabled {
+        return;
+    }
+    // Player position in CryEngine Z-up space. Prefer the player entity (always
+    // valid once spawned); fall back to the third-person camera's look-at
+    // target. Never unload until the anchor is known, so a default/zero target
+    // cannot evict every instance at startup.
+    stream.frames = stream.frames.saturating_add(1);
+    let player_cry = if let Ok(t) = player.single() {
+        // Bevy space -> Cry space: undo the `-90deg` X base rotation.
+        let p = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) * t.translation();
+        [p.x, p.y, p.z]
+    } else if let Some(c) = &cam {
+        if c.0.target.iter().all(|v| v.is_finite()) {
+            c.0.target
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+    let allow_unload = stream.frames > 120;
+
+    // 1. Queue the nearest pending models within the load radius.
+    let nearest = streaming::nearest_distance(&stream.instances, player_cry);
+    let picks = {
+        let s = &mut *stream;
+        streaming::plan(
+            &s.pending, &nearest, player_cry, &s.instances,
+            s.radii.load, 12, &mut s.requested,
+        )
+    };
+    for m in &picks {
+        stream.decoder.request(m);
+    }
+
+    // 2. Build assets + spawn instances for completed decodes, time-budgeted.
+    let t0 = std::time::Instant::now();
+    let vd = view_dist_spec();
+    let buds = stream.decoder.drain(std::time::Duration::from_millis(3));
+    for dm in buds {
+        let tex: HashMap<String, Vec<u8>> = dm.textures.into_iter().collect();
+        let list = build_model_assets(
+            &dm.meshes, &dm.slots, &tex,
+            &mut meshes, &mut materials, &mut images,
+            cache.as_ref().map(|c| &c.0), &mut tex_memo,
+        );
+        props.0.insert(dm.path.clone(), list);
+        let mut ents = Vec::new();
+        let built = &props.0;
+        if let (Some(list), Some(insts)) = (built.get(&dm.path), stream.instances.get(&dm.path)) {
+            let vd = &vd;
+            commands.entity(stream.root).with_children(|root| {
+                for inst in insts {
+                    let tf = Transform {
+                        translation: Vec3::from(inst.pos),
+                        rotation: Quat::from_array(inst.rot),
+                        scale: Vec3::from(inst.scale),
+                    };
+                    let r = model_radius(&meshes, list)
+                        * inst.scale[0].max(inst.scale[1]).max(inst.scale[2]);
+                    let (vdist, step) = if inst.vegetation {
+                        let g = stream.veg_groups.get(inst.group as usize);
+                        let vdr = g.map(|g| g.view_dist_scale()).unwrap_or(1.0);
+                        let lodr = g.map(|g| g.lod_scale()).unwrap_or(1.0);
+                        (
+                            architecture::max_view_dist(r, vd.ratio_veg, vdr, vd.min, vd.max_view_dist),
+                            architecture::lod_step_vegetation(r, lodr, vd.lod_ratio, vd.lod_comp_max),
+                        )
+                    } else {
+                        (
+                            architecture::max_view_dist(r, vd.ratio, inst.view_dist_ratio, vd.min, vd.max_view_dist),
+                            architecture::lod_step_object(r, inst.lod_ratio * 100.0, vd.lod_ratio, vd.lod_comp_max),
+                        )
+                    };
+                    ents.extend(spawn_lod_chain(root, built, &dm.path, tf, vdist, step));
+                }
+            });
+        }
+        stream.spawned.insert(dm.path.clone(), ents);
+        if t0.elapsed() >= std::time::Duration::from_millis(5) {
+            break;
+        }
+    }
+
+    // 3. Drop resident models whose every instance is beyond the unload radius.
+    if !allow_unload {
+        return;
+    }
+    let far: Vec<String> = stream
+        .spawned
+        .keys()
+        .filter(|m| {
+            stream.instances.get(*m)
+                .map(|l| streaming::should_unload(l, player_cry, stream.radii.unload))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    for m in far {
+        if let Some(ents) = stream.spawned.remove(&m) {
+            for e in ents {
+                commands.entity(e).despawn();
+            }
+        }
+        // Free the GPU assets too, and forget the model so it can reload.
+        for path in std::iter::once(m.clone()).chain((1..=3).map(|n| lod_path(&m, n))) {
+            if let Some(list) = props.0.remove(&path) {
+                for (mh, mat) in list {
+                    meshes.remove(mh.id());
+                    materials.remove(mat.id());
+                }
+            }
+            stream.requested.remove(&path);
+        }
+    }
 }
 
 fn setup_world(
@@ -1758,79 +2131,15 @@ fn setup_world(
     let no_slots: Vec<MaterialSlot> = Vec::new();
     for (path, dmeshes) in &world.models {
         let slots = world.slots.get(path).unwrap_or(&no_slots);
-        let mut mat_handles: Vec<Handle<StandardMaterial>> = Vec::new();
-        // `mat_handles` must stay index-aligned with the palette, so a NoDraw
-        // slot still occupies its position but is never drawn (below).
-        let mut nodraw: Vec<bool> = Vec::new();
-        let mut has_normal = false;
-        for slot in slots {
-            if slot.is_nodraw() {
-                mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
-                nodraw.push(true);
-                continue;
-            }
-            // Authored cutout threshold for foliage/decals (material.rs); the
-            // old fixed 0.5 punched holes in the wrong texels.
-            let alpha_mode = AlphaMode::Mask(slot.alpha_test.unwrap_or(0.5));
-            let mut mat = StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, alpha_mode, ..default() };
-            if let Some(tp) = slot.texture("Diffuse") {
-                if let Some(bytes) = world.tex_bytes.get(tp) {
-                    if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) {
-                        mat.base_color_texture = Some(h);
-                    }
-                }
-            }
-            // Normal map (linear, not sRGB); needs tangents, generated below.
-            if let Some(tp) = slot.texture("Bumpmap").or_else(|| slot.texture("Normal")) {
-                if let Some(bytes) = world.tex_bytes.get(tp) {
-                    let key = format!("{tp}#normal");
-                    if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, &key, bytes, false) {
-                        mat.normal_map_texture = Some(h);
-                        has_normal = true;
-                    }
-                }
-            }
-            mat_handles.push(materials.add(mat));
-            nodraw.push(false);
-        }
-        if mat_handles.is_empty() {
-            mat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.78, 0.76, 0.72), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
-            nodraw.push(false);
-        }
-        let mut list = Vec::new();
-        for m in dmeshes {
-            if m.positions.is_empty() { continue; }
-            let build_mesh = |indices: &[u32]| {
-                let mut bm = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-                bm.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(m.positions.clone()));
-                bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
-                if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
-                bm.insert_indices(Indices::U32(indices.to_vec()));
-                // Bevy only applies a normal map when the mesh carries
-                // tangents (`VERTEX_TANGENTS`); derive them for models with one.
-                if has_normal && m.uvs.len() == m.positions.len() {
-                    let _ = bm.generate_tangents();
-                }
-                bm
-            };
-            if m.submeshes.is_empty() {
-                if m.indices.is_empty() || nodraw.first().copied().unwrap_or(false) { continue; }
-                list.push((meshes.add(build_mesh(&m.indices)), mat_handles[0].clone()));
-            } else {
-                for sm in &m.submeshes {
-                    if sm.indices.is_empty() { continue; }
-                    let mi = sm.material as usize;
-                    if nodraw.get(mi).copied().unwrap_or(false) { continue; }
-                    let mat = mat_handles.get(mi).cloned().unwrap_or_else(|| mat_handles[0].clone());
-                    list.push((meshes.add(build_mesh(&sm.indices)), mat));
-                }
-            }
-        }
+        let list = build_model_assets(
+            dmeshes, slots, &world.tex_bytes,
+            &mut meshes, &mut materials, &mut images, cache, &mut tex_memo,
+        );
         built.insert(path.clone(), list);
     }
 
     // World root: terrain + props.
-    commands.spawn((base, Visibility::default())).with_children(|root| {
+    let world_root = commands.spawn((base, Visibility::default())).with_children(|root| {
         if let Some(ext) = &terrain_ext {
             root.spawn((Mesh3d(terrain_mesh.clone()), MeshMaterial3d(ext.clone()), Transform::default()));
         } else {
@@ -1847,7 +2156,9 @@ fn setup_world(
                 scale: Vec3::new(p.scale[0], p.scale[1], p.scale[2]),
             };
             let r = model_radius(&meshes, list) * p.scale[0].max(p.scale[1]).max(p.scale[2]);
-            spawn_lod_chain(root, &built, path, tf, r, max_view_dist(r, vd.ratio, vd.min), 100, &vd);
+            let vdist = architecture::max_view_dist(r, vd.ratio, 1.0, vd.min, vd.max_view_dist);
+            let step = architecture::lod_step_object(r, 100.0, vd.lod_ratio, vd.lod_comp_max);
+            spawn_lod_chain(root, &built, path, tf, vdist, step);
             spawned += 1;
         }
         // Static architecture (buildings, walls, rocks) as instances.
@@ -1859,30 +2170,59 @@ fn setup_world(
                 rotation: Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]),
                 scale: Vec3::splat(*scale),
             };
-            // ViewDistRatio/100 scales the distance (CryEngine GetViewDistRatioNormilized).
-            let vdist = max_view_dist(*bradius, vd.ratio * *vdr as f32 / 100.0, vd.min);
-            spawn_lod_chain(root, &built, model, tf, *bradius, vdist, *lodr, &vd);
+            // `m_ucViewDistRatio/100` normalises the per-object ratio; the spec
+            // `e_ViewDistRatio` is a direct multiplier (GetViewDistRatioNormilized).
+            let vdist = architecture::max_view_dist(*bradius, vd.ratio, *vdr as f32 / 100.0, vd.min, vd.max_view_dist);
+            let step = architecture::lod_step_object(*bradius, *lodr as f32, vd.lod_ratio, vd.lod_comp_max);
+            spawn_lod_chain(root, &built, model, tf, vdist, step);
             bspawned += 1;
         }
-        // Vegetation (trees/bushes).
+        // Vegetation (trees, shrubs, grass). Each instance's Table A group
+        // supplies its `MaxViewDistRatio`, `LodDistRatio` and sprite ratio.
         let mut vspawned = 0;
-        for (model, pos, scale, yaw) in &world.vegetation {
+        for (model, pos, scale, yaw, group) in &world.vegetation {
             let Some(list) = built.get(model) else { continue };
+            let g = world.veg_groups.get(*group as usize);
+            let vdr = g.map(|g| g.view_dist_scale()).unwrap_or(1.0);
+            let lodr = g.map(|g| g.lod_scale()).unwrap_or(1.0);
             let tf = Transform {
                 translation: Vec3::new(pos[0], pos[1], pos[2]),
                 rotation: Quat::from_rotation_z(*yaw),
                 scale: Vec3::splat(*scale),
             };
-            // Vegetation group ratios are not decoded yet: default 100.
             let r = model_radius(&meshes, list) * *scale;
-            spawn_lod_chain(root, &built, model, tf, r, max_view_dist(r, vd.ratio_veg, vd.min), 100, &vd);
+            // The group's `MaxViewDistRatio` is the far cutoff honoured here;
+            // `sod_core::architecture::vegetation_sprite_dist` documents the
+            // engine's sprite-switch distance (sprite ratio + LodDistRatio) for
+            // when a billboard path lands. `e_VegetationSpritesDistanceRatio`
+            // scales it; `vd.sprite_ratio`/`vd.sprite_min` carry the cfg values.
+            let vdist = architecture::max_view_dist(r, vd.ratio_veg, vdr, vd.min, vd.max_view_dist);
+            let step = architecture::lod_step_vegetation(r, lodr, vd.lod_ratio, vd.lod_comp_max);
+            spawn_lod_chain(root, &built, model, tf, vdist, step);
             vspawned += 1;
         }
         info!("[world] spawned {} props, {} brushes, {} vegetation", spawned, bspawned, vspawned);
-    });
+    }).id();
     // Hand the built prop handles to the runtime (searchable containers), which
     // spawns after startup and cannot reuse this function's locals.
     commands.insert_resource(PropAssets(built));
+    // Distance streamer for every model that was not decoded at startup: its
+    // decoder thread starts now, the `update_streaming` system feeds it and
+    // spawns/unloads instances as the player moves (`streaming.rs`).
+    if !world.stream_pending.is_empty() {
+        commands.insert_resource(Streaming {
+            decoder: streaming::ModelDecoder::new(world.vfs.clone()),
+            pending: world.stream_pending.clone(),
+            requested: Default::default(),
+            spawned: Default::default(),
+            instances: world.stream_instances.clone(),
+            veg_groups: world.veg_groups.clone(),
+            root: world_root,
+            radii: world.stream_radii,
+            enabled: std::env::var("SOD_STREAM").map(|v| v != "0").unwrap_or(true),
+            frames: 0,
+        });
+    }
 
     // Player (per-submesh character materials: UL_Character / UL_Test_Skin).
     if let Some(ps) = player_setup {

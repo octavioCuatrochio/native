@@ -2886,8 +2886,9 @@ fn move_player(
     // controller, which turns the character toward it.
     let cam_yaw = cam_state.as_ref().map(|c| c.0.yaw).unwrap_or(player.mstate.yaw);
     let (sc, cc) = cam_yaw.sin_cos();
-    let wdx = cc * fwd - sc * strafe;
-    let wdy = sc * fwd + cc * strafe;
+    // Z-up, yaw 0 -> +X: the camera's right is (sin, -cos), so D (+strafe) moves right.
+    let wdx = cc * fwd + sc * strafe;
+    let wdy = sc * fwd - cc * strafe;
     let mag = (fwd * fwd + strafe * strafe).sqrt();
     let world_yaw = if mag > 1e-4 { wdy.atan2(wdx) } else { player.mstate.yaw };
     let rel = wrap_angle(world_yaw - player.mstate.yaw);
@@ -3291,6 +3292,7 @@ fn follow_camera(
     time: Res<Time>,
     motion: Res<AccumulatedMouseMotion>,
     mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     menu: Res<MenuRes>,
     player: Option<Res<Player>>,
     cam_state: Option<ResMut<CameraStateRes>>,
@@ -3318,12 +3320,9 @@ fn follow_camera(
     let aim = mouse.pressed(MouseButton::Right);
     let input = camera::CameraInput { mouse_dx: dx, mouse_dy: dy, aim, dt: time.delta_secs(), ..Default::default() };
     camera::update(&mut cs.0, &input, &t, target);
-    // Recenter the camera behind the player while walking (nav camera), unless
-    // the player is actively looking this frame.
-    if player.moving && dx.abs() < 0.5 && dy.abs() < 0.5 {
-        let d = wrap_angle(player.mstate.yaw - cs.0.yaw);
-        cs.0.yaw = wrap_angle(cs.0.yaw + d * (time.delta_secs() * 2.0).min(1.0));
-    }
+    // (No hand-made recentre: it chased the body when walking toward the camera
+    // and flipped the camera-relative input. The retail camera stays put —
+    // notes/telemetry/moves_session3.csv.)
     // CryEngine camera lag/smoothing (FUN_015ea260) so the camera trails the
     // target instead of snapping.
     let cam_pos = match lag {
@@ -3334,8 +3333,8 @@ fn follow_camera(
         None => cs.0.pos,
     };
     if std::env::var("SOD_CAMDBG").is_ok() {
-        eprintln!("[camdbg] t={:.3} x={:.3} y={:.3} feet_z={:.4} target_z={:.4} cam_z={:.4} lag_z={:.4} vz={:.3} grounded={} vx={:.3} vy={:.3}",
-            time.elapsed_secs(), player.mstate.pos[0], player.mstate.pos[1], player.mstate.pos[2], target[2], cs.0.pos[2], cam_pos[2], player.mstate.vel[2], player.mstate.grounded, player.mstate.vel[0], player.mstate.vel[1]);
+        eprintln!("[camdbg] t={:.3} x={:.3} y={:.3} feet_z={:.4} target_z={:.4} cam_z={:.4} lag_z={:.4} vz={:.3} grounded={} vx={:.3} vy={:.3} yaw={:.3} cam_yaw={:.3} keys={}",
+            time.elapsed_secs(), player.mstate.pos[0], player.mstate.pos[1], player.mstate.pos[2], target[2], cs.0.pos[2], cam_pos[2], player.mstate.vel[2], player.mstate.grounded, player.mstate.vel[0], player.mstate.vel[1], player.mstate.yaw, cs.0.yaw, format!("{}{}{}{}{}", if keys.pressed(KeyCode::KeyW) {"W"} else {""}, if keys.pressed(KeyCode::KeyA) {"A"} else {""}, if keys.pressed(KeyCode::KeyS) {"S"} else {""}, if keys.pressed(KeyCode::KeyD) {"D"} else {""}, if mouse.pressed(MouseButton::Right) {"+aim"} else {""}));
     }
     let base_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let pos = base_rot * Vec3::new(cam_pos[0], cam_pos[1], cam_pos[2]);

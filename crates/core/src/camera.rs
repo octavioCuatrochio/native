@@ -237,9 +237,14 @@ pub fn update_mode(
             1.0 + MOUSE_DEVICE_SCALE_PER_SENS * MOUSE_SENSITIVITY_NORM,
         )
     } else {
-        // Right stick: shaped deflection (fitted curve, see `STICK_RESPONSE`).
-        let [sx, sy] = [sane(input.stick[0]).clamp(-1.0, 1.0), sane(input.stick[1]).clamp(-1.0, 1.0)];
-        ([sx.signum() * stick_response(sx.abs()), sy.signum() * stick_response(sy.abs())], STICK_DEVICE_SCALE)
+        // Right stick: exact shaping from `0x1587bb0` (called at `0x158a22e`)
+        // plus the magnitude-cube scale at `0x158a233`. Nav uses radius 0.1,
+        // aim 0.20 (live `cl_input_*_camera_deadzone_pc_*`).
+        let (linear, radius) = stick_deadzones(mode);
+        (
+            stick_shape(sane(input.stick[0]), sane(input.stick[1]), linear, radius),
+            STICK_DEVICE_SCALE,
+        )
     };
 
     // Camera rotation (third-person update `0x15ea59c`): only when either
@@ -574,38 +579,103 @@ pub fn mouse_count_scale(s: f32) -> f32 {
     MOUSE_COUNT_BASE + MOUSE_COUNT_PER_SENS * sane(s)
 }
 
-/// Measured right-stick response `(|deflection|, fraction of max rate)`.
-///
-/// Yaw (10 deflections, both directions) and pitch (3 deflections) share this
-/// normalised shape within 1 %, so one curve scaled per axis reproduces both.
-/// Everything at or below 0.65 is dead. Fitted from retail captures, not
-/// decompiled: the code that applies it is not yet located.
-pub const STICK_RESPONSE: [(f32, f32); 9] = [
-    (0.65, 0.0),
-    (0.70, 0.0758),
-    (0.75, 0.1323),
-    (0.80, 0.2211),
-    (0.85, 0.3366),
-    (0.90, 0.5065),
-    (0.95, 0.7259),
-    (1.00, 1.0),
-    (1.00, 1.0),
-];
+/// Camera-stick linear dead zone per axis (`cl_input_*_camera_deadzone_pc_
+/// linearLR/UD`). The exe registers a default of `0.1` (`DAT_0171e204`) for
+/// every camera set, but the shipped profile
+/// `gamedata/libs/config/meleeprototype.cfg` overrides the PC values to `0.3`
+/// for both nav and aim; the branch at `0x158a183` selects the aim set when the
+/// aim flag (`+0x20 & 0x20`) is set, otherwise nav, and feeds the live values
+/// into the shaping call at `0x158a22e`.
+pub const STICK_DEADZONE_LINEAR: f32 = 0.3;
 
-/// Fraction of the maximum stick rotation rate for a deflection magnitude,
-/// linearly interpolated through [`STICK_RESPONSE`].
+/// Nav camera-stick radial dead zone
+/// (`cl_input_nav_camera_deadzone_pc_radius`, cvar storage `0x1e8f0bc`).
+/// Exe registration default `0.24` (`DAT_0176f400`); the shipped profile
+/// overrides it to `0.1`. Live value used here.
+pub const STICK_DEADZONE_RADIUS: f32 = 0.1;
+
+/// Aim camera-stick radial dead zone
+/// (`cl_input_aim_camera_deadzone_pc_radius`, cvar storage `0x1e8f0d4`).
+/// Shipped-profile value `0.20` (`meleeprototype.cfg`); not covered by the
+/// nav capture, but the same shaping path (`0x158a183` -> `0x158a22e`).
+pub const STICK_AIM_DEADZONE_RADIUS: f32 = 0.20;
+
+/// Squared-magnitude floor below which the dead-zone function returns zero
+/// (`DAT_0172150c = 0.001`); a numerical guard, not the radial dead zone.
+pub const STICK_MAG_EPS_SQ: f32 = 0.001;
+
+/// Per-axis clamp `+1.0`/`-1.0` (`DAT_0171e0f0` / `DAT_0171e22c`); the sign
+/// flip uses the `0x80000000` mask (`DAT_0171e250`), which a scalar `-` does.
+const STICK_AXIS_MAX: f32 = 1.0;
+
+/// Linear dead-zone remap for one axis, exactly the first two blocks of
+/// `0x1587bb0`: clamp the deflection to `[-1, 1]`, then map `±linear` to `0`
+/// and `±1` to `±1`; inside the dead zone the result is `0`.
+fn stick_linear_deadzone(v: f32, linear: f32) -> f32 {
+    let v = sane(v);
+    let l = sane(linear).max(0.0);
+    if v > l {
+        (v.min(STICK_AXIS_MAX) - l) / (1.0 - l)
+    } else if v < -l {
+        (v.max(-STICK_AXIS_MAX) + l) / (1.0 - l)
+    } else {
+        0.0
+    }
+}
+
+/// Shape a raw right-stick `(x, y)` exactly as the player-input object does
+/// before the camera reads `+0xd8/+0xdc`.
+///
+/// The dead-zone function `0x1587bb0` (called at `0x158a22e` with the live
+/// `linearLR`, `linearUD`, `radius`) does the per-axis linear remap, then, if
+/// the resulting magnitude is at least `radius`, rescales the vector so the
+/// radius maps to `0` and unit magnitude to `1` (magnitudes above `1` are
+/// normalised). The caller at `0x158a233` then computes the magnitude of that
+/// vector and scales **each component** by `magnitude³`; a single axis
+/// therefore follows `deadzone_output⁴`. Results are in `-1..=1`.
+pub fn stick_shape(x: f32, y: f32, linear: f32, radius: f32) -> [f32; 2] {
+    let xl = stick_linear_deadzone(x, linear);
+    let yl = stick_linear_deadzone(y, linear);
+    let sum = xl * xl + yl * yl;
+    if !sum.is_finite() || sum < STICK_MAG_EPS_SQ {
+        return [0.0, 0.0];
+    }
+    let r = sane(radius).clamp(0.0, 1.0 - 1e-6);
+    let mag = sum.sqrt();
+    if mag < r {
+        return [0.0, 0.0];
+    }
+    let scale = if mag <= STICK_AXIS_MAX {
+        (mag - r) / (1.0 - r) / mag
+    } else {
+        1.0 / mag
+    };
+    let ox = xl * scale;
+    let oy = yl * scale;
+    let omag = (ox * ox + oy * oy).sqrt();
+    let cube = omag * omag * omag;
+    [cube * ox, cube * oy]
+}
+
+/// `(linear, radius)` stick dead zones for a camera mode (`0x158a183`).
+fn stick_deadzones(mode: CameraMode) -> (f32, f32) {
+    match mode {
+        CameraMode::Aim => (STICK_DEADZONE_LINEAR, STICK_AIM_DEADZONE_RADIUS),
+        _ => (STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS),
+    }
+}
+
+/// Fraction of the maximum stick rotation rate for a deflection magnitude `m`
+/// (the game's per-axis curve).
+///
+/// This is the magnitude of [`stick_shape`] for a single deflected axis, i.e.
+/// `deadzone_output⁴`, using the live nav dead zones. The measured retail
+/// shape (`cam_stick_fine.csv`) is reproduced within 0.6 deg/s: `0` through 0.65
+/// (the camera then gates values `<= 0.05`), then `0.0753 / 0.1324 / 0.2170 /
+/// 0.3370 / 0.5009 / 0.7184 / 1.0` at `0.70..1.00`, i.e. `6.8 / 11.9 / 19.5 /
+/// 30.3 / 45.1 / 64.7 / 90.0` deg/s against the `pi/2` max yaw rate.
 pub fn stick_response(m: f32) -> f32 {
-    let m = sane(m).abs().min(1.0);
-    if m <= STICK_RESPONSE[0].0 {
-        return 0.0;
-    }
-    for w in STICK_RESPONSE.windows(2) {
-        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-        if m <= x1 {
-            return if x1 > x0 { y0 + (y1 - y0) * (m - x0) / (x1 - x0) } else { y1 };
-        }
-    }
-    1.0
+    stick_shape(sane(m), 0.0, STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS)[0].abs()
 }
 
 /// Resolved rotation parameters for a [`CameraSet`] (`camera.md` §3.2).
@@ -1396,18 +1466,47 @@ mod tests {
         assert_eq!(s.yaw_vel, 0.0, "stops on release");
     }
 
-    /// The right stick reproduces the retail capture: dead through 0.65,
-    /// 90.1 °/s yaw at full deflection, same shape on pitch.
+    /// The right-stick shaping is the exact `0x1587bb0` + `0x158a233` pipeline
+    /// with the live `meleeprototype.cfg` dead zones (`linear 0.3`,
+    /// nav `radius 0.1`), and it reproduces `cam_stick_fine.csv`: full-stick
+    /// yaw is the `pi/2` rate; pitch shares the same normalised shape.
     #[test]
     fn stick_matches_retail_capture() {
         let deg = |r: f32| r.to_degrees();
+        // Linear dead zone: zero at/below 0.3, matching the value the branch
+        // feeds from `cl_input_*_camera_deadzone_pc_linearLR/UD`.
         assert_eq!(stick_response(0.25), 0.0);
-        assert_eq!(stick_response(0.65), 0.0);
-        let cases = [(0.70, 6.85), (0.75, 11.9), (0.80, 19.9), (0.85, 30.3), (0.90, 45.6), (0.95, 65.4), (1.0, 90.1)];
+        assert_eq!(stick_response(0.3), 0.0);
+        // Linear dead zone 0.3, then radial dead zone 0.1 combine to a shaped
+        // magnitude threshold of `0.3 + 0.7*0.1 = 0.37`.
+        assert_eq!(stick_response(0.37), 0.0);
+        assert!(stick_response(0.38) > 0.0);
+
+        // Independent closed form of the same math at a sample point:
+        // d = (0.7-0.3)/(1-0.3); t = (d-0.1)/(1-0.1); response = t^4.
+        let d = (0.70 - STICK_DEADZONE_LINEAR) / (1.0 - STICK_DEADZONE_LINEAR);
+        let shaped = (d - STICK_DEADZONE_RADIUS) / (1.0 - STICK_DEADZONE_RADIUS);
+        assert!((stick_response(0.70) - shaped.powi(4)).abs() < 1e-6);
+
+        // `cam_stick_fine.csv` (right-stick yaw, averaged over both
+        // directions). 0.65 shapes to ~0.039, below the camera's 0.05 gate, so
+        // no rotation is observed until ~0.67.
+        assert!((stick_response(0.65) - 0.0390).abs() < 2e-3);
+        let cases = [
+            (0.70, 6.82),
+            (0.75, 12.08),
+            (0.80, 19.58),
+            (0.85, 30.29),
+            (0.90, 44.97),
+            (0.95, 64.42),
+            (1.0, 90.43),
+        ];
         for (m, expect) in cases {
             let got = deg(stick_response(m) * CAM_YAW_SPEED);
-            assert!((got - expect).abs() < 0.5, "yaw at {m}: {got} vs {expect}");
+            assert!((got - expect).abs() < 0.7, "yaw at {m}: {got} vs {expect}");
         }
+        // Pitch shares the shape (`cl_cam` pitch speed is 80 deg): the CSV
+        // pitch rates at 0.85 are ~27.4 down / 26.4 up.
         let pitch85 = deg(stick_response(0.85) * CAM_PITCH_SPEED);
         assert!((pitch85 - 27.1).abs() < 1.0, "pitch at 0.85: {pitch85}");
 
@@ -1425,6 +1524,38 @@ mod tests {
         let mut l = CameraState::new();
         update(&mut l, &CameraInput { stick: [-0.9, 0.0], ..idle(false) }, &t, [0.0; 3]);
         assert!(l.yaw_vel < 0.0, "left stick turns the other way");
+
+        // 0.65 is below the camera gate: shaped but not rotated.
+        let mut dead = CameraState::new();
+        update(&mut dead, &CameraInput { stick: [0.65, 0.0], ..idle(false) }, &t, [0.0; 3]);
+        assert_eq!((dead.yaw_vel, dead.pitch_vel), (0.0, 0.0));
+    }
+
+    /// The full 2D shaping: a diagonal is dead-zone-remapped radially and its
+    /// two components are scaled by the vector magnitude cubed (`0x158a233`),
+    /// and magnitudes above `1` are normalised (`0x1587bb0` tail).
+    #[test]
+    fn stick_shape_is_radial_then_cubed() {
+        // Full X: `deadzone_output = 1`, cube -> 1.
+        let x = stick_shape(1.0, 0.0, STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS);
+        assert!((x[0] - 1.0).abs() < 1e-5 && x[1] == 0.0);
+
+        // A diagonal beyond the dead zone is symmetric on both axes.
+        let d = stick_shape(0.9, 0.9, STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS);
+        assert!((d[0] - d[1]).abs() < 1e-6 && d[0] > 0.0);
+
+        // Vectors longer than 1 are normalised: (1, 1) -> unit direction times
+        // the cube of magnitude 1 (the radial remap saturates at 1).
+        let n = stick_shape(1.0, 1.0, STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS);
+        let mag = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        assert!((mag - 1.0).abs() < 1e-4, "normalised magnitude {mag}");
+        assert!((n[0] - n[1]).abs() < 1e-6);
+
+        // Inside the radial dead zone both axes are zero.
+        assert_eq!(stick_shape(0.32, 0.0, STICK_DEADZONE_LINEAR, STICK_DEADZONE_RADIUS), [0.0, 0.0]);
+        // Total on non-finite input / degenerate radius.
+        let nan = stick_shape(f32::NAN, f32::INFINITY, f32::NAN, f32::NAN);
+        assert!(nan.iter().all(|v| v.is_finite()));
     }
 
     /// Expected mouse angular velocity for `(dx, dy)` counts in one frame.

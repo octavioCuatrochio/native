@@ -50,6 +50,7 @@ pub mod tuning;
 pub mod surfaces;
 pub mod tagpoints;
 pub mod terrain;
+pub mod tod;
 pub mod vegetation;
 pub mod view_system;
 pub mod zombie_ai;

@@ -5,6 +5,7 @@
 //!   * `asset`   - recognise/parse CryEngine assets (`.cgf`, `.dds`, `.mtl`).
 //!   * `script`  - run real game Lua (Lua 5.1) against a minimal engine API shim.
 
+pub mod ag_cost;
 pub mod ag_graph;
 pub mod ag_runtime;
 pub mod ai;

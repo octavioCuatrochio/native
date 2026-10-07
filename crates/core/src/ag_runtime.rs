@@ -471,6 +471,37 @@ impl Graph {
             .min_by(|&a, &b| cost(a).partial_cmp(&cost(b)).unwrap_or(std::cmp::Ordering::Equal))
     }
 
+    /// Expensive locomotion selection using the engine's own cost function.
+    ///
+    /// Convenience over [`pick_candidate_by_cost`](Graph::pick_candidate_by_cost):
+    /// `motion_of` yields each candidate's [`crate::ag_cost::CandidateMotion`]
+    /// (built from its animation clip's root motion; see
+    /// [`crate::ag_cost`]) and `desired` is the character's current movement.
+    /// Candidates without motion data are skipped. Mirrors `FUN_007cbaf0`
+    /// (`0x7cbaf0`), which keeps the running minimum (the last candidate wins a
+    /// tie).
+    pub fn pick_candidate_by_locomotion<F>(
+        &self,
+        candidates: &[usize],
+        motion_of: F,
+        desired: &crate::ag_cost::DesiredMotion,
+    ) -> Option<usize>
+    where
+        F: Fn(usize) -> Option<crate::ag_cost::CandidateMotion>,
+    {
+        let mut best: Option<(usize, f32)> = None;
+        for &i in candidates {
+            if let Some(m) = motion_of(i) {
+                let c = crate::ag_cost::locomotion_cost(&m, desired);
+                match best {
+                    Some((_, bc)) if c > bc => {}
+                    _ => best = Some((i, c)),
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
     /// Cheapest link path `from -> to` (link indices), or `None`.
     pub fn path(&self, from: usize, to: usize) -> Option<Vec<usize>> {
         if from == to {

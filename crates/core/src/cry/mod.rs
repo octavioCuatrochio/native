@@ -9,6 +9,7 @@ pub mod binds_system;
 mod cvar_table;
 pub mod constants;
 pub mod cvars;
+pub mod events;
 pub mod gamerules;
 pub mod host;
 pub mod mission;

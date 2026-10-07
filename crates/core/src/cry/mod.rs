@@ -6,6 +6,7 @@ pub mod actor;
 pub mod ai;
 pub mod ai_data;
 pub mod ai_loader;
+pub mod ai_runtime;
 pub mod binds_entity;
 pub mod binds_sound;
 pub mod binds_system;

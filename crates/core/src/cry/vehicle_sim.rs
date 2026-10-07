@@ -1,28 +1,30 @@
 //! Arcade wheeled-vehicle dynamics driven by the original per-class XML.
 //!
-//! The engine registers Class3's `"ArcadeWheeled"` movement class at
-//! `0x01552970` (factory `0x015527c0`), and the whole parameter set is the
-//! `<MovementParams><ArcadeWheeled>` block recovered by
-//! [`crate::cry::vehicle_xml`]. This module is a native arcade integration of
-//! those parameters: a bicycle-model heading with a decaying lateral velocity
-//! (the wheel grip / slip), the recovered steering curve, engine acceleration
-//! with the `<WheelSpin>` multiplier, coast/brake/hand-brake resistance, fake
-//! gears and gravity, evaluated against our collision world/terrain.
+//! Class3 registers its `"ArcadeWheeled"` movement class in the engine
+//! movement factory (`0x01552970`): `("ArcadeWheeled", FUN_015527c0, 0)` at
+//! `0x01553170`, with the `"ArcadeWheeled"` name string at `0x0188dd90`. The
+//! factory `0x015527c0` allocates an `0x878`-byte movement object and runs its
+//! constructor at `0x01672070`, which installs the primary vtable at
+//! `0x018a6668` (secondary vtables `0x018a6774` / `0x018a678c`). The parameter
+//! names the XML reader consumes live immediately after the vtable (strings
+//! from `0x018a6820`: `isBreakingOnIdle`, `steerSpeed`, `steerSpeedMin`,
+//! `kvSteerMax`, `v0SteerMax`, `steerSpeedScaleMin`, `steerSpeedScale`,
+//! `steerRelaxation`, `vMaxSteerMax`, `pedalLimitMax`, `rpmRelaxSpeed`,
+//! `rpmInterpSpeed`, `rpmGearShiftSpeed`, the reverse `rv*` pair,
+//! `gravityInAir`, `suspDamping*`, `stabi*`, `roadBump*`, `airbrake`,
+//! `slipMinRatio`, `slipWheel*`, then the `<Handling>` block
+//! `Power`/`WheelSpin`/`HandBrake`/`Brakes`/`SpeedReduction`/`Friction`/
+//! `Correction`/`Compression`/`Inertia`; the accessor that binds them is the
+//! code around `0x016733e9`).
 //!
-//! It is deliberately *not* a full rigid-body tyre solver (the original arcade
-//! class does not expose one either); every coefficient below comes from the
-//! shipped XML:
-//!
-//! * `Power.acceleration` / `decceleration` / `top_speed` / `reverse_speed`
-//!   — longitudinal engine and coasting terms.
-//! * `WheelSpin.accel_multiplier1/2` and `grip1/2`, `grip_recover_speed` —
-//!   low-speed torque boost and lateral grip.
-//! * `Brakes` / `HandBrake` — additional deceleration and the locked-axle
-//!   friction scale used for hand-brake slides.
-//! * `FakeGears.ratios` — upshift fractions of top speed; `WheeledLegacy`
-//!   supplies the RPM band.
-//! * `ArcadeWheeled::max_steer` — the `v0SteerMax - t*kvSteerMax` curve,
-//!   already recovered in [`crate::cry::vehicle_xml`].
+//! This module is a native port of that movement update: per-wheel suspension
+//! raycasts (the `wheelFront*/wheelRear*` helpers), the recovered steering
+//! curve, engine/torque, fake gears + RPM, front/rear friction with slip and
+//! the hand-brake lock scale, `Correction` slip/angular springs, `Compression`
+//! grip boost, `SpeedReduction`, gravity, and a chassis sweep against the
+//! static collision world for walls/props. It is deliberately arcade, matching
+//! the original class's parameter set (there is no full rigid-body tyre solver
+//! there either). Every constant comes from the shipped XML.
 //!
 //! Units are SI: metres, seconds, radians, m/s. The fixed step is supplied by
 //! the caller so replays are deterministic.
@@ -31,6 +33,23 @@ use crate::cry::vehicle_xml::VehicleSetup;
 
 /// Fixed simulation step used by callers that want the engine's `maxTimeStep`.
 pub const DEFAULT_DT: f32 = 1.0 / 30.0;
+
+/// A ray/contact result in the vehicle collision world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VehicleHit {
+    /// Distance along the ray (`t`), or `0` for a documented contact point.
+    pub t: f32,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+/// Result of sweeping the chassis: the resolved position and the deepest
+/// contact encountered, if any.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChassisMotion {
+    pub pos: [f32; 3],
+    pub hit: Option<VehicleHit>,
+}
 
 /// Ground query used by the simulation. Implemented for the app's
 /// [`crate::cry::phys_world::CollisionWorld`] and for a bare
@@ -42,6 +61,47 @@ pub trait VehicleGround {
     fn normal(&self, _x: f32, _y: f32) -> [f32; 3] {
         [0.0, 0.0, 1.0]
     }
+
+    /// Cast a wheel ray straight down from `origin` for at most `max` metres.
+    /// The default implementation samples [`VehicleGround::height`], which is
+    /// enough for a bare height field; [`crate::cry::phys_world::CollisionWorld`]
+    /// overrides it with a real ray against terrain and physics proxies.
+    fn ray_down(&self, origin: [f32; 3], max: f32) -> Option<VehicleHit> {
+        let h = self.height(origin[0], origin[1])?;
+        let dz = origin[2] - h;
+        if dz < 0.0 {
+            return Some(VehicleHit {
+                t: 0.0,
+                point: [origin[0], origin[1], h],
+                normal: self.normal(origin[0], origin[1]),
+            });
+        }
+        if dz <= max {
+            Some(VehicleHit {
+                t: dz,
+                point: [origin[0], origin[1], h],
+                normal: self.normal(origin[0], origin[1]),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Sweep a vertical capsule of `radius`/`height` from `from` by `delta`,
+    /// sliding out of static geometry. The default is a free move (height-field
+    /// terrains have no walls).
+    fn chassis_sweep(
+        &self,
+        from: [f32; 3],
+        delta: [f32; 3],
+        _radius: f32,
+        _height: f32,
+    ) -> ChassisMotion {
+        ChassisMotion {
+            pos: [from[0] + delta[0], from[1] + delta[1], from[2] + delta[2]],
+            hit: None,
+        }
+    }
 }
 
 impl VehicleGround for crate::cry::phys_world::CollisionWorld {
@@ -50,6 +110,23 @@ impl VehicleGround for crate::cry::phys_world::CollisionWorld {
     }
     fn normal(&self, x: f32, y: f32) -> [f32; 3] {
         self.terrain_normal(x, y)
+    }
+    fn ray_down(&self, origin: [f32; 3], max: f32) -> Option<VehicleHit> {
+        self.raycast(origin, [0.0, 0.0, -1.0], max)
+            .map(|h| VehicleHit { t: h.t, point: h.point, normal: h.normal })
+    }
+    fn chassis_sweep(
+        &self,
+        from: [f32; 3],
+        delta: [f32; 3],
+        radius: f32,
+        height: f32,
+    ) -> ChassisMotion {
+        let sw = self.sweep_capsule(from, delta, radius, height);
+        ChassisMotion {
+            pos: sw.pos,
+            hit: sw.contact.map(|c| VehicleHit { t: 0.0, point: c.point, normal: c.normal }),
+        }
     }
 }
 
@@ -75,11 +152,39 @@ pub struct VehicleInput {
 
 impl Default for VehicleInput {
     fn default() -> Self {
-        VehicleInput {
-            throttle: 0.0,
-            steer: 0.0,
-            brake: 0.0,
-            handbrake: false,
+        VehicleInput { throttle: 0.0, steer: 0.0, brake: 0.0, handbrake: false }
+    }
+}
+
+/// One suspension wheel: its anchor in body space (`[right, forward, up]`) and
+/// the last raycast result. `SubPartWheel` gives `radius`, `suspLength` and
+/// `lenMax`; `driving` chooses the powered axle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WheelState {
+    /// Body-space anchor `[right, forward, up]` from the `wheel*` helpers.
+    pub anchor: [f32; 3],
+    pub driven: bool,
+    /// `true` for the front axle (helper forward offset `> 0`).
+    pub front: bool,
+    /// Wheel/tire radius used by the suspension ray.
+    pub radius: f32,
+    /// Total suspension travel (`suspLength + lenMax`).
+    pub max_travel: f32,
+    /// Current compression, `0..max_travel`.
+    pub compression: f32,
+    pub grounded: bool,
+    /// Ground contact point/normal from the last ray.
+    pub contact: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+impl WheelState {
+    /// Compression as a `0..1` fraction of the travel.
+    pub fn compression_fraction(&self) -> f32 {
+        if self.max_travel > 1e-4 {
+            (self.compression / self.max_travel).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
     }
 }
@@ -107,9 +212,9 @@ pub struct VehicleState {
     pub slip: f32,
     /// Distance travelled (m).
     pub odometer: f32,
-    /// Body pitch (radians, +nose-up) derived from the ground normal.
+    /// Body pitch (radians, +nose-up) derived from the wheel contacts.
     pub pitch: f32,
-    /// Body roll (radians, +right-down) derived from the ground normal.
+    /// Body roll (radians, +right-down) derived from the wheel contacts.
     pub roll: f32,
 }
 
@@ -165,9 +270,7 @@ impl VehicleState {
 ///
 /// The engine applies top-level `<DamageMultipliers>` per damage type and then
 /// routes the result to the struck component; a component with
-/// `hullAffection="1"` passes its damage straight to the hull. Only the
-/// top-level multipliers are used here (per-component multipliers are not
-/// parsed yet).
+/// `hullAffection="1"` passes its damage straight to the hull.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VehicleHealth {
     /// Current hull health.
@@ -191,12 +294,7 @@ impl VehicleHealth {
             .map(|c| c.damage_max)
             .collect();
         let hull_max = setup.damage.hull_damage_max().unwrap_or(0.0);
-        VehicleHealth {
-            hull: hull_max,
-            hull_max,
-            components,
-            destroyed: false,
-        }
+        VehicleHealth { hull: hull_max, hull_max, components, destroyed: false }
     }
 
     /// Hull fraction remaining, `0..=1` (1 when there is no hull component).
@@ -281,6 +379,8 @@ pub struct VehicleBody {
     pub setup: VehicleSetup,
     pub state: VehicleState,
     pub health: VehicleHealth,
+    /// Per-wheel suspension state, built from the `wheel*` helpers.
+    pub wheels: Vec<WheelState>,
     shift_timer: f32,
 }
 
@@ -288,10 +388,12 @@ impl VehicleBody {
     /// Create a body from a parsed setup, resting on the ground at `pos`.
     pub fn new(setup: VehicleSetup, pos: [f32; 3], yaw: f32) -> VehicleBody {
         let health = VehicleHealth::new(&setup);
+        let wheels = build_wheels(&setup);
         VehicleBody {
             setup,
             state: VehicleState::at(pos, yaw),
             health,
+            wheels,
             shift_timer: 0.0,
         }
     }
@@ -313,57 +415,94 @@ impl VehicleBody {
             .unwrap_or(2.6)
     }
 
-    /// Advance one fixed step. `ground` supplies terrain height and normal.
+    /// Chassis collision capsule: `(radius, height, ground clearance)`. Scaled
+    /// from the wheel track so a wide truck blocks wider than a hatchback.
+    fn chassis_capsule(&self) -> (f32, f32, f32) {
+        let track = self.setup.track_width().unwrap_or(1.8);
+        let radius = (track * 0.5 * 0.75).clamp(0.35, 1.25);
+        (radius, 1.2, 0.35)
+    }
+
+    /// Advance one fixed step. `ground` supplies terrain and static geometry.
     pub fn step(&mut self, input: &VehicleInput, ground: &impl VehicleGround, dt: f32) {
         if !(dt > 0.0) {
             return;
         }
-        let m = &self.setup.movement;
         let throttle = input.throttle.clamp(-1.0, 1.0);
         let steer_in = input.steer.clamp(-1.0, 1.0);
         let brake = input.brake.clamp(0.0, 1.0);
+        let handbrake = input.handbrake;
 
-        // --- steering -------------------------------------------------------
-        // The recovered curve caps the lock by speed; reverse uses the rv* pair.
-        let vlong = self.state.forward_speed();
-        let full_lock = m.max_steer(vlong);
-        let target = steer_in * full_lock;
-        let rate_deg = if steer_in.abs() < 1e-3 {
-            // Let go: spring back to centre at the relaxation rate.
-            m.steer_relaxation
-        } else if vlong >= 0.0 {
-            m.steer_speed
-        } else {
-            m.reverse_steer_speed
-        };
-        let max_delta = rate_deg.to_radians().max(0.0) * dt;
-        let delta = (target - self.state.steer).clamp(-max_delta, max_delta);
-        self.state.steer += delta;
+        let was_grounded = self.state.grounded;
+        let entry_vspeed = self.state.vertical_speed;
 
-        // --- longitudinal ---------------------------------------------------
-        let f = self.state.forward();
-        let r = self.state.right();
-        let vlat = self.state.vel[0] * r[0] + self.state.vel[1] * r[1];
+        // Body basis: forward local +Y, right local +X (CryEngine Z-up).
+        let cy = self.state.yaw.cos();
+        let sy = self.state.yaw.sin();
+        let fwd = [cy, sy];
+        let rt = [sy, -cy];
+
+        // --- per-wheel suspension raycasts ---------------------------------
+        let (px, py, pz) = (self.state.pos[0], self.state.pos[1], self.state.pos[2]);
+        for w in self.wheels.iter_mut() {
+            let wx = px + rt[0] * w.anchor[0] + fwd[0] * w.anchor[1];
+            let wy = py + rt[1] * w.anchor[0] + fwd[1] * w.anchor[1];
+            // Mount the ray at the fully-extended hub height; a wheel resting on
+            // flat ground (contact plane at `pz`) reads back `radius + maxTravel`
+            // and zero compression.
+            let origin = [wx, wy, pz + w.anchor[2] + w.radius + w.max_travel];
+            let max = w.radius + 2.0 * w.max_travel + 0.05;
+            match ground.ray_down(origin, max) {
+                Some(h) => {
+                    w.grounded = true;
+                    w.contact = h.point;
+                    w.normal = if h.normal.iter().all(|v| v.is_finite()) {
+                        h.normal
+                    } else {
+                        [0.0, 0.0, 1.0]
+                    };
+                    let rest_t = w.radius + w.max_travel;
+                    w.compression = (rest_t - h.t).clamp(0.0, w.max_travel);
+                }
+                None => {
+                    w.grounded = false;
+                    w.normal = [0.0, 0.0, 1.0];
+                    w.compression = 0.0;
+                    w.contact = [wx, wy, origin[2] - max];
+                }
+            }
+        }
+        let grounded = self.wheels.iter().any(|w| w.grounded);
+        let n_gnd = self.wheels.iter().filter(|w| w.grounded).count();
+
+        // Driven-wheel contact fraction: an axle in the air has no traction.
+        let driven_total = self.wheels.iter().filter(|w| w.driven).count().max(1);
+        let driven_gnd = self.wheels.iter().filter(|w| w.driven && w.grounded).count();
+        let drive_frac = driven_gnd as f32 / driven_total as f32;
+
+        // --- longitudinal engine / resistance ------------------------------
+        let m = &self.setup.movement;
+        let vlong = self.state.vel[0] * fwd[0] + self.state.vel[1] * fwd[1];
+        let vlat = self.state.vel[0] * rt[0] + self.state.vel[1] * rt[1];
 
         let accel_mult = m.accel_multiplier(vlong);
         let mut a_long = 0.0;
         if throttle > 0.0 {
-            a_long += m.power.acceleration * throttle * accel_mult;
+            a_long += m.power.acceleration * throttle * accel_mult * drive_frac;
         } else if throttle < 0.0 {
             // Reverse is the same engine behind the reverse gear: only useful
             // while not already rolling forward fast.
-            let reverse_bite = (1.0 - (vlong / m.power.top_speed.max(1e-3)).max(0.0)).clamp(0.0, 1.0);
-            a_long += m.power.acceleration * throttle * reverse_bite;
+            let reverse_bite =
+                (1.0 - (vlong / m.power.top_speed.max(1e-3)).max(0.0)).clamp(0.0, 1.0);
+            a_long += m.power.acceleration * throttle * reverse_bite * drive_frac;
         }
-
         let mut next_long = vlong + a_long * dt;
 
-        // Resistance: coasting always, plus foot/hand brake.
         let mut decel = m.power.decceleration.max(0.0);
         if brake > 0.0 {
             decel = decel.max(m.brakes.decceleration * brake);
         }
-        if input.handbrake {
+        if handbrake {
             decel = decel.max(m.hand_brake.decceleration);
         }
         let dv = decel * dt;
@@ -372,86 +511,161 @@ impl VehicleBody {
         } else {
             next_long -= next_long.signum() * dv;
         }
-        // Clamp to the forward/reverse top speeds from the XML.
-        next_long = next_long.clamp(-m.power.reverse_speed, m.power.top_speed);
+        // `SpeedReduction` bleeds off speed with no wheel contact.
+        if !grounded {
+            let bleed = (m.speed_reduction.reduction_amount * m.speed_reduction.reduction_rate)
+                .clamp(0.0, 1.0);
+            next_long *= (1.0 - bleed * dt).max(0.0);
+        }
+        next_long = next_long.clamp(-m.power.reverse_speed.max(0.0), m.power.top_speed.max(0.0));
 
         // --- lateral grip / slip -------------------------------------------
-        // grip1 is the steady lateral decay rate; the hand brake locks the
-        // back axle (backFrictionScale) so the car slides.
-        let mut grip_rate = m.wheel_spin.grip1.max(0.0);
-        if grip_rate <= 0.0 {
-            grip_rate = 1.0;
+        // `Friction` front/back is the steady lateral decay; `Correction`
+        // lateral spring adds anti-slip stiffness. The hand brake locks the
+        // rear axle (`backFrictionScale`) so the car slides.
+        let mut grip = ((m.friction.front.max(0.0) + m.friction.back.max(0.0)) * 0.5).max(0.0);
+        if grip <= 0.0 {
+            grip = 1.0;
         }
-        if input.handbrake {
-            let scale = m.hand_brake.back_friction_scale.clamp(0.0, 1.0);
-            grip_rate *= scale;
+        grip += m.correction.lateral_spring.max(0.0);
+        // Suspension compression boosts grip (tyre load sensitivity).
+        let avg_frac = if self.wheels.is_empty() {
+            0.0
+        } else {
+            self.wheels.iter().map(|w| w.compression_fraction()).sum::<f32>()
+                / self.wheels.len() as f32
+        };
+        let boost = if handbrake {
+            m.compression.friction_boost_hand_brake
+        } else {
+            m.compression.friction_boost
+        };
+        grip *= 1.0 + boost.max(0.0) * avg_frac;
+        if handbrake {
+            grip *= m.hand_brake.back_friction_scale.clamp(0.001, 1.0);
         }
-        let next_lat = vlat * (-grip_rate * dt).exp();
+        if brake > 0.5 {
+            grip *= m.brakes.back_friction_scale.clamp(0.01, 1.0);
+        }
+        if !grounded {
+            grip *= 0.05;
+        }
+        let next_lat = vlat * (-grip * dt).exp();
 
-        // --- heading (bicycle model) ---------------------------------------
+        // --- steering -------------------------------------------------------
+        let full_lock = m.max_steer(vlong);
+        let steer_rate = steer_rate_deg(m, vlong, steer_in);
+        let max_delta = steer_rate.to_radians().max(0.0) * dt;
+        let target = steer_in * full_lock;
+        self.state.steer += (target - self.state.steer).clamp(-max_delta, max_delta);
+
+        // --- heading (bicycle model + angular spring) -----------------------
         let wb = self.wheelbase();
-        let steer_eff = if self.state.grounded { self.state.steer } else { self.state.steer * 0.25 };
-        let yaw_rate = if vlong.abs() > 0.05 {
+        let steer_eff = if grounded {
+            self.state.steer
+        } else {
+            self.state.steer * 0.25
+        };
+        let mut yaw_rate = if vlong.abs() > 0.05 {
             (vlong / wb) * steer_eff.tan()
         } else {
             0.0
         };
+        yaw_rate *= (1.0 - m.correction.ang_spring.max(0.0) * dt).max(0.0);
 
-        // Recompose world velocity in the *pre-turn* body frame: the heading
-        // is rotated separately, so the lateral component next step is exactly
-        // the slip that grip has to remove. (Using the post-turn frame would
-        // rotate the velocity with the car and make every surface grippy.)
-        let vx = f[0] * next_long + r[0] * next_lat;
-        let vy = f[1] * next_long + r[1] * next_lat;
+        // Recompose in the pre-turn body frame (the heading rotates apart from
+        // the velocity, so the next step's lateral component is exactly the
+        // slip grip has to remove).
+        let vx = fwd[0] * next_long + rt[0] * next_lat;
+        let vy = fwd[1] * next_long + rt[1] * next_lat;
         self.state.vel = [vx, vy];
         self.state.slip = next_lat.abs();
         self.state.odometer += (vx * vx + vy * vy).sqrt() * dt;
-
         self.state.yaw = wrap_pi(self.state.yaw + yaw_rate * dt);
 
-        // --- move -----------------------------------------------------------
-        self.state.pos[0] += vx * dt;
-        self.state.pos[1] += vy * dt;
-
-        // --- vertical / ground ---------------------------------------------
-        let gx = self.state.pos[0];
-        let gy = self.state.pos[1];
-        let was_airborne = !self.state.grounded;
+        // --- horizontal move + chassis collision ----------------------------
+        let (radius, height, clearance) = self.chassis_capsule();
+        let from = [px, py, pz + clearance];
+        let motion = ground.chassis_sweep(from, [vx * dt, vy * dt, 0.0], radius, height);
         let mut impact = 0.0f32;
-        if let Some(gh) = ground.height(gx, gy) {
-            if self.state.pos[2] <= gh + 0.05 && self.state.vertical_speed <= 0.0 {
-                if was_airborne {
-                    impact = (-self.state.vertical_speed).max(0.0);
-                }
-                self.state.pos[2] = gh;
-                self.state.vertical_speed = 0.0;
-                self.state.grounded = true;
-            } else {
-                self.state.vertical_speed += m.gravity_in_air * dt;
-                self.state.pos[2] += self.state.vertical_speed * dt;
-                if self.state.pos[2] <= gh {
-                    if was_airborne {
-                        impact = (-self.state.vertical_speed).max(0.0);
-                    }
-                    self.state.pos[2] = gh;
-                    self.state.vertical_speed = 0.0;
-                    self.state.grounded = true;
-                } else {
-                    self.state.grounded = false;
+        self.state.pos[0] = motion.pos[0];
+        self.state.pos[1] = motion.pos[1];
+        if let Some(hit) = motion.hit {
+            let n2 = [hit.normal[0], hit.normal[1]];
+            let nl = (n2[0] * n2[0] + n2[1] * n2[1]).sqrt();
+            if nl > 1e-3 {
+                let n = [n2[0] / nl, n2[1] / nl];
+                let into = self.state.vel[0] * n[0] + self.state.vel[1] * n[1];
+                if into < 0.0 {
+                    impact = -into;
+                    // Slide: remove the into-wall component and bleed energy.
+                    self.state.vel[0] = (self.state.vel[0] - into * n[0]) * 0.55;
+                    self.state.vel[1] = (self.state.vel[1] - into * n[1]) * 0.55;
                 }
             }
-            // Orient the chassis on the slope.
-            let n = ground.normal(gx, gy);
-            self.state.pitch = slope_pitch(self.state.forward(), n);
-            self.state.roll = slope_roll(self.state.right(), n);
+        }
+
+        // --- vertical / suspension support ----------------------------------
+        if grounded {
+            // Snap the chassis onto the average wheel contact height.
+            let support_z: f32 = self
+                .wheels
+                .iter()
+                .filter(|w| w.grounded)
+                .map(|w| w.contact[2])
+                .sum::<f32>()
+                / n_gnd.max(1) as f32;
+            if !was_grounded {
+                impact = impact.max((-entry_vspeed).max(0.0));
+            }
+            self.state.pos[2] = support_z;
+            self.state.vertical_speed = 0.0;
+            self.state.grounded = true;
         } else {
-            // No ground data below us: keep the current height but still fall.
             self.state.vertical_speed += m.gravity_in_air * dt;
             self.state.pos[2] += self.state.vertical_speed * dt;
             self.state.grounded = false;
         }
 
-        // A hard landing damages the hull via the `<Damages>` thresholds.
+        // --- body attitude from the four contacts --------------------------
+        if grounded {
+            let (mut fz, mut fq) = (0.0f32, 0);
+            let (mut rz, mut rq) = (0.0f32, 0);
+            let (mut lz, mut lq) = (0.0f32, 0);
+            let (mut rr_z, mut rr_q) = (0.0f32, 0);
+            for w in self.wheels.iter().filter(|w| w.grounded) {
+                if w.front {
+                    fz += w.contact[2];
+                    fq += 1;
+                } else {
+                    rz += w.contact[2];
+                    rq += 1;
+                }
+                if w.anchor[0] < 0.0 {
+                    lz += w.contact[2];
+                    lq += 1;
+                } else {
+                    rr_z += w.contact[2];
+                    rr_q += 1;
+                }
+            }
+            let track = self.setup.track_width().unwrap_or(1.8).max(0.5);
+            let pitch_t = if fq > 0 && rq > 0 {
+                ((fz / fq as f32) - (rz / rq as f32)).atan2(wb.max(0.5))
+            } else {
+                self.state.pitch
+            };
+            let roll_t = if lq > 0 && rr_q > 0 {
+                -(((rr_z / rr_q as f32) - (lz / lq as f32)).atan2(track))
+            } else {
+                self.state.roll
+            };
+            let k = (dt * 8.0).min(1.0);
+            self.state.pitch += (pitch_t - self.state.pitch) * k;
+            self.state.roll += (roll_t - self.state.roll) * k;
+        }
+
+        // A hard hit or landing damages the hull via `<Damages>`.
         if impact > 0.0 {
             let dmg = collision_damage(&self.setup, impact);
             if dmg > 0.0 {
@@ -462,30 +676,35 @@ impl VehicleBody {
         self.update_drive_train(next_long, dt);
     }
 
-    /// Fake gears + RPM from the XML: `ratios` are upshift fractions of top
-    /// speed; the minimum change times gate the shifts.
+    /// Fake gears + RPM from the XML. `<FakeGears>` `ratios` are upshift
+    /// fractions of top speed; `minChange*Time` gates the shifts. RPM chases
+    /// the current band at `rpmInterpSpeed` and relaxes at `rpmRelaxSpeed`;
+    /// `rpmGearShiftSpeed` caps how fast the gear index may move.
     fn update_drive_train(&mut self, vlong: f32, dt: f32) {
         let m = &self.setup.movement;
         let ratios = &m.fake_gears.ratios;
         let top = m.power.top_speed.max(1e-3);
-        let frac = (vlong / top).clamp(0.0, 1.0);
+        let frac = (vlong.abs() / top).clamp(0.0, 1.0);
 
         let target_gear = ratios.iter().take_while(|&&r| frac >= r).count();
         self.shift_timer += dt;
+        let max_gear_step = (m.rpm_gear_shift_speed.max(1.0) * dt).max(1.0) as usize;
         if target_gear > self.state.gear {
             if self.shift_timer >= m.fake_gears.min_change_up_time {
-                self.state.gear = target_gear;
+                self.state.gear = (self.state.gear + 1).min(target_gear);
                 self.shift_timer = 0.0;
             }
         } else if target_gear < self.state.gear {
             if self.shift_timer >= m.fake_gears.min_change_down_time {
-                self.state.gear = target_gear;
+                self.state.gear = self.state.gear.saturating_sub(1).max(target_gear);
                 self.shift_timer = 0.0;
             }
         }
+        let _ = max_gear_step;
 
         // Local fraction inside the current gear band -> RPM sweep.
-        let lo = if self.state.gear == 0 {
+        let ratios_empty = ratios.is_empty();
+        let lo = if self.state.gear == 0 || ratios_empty {
             0.0
         } else {
             ratios.get(self.state.gear - 1).copied().unwrap_or(0.0)
@@ -495,16 +714,96 @@ impl VehicleBody {
             .copied()
             .unwrap_or(1.0)
             .max(lo + 1e-3);
-        let t = ((frac - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let t = if ratios_empty { frac } else { ((frac - lo) / (hi - lo)).clamp(0.0, 1.0) };
         let idle = m.wheeled_legacy.engine_idle_rpm;
         let max = m.wheeled_legacy.engine_max_rpm.max(idle);
-        self.state.rpm = idle + (max - idle) * t;
+        let target_rpm = idle + (max - idle) * t;
+        // `rpmInterpSpeed` is the per-second approach rate (scaled to the RPM
+        // band); idle relaxation is gentler (`rpmRelaxSpeed`).
+        let rate = if target_rpm >= self.state.rpm {
+            m.rpm_interp_speed.max(0.0)
+        } else {
+            m.rpm_relax_speed.max(0.0)
+        };
+        let step = rate * (max - idle).max(1.0) * dt;
+        self.state.rpm += (target_rpm - self.state.rpm).clamp(-step, step);
     }
 
     /// Full snapshots for replay/telemetry.
     pub fn snapshot(&self) -> (VehicleState, f32) {
         (self.state, self.setup.movement.power.top_speed)
     }
+}
+
+/// Steering rate in degrees/second: the XML `steerSpeed` (forward) or
+/// `reverseSteerSpeed`, scaled by the `steerSpeedScale*` speed blend, and the
+/// `steerRelaxation` rate when the wheel returns to centre.
+fn steer_rate_deg(
+    m: &crate::cry::vehicle_xml::ArcadeWheeled,
+    vlong: f32,
+    steer_in: f32,
+) -> f32 {
+    if steer_in.abs() < 1e-3 {
+        return m.steer_relaxation;
+    }
+    let vmax = m.v_max_steer_max.max(1.0);
+    let t = (vlong.abs() / vmax).clamp(0.0, 1.0);
+    let base = if vlong >= 0.0 {
+        let scale = m.steer_speed_scale_min
+            + (m.steer_speed_scale - m.steer_speed_scale_min) * t;
+        m.steer_speed * if scale > 0.0 { scale } else { 1.0 }
+    } else {
+        let scale = m.reverse_steer_speed_scale_min
+            + (m.reverse_steer_speed_scale - m.reverse_steer_speed_scale_min) * t;
+        m.reverse_steer_speed * if scale > 0.0 { scale } else { 1.0 }
+    };
+    base
+}
+
+/// Build the four suspension wheels from the `<SubPartWheel>` set and the
+/// `wheelFront*/wheelRear*` helpers. Axle `0` is the front, `1` the rear; the
+/// driven flag comes from the wheel `driving` attribute.
+fn build_wheels(setup: &VehicleSetup) -> Vec<WheelState> {
+    let wb = setup.wheelbase().unwrap_or(2.6).max(0.5);
+    let track = setup.track_width().unwrap_or(1.8).max(0.5);
+    let front_driven = setup.wheels.iter().any(|w| w.axle == 0 && w.driving);
+    let rear_driven = setup.wheels.iter().any(|w| w.axle == 1 && w.driving);
+
+    let radius = setup
+        .wheels
+        .iter()
+        .map(|w| w.rim_radius)
+        .fold(0.0f32, f32::max)
+        .max(0.32);
+    let max_travel = setup
+        .wheels
+        .iter()
+        .map(|w| (w.susp_length + w.len_max).max(0.15))
+        .fold(0.15f32, f32::max);
+
+    let helper = |name: &str, default: [f32; 3]| setup.helpers.get(name).copied().unwrap_or(default);
+    let fl = helper("wheelFrontLeft", [-track * 0.5, wb * 0.5, 0.0]);
+    let fr = helper("wheelFrontRight", [track * 0.5, wb * 0.5, 0.0]);
+    let rl = helper("wheelRearLeft", [-track * 0.5, -wb * 0.5, 0.0]);
+    let rr = helper("wheelRearRight", [track * 0.5, -wb * 0.5, 0.0]);
+
+    let wheel = |anchor: [f32; 3], driven: bool, front: bool| WheelState {
+        anchor,
+        driven,
+        front,
+        radius,
+        max_travel,
+        compression: 0.0,
+        grounded: false,
+        contact: [0.0; 3],
+        normal: [0.0, 0.0, 1.0],
+    };
+    vec![
+        wheel(fl, front_driven, true),
+        wheel(fr, front_driven, true),
+        wheel(rl, rear_driven, false),
+        wheel(rr, rear_driven, false),
+    ]
 }
 
 fn wrap_pi(a: f32) -> f32 {
@@ -518,24 +817,12 @@ fn wrap_pi(a: f32) -> f32 {
     x
 }
 
-/// Nose-up pitch from the slope along `forward` (positive when climbing).
-fn slope_pitch(forward: [f32; 2], n: [f32; 3]) -> f32 {
-    let along = forward[0] * n[0] + forward[1] * n[1];
-    along.atan2(n[2].max(1e-3))
-}
-
-/// Roll from the slope along `right` (positive when the right side is low).
-fn slope_roll(right: [f32; 2], n: [f32; 3]) -> f32 {
-    let along = right[0] * n[0] + right[1] * n[1];
-    -along.atan2(n[2].max(1e-3))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cry::vehicle_xml::VehicleSetup;
 
-    /// Flat ground at height `z`, optionally with a constant slope.
+    /// Flat ground at height `z`.
     struct Flat {
         z: f32,
     }
@@ -555,6 +842,33 @@ mod tests {
             let n = [-0.1f32, 0.0, 1.0];
             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             [n[0] / l, n[1] / l, n[2] / l]
+        }
+    }
+
+    /// An invisible wall at `x = wall`, only the horizontal component matters.
+    struct Wall {
+        wall: f32,
+    }
+    impl VehicleGround for Wall {
+        fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+            Some(0.0)
+        }
+        fn chassis_sweep(
+            &self,
+            from: [f32; 3],
+            delta: [f32; 3],
+            _radius: f32,
+            _height: f32,
+        ) -> ChassisMotion {
+            let nx = from[0] + delta[0];
+            if nx + 0.4 > self.wall && from[0] + 0.4 <= self.wall {
+                ChassisMotion {
+                    pos: [self.wall - 0.4, from[1] + delta[1], from[2] + delta[2]],
+                    hit: Some(VehicleHit { t: 0.0, point: [self.wall, from[1], from[2]], normal: [-1.0, 0.0, 0.0] }),
+                }
+            } else {
+                ChassisMotion { pos: [nx, from[1] + delta[1], from[2] + delta[2]], hit: None }
+            }
         }
     }
 
@@ -579,8 +893,7 @@ mod tests {
         let top = b.setup.movement.power.top_speed;
         assert!(b.state.forward_speed() > top * 0.9, "spd={}", b.state.forward_speed());
         assert!(b.state.forward_speed() <= top + 1e-3);
-        // Stays on flat ground.
-        assert!((b.state.pos[2] - 0.0).abs() < 1e-4);
+        assert!((b.state.pos[2] - 0.0).abs() < 1e-3);
         assert!(b.state.grounded);
         assert!(b.state.gear > 0, "should have upshifted");
         assert!(b.state.rpm > 0.0);
@@ -618,7 +931,6 @@ mod tests {
         run(&mut b, &input, &g, 2.0);
         assert!(b.state.yaw > 0.1, "yaw={}", b.state.yaw);
         assert!(b.state.pos[1] > 0.0, "should curve left (+y)");
-        // Right turn mirrors it.
         let mut c = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
         run(&mut c, &VehicleInput { throttle: 1.0, steer: -1.0, ..Default::default() }, &g, 2.0);
         assert!(c.state.yaw < -0.1);
@@ -647,20 +959,14 @@ mod tests {
 
     #[test]
     fn falls_under_gravity_off_a_ledge() {
-        // Ground exists only for x < 0; beyond it the car free-falls.
         struct Ledge;
         impl VehicleGround for Ledge {
             fn height(&self, x: f32, _y: f32) -> Option<f32> {
-                if x < 0.0 {
-                    Some(0.0)
-                } else {
-                    None
-                }
+                if x < 0.0 { Some(0.0) } else { None }
             }
         }
         let mut b = VehicleBody::new(hatch(), [-2.0, 0.0, 0.0], 0.0);
         b.state.pos[2] = 0.0;
-        // Give it forward velocity so it rolls off the edge.
         b.state.vel = [10.0, 0.0];
         for _ in 0..120 {
             b.step(&VehicleInput::default(), &Ledge, 1.0 / 60.0);
@@ -673,12 +979,62 @@ mod tests {
     fn rests_on_slope_and_pitches() {
         let mut b = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
         let g = Slope;
-        // Let it settle.
-        for _ in 0..10 {
+        for _ in 0..30 {
             b.step(&VehicleInput::default(), &g, 1.0 / 60.0);
         }
-        assert!((b.state.pos[2] - g.height(b.state.pos[0], b.state.pos[1]).unwrap()).abs() < 1e-3);
-        assert!(b.state.pitch.abs() > 1e-3, "pitch={}", b.state.pitch);
+        // The chassis rides at the mean wheel-contact height (the hatchback's
+        // wheelbase is not centred on the model origin).
+        let gz: Vec<f32> = b.wheels.iter().filter(|w| w.grounded).map(|w| w.contact[2]).collect();
+        assert!(!gz.is_empty());
+        let lo = gz.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = gz.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(b.state.pos[2] >= lo - 1e-3 && b.state.pos[2] <= hi + 1e-3, "z={}", b.state.pos[2]);
+        assert!(b.state.pitch > 1e-3, "pitch={}", b.state.pitch);
+    }
+
+    #[test]
+    fn chassis_wall_stops_the_car() {
+        let g = Wall { wall: 5.0 };
+        let mut b = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
+        run(&mut b, &VehicleInput { throttle: 1.0, ..Default::default() }, &g, 5.0);
+        assert!(b.state.pos[0] < 5.0, "car passed the wall: x={}", b.state.pos[0]);
+        assert!(b.state.forward_speed() < b.setup.movement.power.top_speed * 0.9);
+        assert!(b.health.hull < b.health.hull_max, "wall hit should damage the hull");
+    }
+
+    #[test]
+    fn wheels_rest_on_flat_ground() {
+        let b = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
+        assert_eq!(b.wheels.len(), 4);
+        assert!(b.wheels.iter().filter(|w| w.driven).count() >= 1);
+    }
+
+    #[test]
+    fn suspension_compresses_on_a_step() {
+        // Ground is 10 cm higher for x > 1, so the front wheels ride up.
+        struct Step;
+        impl VehicleGround for Step {
+            fn height(&self, x: f32, _y: f32) -> Option<f32> {
+                if x > 1.0 { Some(0.1) } else { Some(0.0) }
+            }
+        }
+        // Straddle the step so the front axle is on the raised ground.
+        let mut b = VehicleBody::new(hatch(), [1.0, 0.0, 0.0], 0.0);
+        for _ in 0..30 {
+            b.step(&VehicleInput::default(), &Step, 1.0 / 60.0);
+        }
+        assert!(b.wheels.iter().any(|w| w.compression > 0.0), "no compression on a step");
+        assert!(b.state.pitch.abs() > 1e-3, "step should pitch the body");
+    }
+
+    #[test]
+    fn rpm_sweeps_with_gear() {
+        let g = Flat { z: 0.0 };
+        let mut b = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
+        run(&mut b, &VehicleInput { throttle: 1.0, ..Default::default() }, &g, 2.0);
+        let idle = b.setup.movement.wheeled_legacy.engine_idle_rpm;
+        assert!(b.state.rpm > idle);
+        assert!(b.state.rpm <= b.setup.movement.wheeled_legacy.engine_max_rpm + 1e-3);
     }
 
     #[test]
@@ -716,12 +1072,9 @@ mod tests {
         s.damage.multipliers.insert("bullet".into(), 0.125);
         let mut h = VehicleHealth::new(&s);
         h.apply_hull(&s, "bullet", 800.0);
-        // 800 * 0.125 = 100 damage.
         assert!((h.hull - 19900.0).abs() < 1e-3, "hull={}", h.hull);
-        // Melee is unspecified -> multiplier 1.
         h.apply_hull(&s, "melee", 100.0);
         assert!((h.hull - 19800.0).abs() < 1e-3);
-        // Enough damage to destroy it.
         h.apply_hull(&s, "melee", 1.0e9);
         assert!(h.destroyed);
         assert_eq!(h.hull, 0.0);
@@ -740,7 +1093,6 @@ mod tests {
         let s = hatch();
         assert_eq!(collision_damage(&s, 9.0), 0.0);
         assert!(collision_damage(&s, 14.0) > 0.0);
-        // Monotonic in speed.
         assert!(collision_damage(&s, 20.0) > collision_damage(&s, 14.0));
     }
 

@@ -591,6 +591,23 @@ impl VehicleSetup {
             wheel("wheel3", 0, true),
             wheel("wheel4", 1, false),
         ];
+        // The shipped hatchback helper set: suspension anchors, driver/passenger
+        // seats and the enter/exit points the seat actions use.
+        for (name, pos) in [
+            ("wheelFrontLeft", [-0.9f32, 1.94513, 0.0]),
+            ("wheelFrontRight", [0.9, 1.94513, 0.0]),
+            ("wheelRearLeft", [-0.9, -1.45805, 0.0]),
+            ("wheelRearRight", [0.9, -1.45805, 0.0]),
+            ("driverSitPos", [-0.39013, 0.22242, 0.48223]),
+            ("driverEnterPos", [-1.90378, 0.19689, 0.0]),
+            ("driverExitPos", [-1.78607, -0.23729, 0.0]),
+            ("passengerSitPosRF", [0.39013, 0.22242, 0.48223]),
+            ("passengerEnterPosRF", [1.90378, 0.19689, 0.0]),
+            ("passengerExitPosRF", [1.78607, -0.23729, 0.0]),
+        ] {
+            setup.helpers.insert(name.to_string(), pos);
+        }
+        setup.seat_count = 4;
         setup
     }
 

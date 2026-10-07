@@ -11,6 +11,7 @@ pub mod ag_graph;
 pub mod ag_runtime;
 pub mod ai;
 pub mod anim;
+pub mod anim_alias;
 pub mod anim_graph;
 pub mod anim_manifest;
 pub mod architecture;

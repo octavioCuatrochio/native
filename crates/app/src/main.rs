@@ -3107,15 +3107,17 @@ fn animate_followers(time: Res<Time>, mut meshes: ResMut<Assets<Mesh>>, mut q: Q
 }
 
 /// Player melee/firearm input. The attack itself runs through the original
-/// game-rules pipeline: this only translates the pressed keys into a
+/// game-rules pipeline: this translates the pressed keys into a
 /// [`ai_bridge::PlayerAttackRequest`] (the bridge owns the script host and the
 /// damage model), exactly as `CreateHit` does in `singleplayer.lua:332`.
 ///
-/// Base damages are the shipped weapon values: machete `80`
-/// (`meleemachete02.xml`, `notes/ai-combat.md §4.5`) and TacMaster 1911 `200`
-/// with a 600 rpm interval (`pistol_tacmaster1911.xml`). The unreplaced
-/// magazine/reload/stamina model lives in [`LegacyWeapons`] behind
-/// `SOD_LEGACY_WEAPONS`.
+/// The weapon numbers come from the shipped weapon XML and the native
+/// `self.actor` runtime: `cry::weapons` holds the fire modes (damage, rate,
+/// clip, reload, noise radius, condition bounds), `cry::weapons_stamina` holds
+/// the magazine/reload/stamina/condition state and the `actorconstants.xml`
+/// stamina magnitudes. Without a script host the shipped base values are fed
+/// directly. The old hand-written magazine/reload/stamina model is only used
+/// under `SOD_LEGACY_WEAPONS`.
 fn player_attack(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -3123,6 +3125,7 @@ fn player_attack(
     player: Option<Res<Player>>,
     mut combat_state: Option<ResMut<PlayerCombat>>,
     legacy: Option<ResMut<LegacyWeapons>>,
+    cry: Option<NonSendMut<cry_bridge::CryHost>>,
     mut req: Option<ResMut<ai_bridge::PlayerAttackRequest>>,
 ) {
     if menu.active { return; }
@@ -3184,16 +3187,92 @@ fn player_attack(
                 println!("[combat] reloading {} ({}/{})", gun.name, gun_state.in_mag, gun_state.reserve);
             }
         }
-        // Default: the original pipeline owns the hit; feed it the shipped
-        // weapon damage and pace the input.
+        // Default: the original-driven weapon model on `self.actor`. Weapon
+        // numbers come from the shipped weapon XML, stamina from the recovered
+        // `actorconstants.xml` rows; the bridge still owns the hit itself.
         None => {
-            if melee_now {
-                out.melee = Some(MELEE_DAMAGE);
-                auto_cd = MELEE_INTERVAL;
+            use sod_core::cry::weapons_stamina::{FireOutcome, MeleeAttack};
+            let mut handled = false;
+            if let Some(cry) = cry {
+                let pid = cry.player;
+                let vfs = cry.host.ctx.vfs.clone();
+                let consts = sod_core::cry::weapons_stamina::constants_for(&vfs);
+                let speed = (player.mstate.vel[0] * player.mstate.vel[0]
+                    + player.mstate.vel[1] * player.mstate.vel[1])
+                    .sqrt();
+                let sprint_key =
+                    keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+                let mut actors = cry.host.ctx.actors.borrow_mut();
+                if let Some(a) = actors.get_mut(&pid) {
+                    handled = true;
+                    a.stamina.sprinting = sprint_key && speed > 1.0;
+                    a.stamina.tick(dt, consts);
+                    a.weapons.tick(dt);
+                    if melee_now {
+                        match a.weapons.melee_attack(&mut a.stamina, consts) {
+                            MeleeAttack::Swing { damage, cost, tier, exhausted, broke } => {
+                                out.melee = Some(damage);
+                                auto_cd = 0.6;
+                                println!(
+                                    "[combat] melee {} {:.0} dmg (stamina {:.1}, cost {:.2}, {}{}{})",
+                                    a.weapons.melee_name(),
+                                    damage,
+                                    a.stamina.current,
+                                    cost,
+                                    tier.name(),
+                                    if exhausted { " exhausted" } else { "" },
+                                    if broke { " BROKEN" } else { "" },
+                                );
+                            }
+                            _ => auto_cd = 0.2,
+                        }
+                    }
+                    if fire_now {
+                        match a.weapons.try_fire() {
+                            FireOutcome::Shot { damage, noise } => {
+                                out.shot = Some(damage);
+                                auto_fire_cd = a.weapons.fire_cd.max(0.05);
+                                let (m, cap, res) = a.weapons.mag_info().unwrap_or((0, 0, 0));
+                                println!(
+                                    "[combat] fire {} {:.0} dmg (mag {m}/{cap}, reserve {res}, noise {noise:.0}m)",
+                                    a.weapons.gun_name(),
+                                    damage,
+                                );
+                            }
+                            other => {
+                                auto_fire_cd = 0.12;
+                                if auto
+                                    && matches!(other, FireOutcome::Empty)
+                                    && a.weapons.reload()
+                                {
+                                    let (m, cap, res) =
+                                        a.weapons.mag_info().unwrap_or((0, 0, 0));
+                                    println!(
+                                        "[combat] reload {} -> mag {m}/{cap}, reserve {res}",
+                                        a.weapons.gun_name()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if keys.just_pressed(KeyCode::KeyR) && a.weapons.reload() {
+                        let (m, cap, res) = a.weapons.mag_info().unwrap_or((0, 0, 0));
+                        println!(
+                            "[combat] reload {} -> mag {m}/{cap}, reserve {res}",
+                            a.weapons.gun_name()
+                        );
+                    }
+                }
             }
-            if fire_now {
-                out.shot = Some(BULLET_DAMAGE);
-                auto_fire_cd = BULLET_INTERVAL;
+            if !handled {
+                if melee_now {
+                    out.melee = Some(MELEE_DAMAGE);
+                    auto_cd = MELEE_INTERVAL;
+                }
+                if fire_now {
+                    out.shot = Some(BULLET_DAMAGE);
+                    auto_fire_cd = BULLET_INTERVAL;
+                }
             }
         }
     }
@@ -3309,9 +3388,10 @@ fn hud_update(
 ) {
     let Some(mut hud_res) = hud_res else { return };
     // Health is the authoritative actor health from the original combat
-    // pipeline (`ai_bridge::combat_step` -> `cry::actor`); stamina is the
-    // unreplaced legacy value when its flag is on, else a full bar. The HUD no
-    // longer owns a separate player-health approximation.
+    // pipeline (`ai_bridge::combat_step` -> `cry::actor`); stamina likewise is
+    // the actor's native pool (`cry::weapons_stamina`, magnitudes from
+    // `actorconstants.xml`). The legacy `LegacyWeapons` values only seed the
+    // fallback path when the script host is disabled.
     let mut vitals = weapons
         .as_ref()
         .map(|w| w.vitals)
@@ -3322,6 +3402,8 @@ fn hud_update(
             if let Some(a) = actors.get(&pid) {
                 vitals.max_hp = a.max_health.max(1.0);
                 vitals.hp = a.health.clamp(0.0, vitals.max_hp);
+                vitals.max_stamina = a.stamina.max_total();
+                vitals.stamina = a.stamina.current.clamp(0.0, vitals.max_stamina);
             }
         }
     }

@@ -3,6 +3,7 @@
 //! `self.actor:Method(...)`; the table carries the owning entity id.
 
 use super::host::{num, value_to_id, Ctx};
+use super::weapons_stamina::{StaminaState, WeaponRuntime};
 use super::world::EntityId;
 use mlua::{Function, Lua, Result, Table, Value};
 
@@ -11,6 +12,10 @@ pub struct ActorState {
     pub is_player: bool,
     pub health: f32,
     pub max_health: f32,
+    /// Native stamina pool (see [`super::weapons_stamina`]).
+    pub stamina: StaminaState,
+    /// The actor's equipped melee weapon / firearm and their runtime state.
+    pub weapons: WeaponRuntime,
     pub stored_pos: Option<[f32; 3]>,
     pub physicalization_profile: String,
     pub spectator_mode: i32,
@@ -23,6 +28,8 @@ impl ActorState {
             is_player,
             health: 100.0,
             max_health: 100.0,
+            stamina: StaminaState::new(),
+            weapons: WeaponRuntime::default(),
             stored_pos: None,
             physicalization_profile: "alive".into(),
             spectator_mode: 0,
@@ -136,6 +143,70 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
         with(|a, _, _| Ok(a.linked_vehicle.map(super::host::id_value).unwrap_or(Value::Nil)))?,
     )?;
 
+    // --- stamina (native stat; actorconstants.xml magnitudes) ---
+    t.raw_set("GetStamina", with(|a, _, _| Ok(Value::Number(a.stamina.current as f64)))?)?;
+    t.raw_set(
+        "SetStamina",
+        with(|a, _, v| {
+            a.stamina.set(num(&v).unwrap_or(0.0) as f32);
+            Ok(Value::Nil)
+        })?,
+    )?;
+    t.raw_set(
+        "AddStamina",
+        with(|a, _, v| {
+            a.stamina.add(num(&v).unwrap_or(0.0) as f32);
+            Ok(Value::Nil)
+        })?,
+    )?;
+    t.raw_set("GetMaxStamina", with(|a, _, _| Ok(Value::Number(a.stamina.max_total() as f64)))?)?;
+    t.raw_set(
+        "SetMaxStamina",
+        with(|a, _, v| {
+            let m = num(&v).unwrap_or(super::weapons_stamina::STAMINA_MAX as f64) as f32;
+            a.stamina.set_bonus(m - super::weapons_stamina::STAMINA_MAX);
+            Ok(Value::Nil)
+        })?,
+    )?;
+    t.raw_set("GetStaminaRatio", with(|a, _, _| Ok(Value::Number(a.stamina.ratio() as f64)))?)?;
+    t.raw_set("IsExhausted", with(|a, _, _| Ok(Value::Boolean(a.stamina.exhausted)))?)?;
+
+    // --- weapon runtime (weapon XML + items.xml) ---
+    t.raw_set("GetAmmo", with(|a, _, _| Ok(Value::Integer(a.weapons.mag_info().map(|m| m.0).unwrap_or(0) as i64)))?)?;
+    t.raw_set("GetReserveAmmo", with(|a, _, _| Ok(Value::Integer(a.weapons.mag_info().map(|m| m.2).unwrap_or(0) as i64)))?)?;
+    t.raw_set("GetClipSize", with(|a, _, _| Ok(Value::Integer(a.weapons.mag_info().map(|m| m.1).unwrap_or(0) as i64)))?)?;
+    t.raw_set(
+        "IsReloading",
+        with(|a, _, _| Ok(Value::Boolean(a.weapons.gun.as_ref().map(|g| g.reload_left > 0.0).unwrap_or(false))))?,
+    )?;
+    t.raw_set(
+        "Reload",
+        with(|a, _, _| Ok(Value::Boolean(a.weapons.reload())))?,
+    )?;
+    t.raw_set(
+        "GetWeaponName",
+        with(|a, lua, _| {
+            let name = a.weapons.gun.as_ref().map(|g| g.def.title().to_string()).unwrap_or_else(|| a.weapons.melee_name().to_string());
+            Ok(Value::String(lua.create_string(&name)?))
+        })?,
+    )?;
+    t.raw_set(
+        "GetMeleeWeaponName",
+        with(|a, lua, _| Ok(Value::String(lua.create_string(a.weapons.melee_name().to_string())?)))?,
+    )?;
+    t.raw_set(
+        "GetDurability",
+        with(|a, _, _| {
+            Ok(Value::Number(a.weapons.melee.as_ref().map(|m| m.condition as f64).unwrap_or(0.0)))
+        })?,
+    )?;
+    t.raw_set(
+        "GetMaxDurability",
+        with(|a, _, _| {
+            Ok(Value::Number(a.weapons.melee.as_ref().map(|m| m.condition_max as f64).unwrap_or(0.0)))
+        })?,
+    )?;
+
     // StoredPosSet() stores the entity's current world position.
     let c = ctx.clone();
     t.raw_set(
@@ -155,7 +226,16 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
 
 /// Create the actor record and attach `self.actor` to the entity table.
 pub fn attach(lua: &Lua, ctx: &Ctx, id: EntityId, inst: &Table, is_player: bool) -> Result<()> {
-    ctx.actors.borrow_mut().insert(id, ActorState::new(is_player));
+    let mut state = ActorState::new(is_player);
+    // The player carries the default loadout; other actors fall back to fists.
+    let data = super::weapons::data_for(&ctx.vfs);
+    let loadout = if is_player {
+        super::weapons_stamina::default_loadout(data)
+    } else {
+        super::weapons_stamina::loadout_named(data, "Fists", "")
+    };
+    state.weapons = WeaponRuntime::from_loadout(loadout, data);
+    ctx.actors.borrow_mut().insert(id, state);
     let newf: Function = lua.globals().get("__actor_new")?;
     let actor: Table = newf.call(super::host::id_value(id))?;
     inst.raw_set("actor", actor)?;

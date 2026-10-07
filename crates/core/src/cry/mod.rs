@@ -26,6 +26,8 @@ pub mod navmesh;
 pub mod phys_proxy;
 pub mod phys_world;
 pub mod render;
+pub mod weapons;
+pub mod weapons_stamina;
 pub mod world;
 pub mod zombie_actor;
 pub mod zombie_runtime;

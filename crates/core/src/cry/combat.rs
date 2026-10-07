@@ -568,6 +568,47 @@ pub fn melee_recovery(profile: MeleeProfile) -> f32 {
     profile.recovery()
 }
 
+// ---------------------------------------------------------------------------
+// Player strike stamina (actorconstants.xml `Stamina_*` rows)
+// ---------------------------------------------------------------------------
+
+use super::weapons_stamina::{StaminaConstants, StaminaState, SwingTier};
+
+/// The `Stamina_*` cost tier a strike profile spends. The actor constants table
+/// names the tiers (`Stamina_Light_Normal` .. `Stamina_Massive_Normal`); the
+/// SM's damage profiles map onto them: light/standard/heavy strikes, bite =
+/// heavy, finishers = massive, stamina-only hits = standard.
+pub fn swing_tier_for_profile(profile: MeleeProfile) -> SwingTier {
+    match profile {
+        MeleeProfile::Light => SwingTier::Light,
+        MeleeProfile::Standard => SwingTier::Standard,
+        MeleeProfile::Heavy | MeleeProfile::Bite => SwingTier::Heavy,
+        MeleeProfile::KillCredit => SwingTier::Massive,
+        MeleeProfile::StaminaLight | MeleeProfile::StaminaHeavy | MeleeProfile::Unknown => {
+            SwingTier::Standard
+        }
+    }
+}
+
+/// Stamina a player strike of `profile` costs; the `_Reduced` rows apply while
+/// the actor is exhausted.
+pub fn player_melee_stamina(profile: MeleeProfile, c: &StaminaConstants) -> f32 {
+    let tier = swing_tier_for_profile(profile);
+    c.cost(tier, false)
+}
+
+/// Melee damage after the exhaustion scale. A swing made while exhausted deals
+/// [`super::weapons_stamina::EXHAUSTED_DAMAGE_SCALE`] of its base (the SM's
+/// `Exhausted` attack branch).
+pub fn melee_damage_with_exhaustion(base: f32, stamina: &StaminaState) -> f32 {
+    if stamina.exhausted {
+        base * super::weapons_stamina::EXHAUSTED_DAMAGE_SCALE
+    } else {
+        base
+    }
+}
+
+
 /// English helper for the frag-band distance; `dir` is overloaded by the caller
 /// as the explosion centre (the fields are positional in `CreateHit`).
 fn vec_dist(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -775,5 +816,23 @@ mod tests {
         assert!(melee_damage(ZombieKind::Grunt, MeleeProfile::KillCredit) > PLAYER_MAX_HEALTH);
         assert_eq!(melee_damage(ZombieKind::Grunt, MeleeProfile::StaminaLight), 0.0);
         assert!(melee_recovery(MeleeProfile::Heavy) > melee_recovery(MeleeProfile::Light));
+    }
+
+    #[test]
+    fn strike_profiles_map_to_stamina_tiers() {
+        assert_eq!(swing_tier_for_profile(MeleeProfile::Light), SwingTier::Light);
+        assert_eq!(swing_tier_for_profile(MeleeProfile::Bite), SwingTier::Heavy);
+        assert_eq!(swing_tier_for_profile(MeleeProfile::KillCredit), SwingTier::Massive);
+        let c = crate::cry::weapons_stamina::StaminaConstants::builtin();
+        assert_eq!(player_melee_stamina(MeleeProfile::Light, &c), 4.0);
+        assert_eq!(player_melee_stamina(MeleeProfile::Heavy, &c), 12.0);
+    }
+
+    #[test]
+    fn exhausted_swing_is_scaled_down() {
+        let mut st = StaminaState::new();
+        assert_eq!(melee_damage_with_exhaustion(80.0, &st), 80.0);
+        st.exhausted = true;
+        assert_eq!(melee_damage_with_exhaustion(80.0, &st), 40.0);
     }
 }

@@ -256,7 +256,7 @@ impl MoveState {
 
 /// Aim movement speed scale over `aimRunSpeed` (retail measurement, see
 /// `update_normal`).
-pub const AIM_SPEED_SCALE: f32 = 3.0;
+pub const AIM_SPEED_SCALE: f32 = 3.2;
 
 /// One frame of player input. `forward`/`strafe` are camera/body-relative
 /// analog axes (typically `-1..=1`); `mouse_*` are look deltas already in
@@ -730,7 +730,7 @@ pub fn step(
         // Aiming (stance[2]): every direction moves at the aim run slot. The
         // runtime factors of GetStanceSpeed are not traced; AIM_SPEED_SCALE is
         // measured in the retail game (notes/telemetry/moves_session3.csv:
-        // 1.50 m/s steady in all four directions vs aimRunSpeed 0.5).
+        // 1.60 m/s steady in all four directions in moves_session3 + real_bd capture vs aimRunSpeed 0.5).
         sane(t.aim_run) * AIM_SPEED_SCALE * drive
     } else {
         get_stance_speed(
@@ -776,7 +776,12 @@ pub fn step(
     let ground_up = class3_physics::ground_normal(state.pos[0], state.pos[1], ground);
     state.up = slerp_up(state.up, ground_up, gain);
     if constrained {
-        process_constrained_to_markup(state, [dir_x, dir_y, 0.0], dt);
+        // Aiming: the rotation target is the aim direction, not the movement.
+        let target = match input.aim_yaw {
+            Some(aim) => [sane(aim).cos(), sane(aim).sin(), 0.0],
+            None => [dir_x, dir_y, 0.0],
+        };
+        process_constrained_to_markup(state, target, dt);
     } else {
         let committed = normalize_quat(euler_to_quat([0.0, 0.0, state.yaw + yaw_delta]));
         state.yaw = wrap_angle(quat_yaw(committed));

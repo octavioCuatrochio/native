@@ -45,6 +45,7 @@ pub mod material;
 pub mod mesh;
 pub mod parity;
 pub mod parity_replay;
+pub mod particles;
 pub mod physics;
 pub mod player_locomotion;
 pub mod render_light;

@@ -535,8 +535,11 @@ fn parse_object_block(
                 }
                 p = q + adv;
             }
-            // Unrecognised type: the block size is stored separately, so skipping
-            // the remainder keeps the octree walk exact.
+            // Unrecognised type. The block boundary is stored separately, so the
+            // octree walk itself stays exact, but any later entry in this block
+            // is skipped. Object blocks are type-sorted ascending, so vegetation
+            // (2) entries are always parsed before the first unrecognised type
+            // (WaterVolume 9 / Dummy3 22); no placed vegetation is lost here.
             _ => break,
         }
     }

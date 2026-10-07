@@ -495,8 +495,14 @@ fn parse_object_block(dat: &[u8], start: usize, end: usize, names: &[String], ou
                 }
                 p = q + adv;
             }
-            // Unrecognised type: the block boundary is stored separately, so
-            // skipping the remainder keeps the octree walk exact.
+            // Unrecognised type. The block boundary is stored separately, so the
+            // octree walk itself stays exact, but any later entry in this block
+            // is skipped. Object blocks are type-sorted ascending, so brush (1)
+            // and vegetation (2) entries are always parsed before the first
+            // unrecognised type; the loss is confined to decals (7), roads (11)
+            // and merged meshes (23) that follow `WaterVolume` (9) / `Dummy3`
+            // (22). On Class3 that is ~8.8% of object bytes (`WaterVolume` in
+            // 104 blocks, `Dummy3` in 240) and contains no brushes.
             _ => break,
         }
     }

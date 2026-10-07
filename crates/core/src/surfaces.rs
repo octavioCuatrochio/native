@@ -24,7 +24,7 @@
 //! attributes default to empty and entries without a `SurfaceTypeID` are
 //! skipped.
 
-use crate::{asset, crypak, terrain};
+use crate::{asset, crypak, material, terrain};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::collections::HashMap;
@@ -178,8 +178,10 @@ pub fn color_for(types: &[SurfaceType], id: u8) -> [f32; 4] {
 
 /// World metres covered by one repeat of a ground texture.
 const GROUND_UV_METERS: f32 = 4.0;
-/// Hard cap on distinct ground textures decoded per bake (bounds memory).
-const MAX_GROUND_TEXTURES: usize = 8;
+/// Hard cap on distinct ground textures decoded per bake (bounds memory). The
+/// Class3 palette has 33 layers; this admits most of the distinct tiles while
+/// keeping the decoded-texture memory bounded.
+const MAX_GROUND_TEXTURES: usize = 24;
 /// Hard cap on the baked albedo side (bounds the output allocation).
 const MAX_ALBEDO_DIM: u32 = 4096;
 
@@ -194,6 +196,98 @@ const GROUND_CONCRETE: &str = "textures/ground/gravel_parking12x12_diffuse.dds";
 /// Documented ground-texture repeat: one texture tile per this many world metres.
 pub fn uv_scale() -> f32 {
     GROUND_UV_METERS
+}
+
+/// A surface type's real terrain-layer material, resolved from `leveldata.xml`'s
+/// `DetailMaterial` -> `terrain/terrainmaterials/<name>.mtl`.
+///
+/// This is the shipping terrain pipeline: each `SurfaceTypeID` paints one
+/// `Terrain.Layer` material whose `Diffuse`/`Bumpmap` textures tile over the
+/// world at the authored `TexMod TileU/TileV` scale (repeats per metre), not a
+/// single baked flat colour. [`resolve_surface_textures`] returns one row per
+/// palette entry; the renderer can tile `diffuse` at `tile_u`/`tile_v` in the
+/// shader, or feed the baked fallback ([`build_ground_albedo`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceTexture {
+    pub id: u32,
+    /// Resolved `..._diffuse.dds` pak path, if the material could be found.
+    pub diffuse: Option<String>,
+    pub normal: Option<String>,
+    pub specular: Option<String>,
+    /// `TexMod` repeats per world metre (default `1 / GROUND_UV_METERS`).
+    pub tile_u: f32,
+    pub tile_v: f32,
+    pub alpha_test: Option<f32>,
+}
+
+/// Candidate `.mtl` paths for a `<SurfaceType>`'s detail material.
+fn surface_mtl_candidates(st: &SurfaceType) -> Vec<String> {
+    let mat = if st.material.is_empty() { st.name.as_str() } else { st.material.as_str() };
+    let mat_base = mat.rsplit('/').next().unwrap_or(mat);
+    let name_base = st.name.rsplit('/').next().unwrap_or(&st.name);
+    let mut c = vec![
+        format!("{mat}.mtl"),
+        format!("terrain/terrainmaterials/{mat_base}.mtl"),
+        format!("{}.mtl", st.name),
+        format!("terrain/terrainmaterials/{name_base}.mtl"),
+    ];
+    c.dedup();
+    c
+}
+
+/// Resolve the real terrain-layer material for one surface type, or `None`.
+fn resolve_surface_material(vfs: &crypak::Vfs, st: &SurfaceType) -> Option<material::MaterialSlot> {
+    for c in surface_mtl_candidates(st) {
+        let slots = material::load_mtl_path(vfs, &c);
+        if let Some(s) = slots.into_iter().find(|s| s.texture("Diffuse").is_some()) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Resolve every surface type to its authored terrain-layer textures + tiling.
+///
+/// Entries with no findable material fall back to [`texture_hint`] (generic
+/// ground textures) and the default tiling, so the result always has one row per
+/// input (same order). Never panics; a missing VFS entry simply yields `None`s.
+pub fn resolve_surface_textures(
+    vfs: &crypak::Vfs,
+    types: &[SurfaceType],
+) -> Vec<SurfaceTexture> {
+    types
+        .iter()
+        .map(|st| match resolve_surface_material(vfs, st) {
+            Some(s) => {
+                let (tu, tv) = s.texture_tile("Diffuse");
+                let (tu, tv) = if tu == 1.0 && tv == 1.0 { (1.0 / GROUND_UV_METERS, 1.0 / GROUND_UV_METERS) } else { (tu, tv) };
+                SurfaceTexture {
+                    id: st.id,
+                    diffuse: s.texture("Diffuse").map(str::to_string),
+                    normal: s
+                        .texture("Bumpmap")
+                        .or_else(|| s.texture("Normal"))
+                        .map(str::to_string),
+                    specular: s.texture("Specular").map(str::to_string),
+                    tile_u: tu,
+                    tile_v: tv,
+                    alpha_test: s.alpha_test,
+                }
+            }
+            None => {
+                let name = if st.material.is_empty() { st.name.as_str() } else { st.material.as_str() };
+                SurfaceTexture {
+                    id: st.id,
+                    diffuse: Some(texture_hint(name).to_string()),
+                    normal: None,
+                    specular: None,
+                    tile_u: 1.0 / GROUND_UV_METERS,
+                    tile_v: 1.0 / GROUND_UV_METERS,
+                    alpha_test: None,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Map a surface name or material path to the virtual path of its diffuse
@@ -260,13 +354,13 @@ fn sample_rgba(img: &asset::DdsImageRgba, u: f32, v: f32) -> [u8; 4] {
 /// [`MAX_GROUND_TEXTURES`], then tiled-sample it at UV `(u, v)`.
 fn sample_ground_texture(
     vfs: &crypak::Vfs,
-    cache: &mut HashMap<&'static str, Option<asset::DdsImageRgba>>,
+    cache: &mut HashMap<String, Option<asset::DdsImageRgba>>,
     decoded: &mut usize,
-    path: &'static str,
+    path: &str,
     u: f32,
     v: f32,
 ) -> Option<[u8; 4]> {
-    let slot = cache.entry(path).or_insert_with(|| {
+    let slot = cache.entry(path.to_string()).or_insert_with(|| {
         if *decoded >= MAX_GROUND_TEXTURES {
             return None;
         }
@@ -279,10 +373,12 @@ fn sample_ground_texture(
 /// Bake a single RGBA8 ground-albedo texture for the whole terrain.
 ///
 /// Each output texel maps to a world `(x, y)`, reads [`terrain::Terrain::surface_at`],
-/// resolves that surface's [`texture_hint`], decodes the texture (memoised, and
-/// capped at [`MAX_GROUND_TEXTURES`]) and samples it with tiled UVs of
-/// [`uv_scale`] metres per repeat. When a texture cannot be read/decoded the
-/// surface's [`color_for`] colour is written instead.
+/// resolves that surface's authored terrain-layer diffuse (via
+/// [`resolve_surface_textures`], falling back to [`texture_hint`]), decodes the
+/// texture (memoised, and capped at [`MAX_GROUND_TEXTURES`]) and samples it with
+/// tiled UVs using the material's own `TexMod` repeat (repeats per metre).
+/// When a texture cannot be read/decoded the surface's [`color_for`] colour is
+/// written instead.
 ///
 /// Returns `(out_size, out_size, rgba)` with `out_size²·4` bytes, or `None` for
 /// an empty/degenerate terrain or an out-of-range `out_size`. Never panics.
@@ -303,8 +399,16 @@ pub fn build_ground_albedo(
     let bytes = n.checked_mul(n)?.checked_mul(4)?;
     let mut out = vec![0u8; bytes];
 
-    // Per-id lookup tables, computed once (no per-texel name allocation).
-    let mut hint_by_id: [&'static str; 256] = [texture_hint(""); 256];
+    // Per-id lookup tables, computed once (no per-texel allocation).
+    //
+    // NOTE: the shipping `terrain/terrainmaterials/*_diffuse.dds` are *neutral
+    // detail* maps (mean ~127 grey); the layer colour is applied by the
+    // `Terrain.Layer` shader (material `Diffuse` colour + painted layer
+    // coverage). Baking them directly as albedo produces a grey ground, so the
+    // bake uses the coloured generic ground textures and the real per-layer
+    // material metadata stays in [`resolve_surface_textures`] for a proper
+    // tiled/blended terrain shader (see the report).
+    let mut path_by_id: [Option<String>; 256] = std::array::from_fn(|_| None);
     let mut color_by_id: [[u8; 4]; 256] = [[128, 128, 128, 255]; 256];
     for id in 0..=255u8 {
         color_by_id[id as usize] = rgba8(color_for(types, id));
@@ -312,7 +416,7 @@ pub fn build_ground_albedo(
     for t in types {
         if t.id <= 255 {
             let name = if t.material.is_empty() { &t.name } else { &t.material };
-            hint_by_id[t.id as usize] = texture_hint(name);
+            path_by_id[t.id as usize] = Some(texture_hint(name).to_string());
         }
     }
 
@@ -320,25 +424,33 @@ pub fn build_ground_albedo(
     let span_y = ter.samples as f32 * ter.spacing;
     let (x0, y0) = (ter.world_min[0], ter.world_min[1]);
     let inv = 1.0 / out_size as f32;
+    // The baked colormap repeats the detail texture at a fixed 4 m so adjacent
+    // output texels (4 m apart at 1024) do not alias the tile away. The
+    // authored per-layer `TexMod` scale is for the renderer's world-space tiling
+    // (`SurfaceTexture::tile_u`), not for this full-world bake.
+    let bake_tile = 1.0 / GROUND_UV_METERS;
 
-    let mut cache: HashMap<&'static str, Option<asset::DdsImageRgba>> = HashMap::new();
+    let mut cache: HashMap<String, Option<asset::DdsImageRgba>> = HashMap::new();
     let mut decoded = 0usize;
 
     for oy in 0..n {
         let wy = y0 + (oy as f32 + 0.5) * inv * span_y;
         for ox in 0..n {
             let wx = x0 + (ox as f32 + 0.5) * inv * span_x;
-            let id = ter.surface_at(wx, wy);
-            let hint = hint_by_id[id as usize];
-            let px = sample_ground_texture(
-                vfs,
-                &mut cache,
-                &mut decoded,
-                hint,
-                wx / GROUND_UV_METERS,
-                wy / GROUND_UV_METERS,
-            )
-            .unwrap_or(color_by_id[id as usize]);
+            let id = ter.surface_at(wx, wy) as usize;
+            let px = path_by_id[id]
+                .as_deref()
+                .and_then(|path| {
+                    sample_ground_texture(
+                        vfs,
+                        &mut cache,
+                        &mut decoded,
+                        path,
+                        wx * bake_tile,
+                        wy * bake_tile,
+                    )
+                })
+                .unwrap_or(color_by_id[id]);
             let o = (oy * n + ox) * 4;
             out[o..o + 4].copy_from_slice(&px);
         }
@@ -555,6 +667,52 @@ mod tests {
         let (w, h, rgba) = build_ground_albedo(&vfs, &good, &[], 4).expect("empty palette ok");
         assert_eq!((w, h), (4, 4));
         assert_eq!(rgba.len(), 4 * 4 * 4);
+    }
+
+    #[test]
+    fn resolves_real_terrain_layer_textures_if_present() {
+        let level = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted-game/level/leveldata.xml");
+        let terrain_root =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted-game/terrain"));
+        if !terrain_root.is_dir() {
+            return; // extraction absent: skip silently
+        }
+        let Ok(bytes) = std::fs::read(level) else { return };
+        let types = parse_surface_types(&bytes);
+        assert!(!types.is_empty());
+
+        let mut vfs = crate::crypak::Vfs::new();
+        vfs.set_loose_root(terrain_root);
+        let stex = resolve_surface_textures(&vfs, &types);
+        assert_eq!(stex.len(), types.len());
+
+        // Most authored layers must resolve to a real terrainmaterials diffuse.
+        let with_tex = stex.iter().filter(|s| s.diffuse.is_some()).count();
+        assert!(
+            with_tex * 2 >= types.len(),
+            "only {with_tex}/{} surfaces resolved a texture",
+            types.len()
+        );
+
+        // id 4 == lawn_green_01: diffuse + authored 0.5 repeat/m.
+        let id4 = stex.iter().find(|s| s.id == 4).expect("id 4");
+        let d = id4.diffuse.as_deref().unwrap_or("");
+        assert!(d.contains("lawn_green_01"), "id4 diffuse {d}");
+        assert!((id4.tile_u - 0.5).abs() < 1e-3, "id4 tile_u {}", id4.tile_u);
+        assert!(id4.normal.is_some(), "id4 should carry a Bumpmap");
+    }
+
+    #[test]
+    fn resolve_surface_textures_falls_back_for_unknown() {
+        let types = parse_surface_types(SAMPLE.as_bytes());
+        let vfs = crate::crypak::Vfs::new();
+        let stex = resolve_surface_textures(&vfs, &types);
+        assert_eq!(stex.len(), types.len());
+        // With no VFS every entry still gets a generic fallback diffuse.
+        for s in &stex {
+            assert!(s.diffuse.is_some(), "id {} should fall back", s.id);
+            assert!(s.diffuse.as_deref().unwrap().starts_with("textures/ground/"));
+        }
     }
 
     #[test]

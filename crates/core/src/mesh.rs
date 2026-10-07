@@ -281,6 +281,33 @@ struct NodeInfo {
     parent: i32,
     material_chunk: u32,
     local: Mat4,
+    /// Node name (payload +0x00, 64-byte NUL-padded). Used to identify physics
+    /// proxies / in-file LOD helpers that must not be drawn.
+    name: String,
+}
+
+/// Node-name substrings that mark a **non-renderable** node: the physics hit
+/// proxy (`*_hitref`, `$physics_proxy*`) or an in-file LOD helper
+/// (`*__lod1_geometry`, `*$lod1*`). The engine writes a separate low-poly mesh
+/// node for collision and, in a few files, extra LOD nodes next to the LOD0
+/// geometry; both carry their own `Mesh` chunk. Decoding them together with the
+/// render mesh draws the collision shell over the real model (and overlaps LODs),
+/// which is exactly the "low-poly" look.
+pub fn node_is_render_geometry(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n.is_empty() {
+        return true;
+    }
+    if n.contains("hitref") || n.contains("physics_proxy") {
+        return false;
+    }
+    if n.starts_with("$physics") || n.starts_with("$lod") {
+        return false;
+    }
+    if n.contains("__lod") || n.contains("_lod1") || n.contains("_lod2") || n.contains("_lod3") {
+        return false;
+    }
+    true
 }
 
 fn parse_nodes(cf: &CryChunkFile, file: &[u8]) -> Vec<NodeInfo> {
@@ -293,6 +320,9 @@ fn parse_nodes(cf: &CryChunkFile, file: &[u8]) -> Vec<NodeInfo> {
         let object_chunk = rd_u32(p, 0x40).unwrap_or(0);
         let parent = rd_u32(p, 0x44).map(|v| v as i32).unwrap_or(-1);
         let material_chunk = rd_u32(p, 0x4C).unwrap_or(0);
+        let raw_name = p.get(0..64).unwrap_or(&[]);
+        let end = raw_name.iter().position(|&b| b == 0).unwrap_or(raw_name.len());
+        let name = String::from_utf8_lossy(&raw_name[..end]).trim().to_string();
         let mut m = [0f32; 16];
         let mut ok = true;
         for (i, slot) in m.iter_mut().enumerate() {
@@ -309,6 +339,7 @@ fn parse_nodes(cf: &CryChunkFile, file: &[u8]) -> Vec<NodeInfo> {
             parent,
             material_chunk,
             local: if ok { Mat4(m) } else { Mat4::identity() },
+            name,
         });
     }
     nodes
@@ -355,12 +386,31 @@ fn mtlname_name(cf: &CryChunkFile, file: &[u8], by_id: &HashMap<u32, usize>, id:
 
 /// Decode all meshes of a chunk file into world-space triangles.
 pub fn decode_model(file: &[u8]) -> Option<DecodedModel> {
-    decode_model_with(file, true)
+    decode_model_full(file, true, false)
 }
 
 /// Like [`decode_model`], but optionally skips Node transform composition
 /// (needed for skinned meshes, whose vertices must stay in bind model space).
 pub fn decode_model_with(file: &[u8], apply_node_transforms: bool) -> Option<DecodedModel> {
+    decode_model_full(file, apply_node_transforms, false)
+}
+
+/// Decode only the **renderable LOD0** geometry: like [`decode_model`], but
+/// skips the physics/collision proxy mesh node (`*_hitref`, `$physics_proxy*`)
+/// and any in-file LOD helper node (`*__lod1_geometry`, `$lod1*`) that a few
+/// models carry next to the LOD0 geometry. See [`node_is_render_geometry`].
+///
+/// Use this for drawing; use [`decode_model`] when the caller wants every mesh
+/// (e.g. to include collision proxies in a physics build).
+pub fn decode_model_render(file: &[u8]) -> Option<DecodedModel> {
+    decode_model_full(file, true, true)
+}
+
+pub fn decode_model_full(
+    file: &[u8],
+    apply_node_transforms: bool,
+    render_only: bool,
+) -> Option<DecodedModel> {
     let cf = parse_cry_chunk_file(file)?;
     let mut by_id: HashMap<u32, usize> = HashMap::new();
     for (i, c) in cf.chunks.iter().enumerate() {
@@ -392,6 +442,18 @@ pub fn decode_model_with(file: &[u8], apply_node_transforms: bool) -> Option<Dec
             continue;
         }
         let Some(mp) = ch.payload(file) else { continue };
+
+        // Render path: drop physics-proxy / in-file LOD nodes. A mesh with no
+        // owning node is kept (nothing to classify it by).
+        let owning_node = node_of_object.get(&ch.id).copied();
+        if render_only {
+            if let Some(ni) = owning_node {
+                if !node_is_render_geometry(&nodes[ni].name) {
+                    continue;
+                }
+            }
+        }
+
         let ref_at = |slot: usize| rd_u32(mp, 0x1C + slot * 4).unwrap_or(0);
 
         let Some(pos_stream) = read_stream(&cf, file, &by_id, ref_at(0)) else {
@@ -409,9 +471,7 @@ pub fn decode_model_with(file: &[u8], apply_node_transforms: bool) -> Option<Dec
         };
 
         // Apply the owning node's world transform (row-vector convention).
-        let mut owning_node = None;
-        if let Some(&ni) = node_of_object.get(&ch.id) {
-            owning_node = Some(ni);
+        if let Some(ni) = owning_node {
             if !apply_node_transforms {
                 // skinned path: keep bind model space
             } else {
@@ -511,8 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn subset_material_indices_span_meshes_in_decode_order() {
-        let model = DecodedModel {
+    fn subset_material_indices_span_meshes_in_decode_order() {        let model = DecodedModel {
             meshes: vec![mesh_with(&[2, 0]), mesh_with(&[1])],
             ..Default::default()
         };
@@ -555,6 +614,73 @@ mod tests {
                 .unwrap_or_else(|| panic!("decode failed: {}", path.display()));
             let got = subset_material_indices(&model);
             assert_eq!(got.as_slice(), expected, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn render_geometry_classifier() {
+        // Physics hit proxies / in-file LOD helpers are not drawable.
+        assert!(!node_is_render_geometry("ranger_station_01_hitref"));
+        assert!(!node_is_render_geometry("$physics_proxy_hitref"));
+        assert!(!node_is_render_geometry("$physics_proxy_$lod1_short03_hitref"));
+        assert!(!node_is_render_geometry("Physics_Proxy"));
+        assert!(!node_is_render_geometry("desert_brush__lod1_geometry"));
+        assert!(!node_is_render_geometry("group__lod1_blaines_grocery"));
+        // A render node whose *name* merely mentions collision is still drawn.
+        assert!(node_is_render_geometry("boxwood_clump_no_collision"));
+        assert!(node_is_render_geometry("geometry"));
+        assert!(node_is_render_geometry("ranger_station_01"));
+        assert!(node_is_render_geometry("")); // unclassified -> keep
+    }
+
+    /// A real building whose cgf carries both a `*_hitref` collision mesh and the
+    /// LOD0 render mesh: the render decoder must drop the proxy, while the full
+    /// decoder keeps it for physics callers.
+    #[test]
+    fn render_skips_hitref_proxy_on_real_building() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extracted-game");
+        let path = root.join(
+            "objects/objects/architecture/buildings/civic/ranger_station_01/ranger_station_01.cgf",
+        );
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skip: {} missing", path.display());
+            return;
+        };
+        let full = decode_model(&bytes).expect("full decode");
+        let render = decode_model_render(&bytes).expect("render decode");
+
+        // Dropping at least one whole mesh (the hitref proxy).
+        assert!(
+            render.meshes.len() < full.meshes.len(),
+            "render {} meshes, full {}",
+            render.meshes.len(),
+            full.meshes.len()
+        );
+        // The biggest LOD0 mesh survives; total triangles drop but stay large.
+        assert!(full.triangle_count() > render.triangle_count());
+        assert!(render.triangle_count() > 5_000, "lod0 mesh must survive");
+        // Every render submesh's triangle count is real geometry, not the
+        // low-poly proxy (the proxy here is a few hundred triangles).
+        assert!(render.triangle_count() >= full.triangle_count() * 8 / 10);
+    }
+
+    /// A proxy-only cgf decodes to `None` on the render path (nothing drawable).
+    #[test]
+    fn render_only_proxy_file_decodes_to_none() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extracted-game");
+        let path =
+            root.join("objects/objects/architecture/buildings/agricultural/windmill_01/windmill_01_proxy.cgf");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skip: {} missing", path.display());
+            return;
+        };
+        // The proxy node's mesh is zero-vertex in this file; accept either None
+        // or an empty mesh set as "nothing to draw".
+        match decode_model_render(&bytes) {
+            None => {}
+            Some(m) => assert_eq!(m.triangle_count(), 0, "proxy file must have no render tris"),
         }
     }
 }

@@ -18,8 +18,11 @@
 //!   `Brush` chunk yields a `Matrix34` transform.
 //!
 //! The reconstructed grid is `1024 x 1024` cells (a 4 m lattice over the 4096 m
-//! world), matching the note's validation: Class3 `min 21.32 / max 322.50 /
-//! mean 140.89 m`, `0` missing cells.
+//! world) for [`decode_terrain`], matching the note's validation: Class3
+//! `min 21.32 / max 322.50 / mean 140.89 m`, `0` missing cells. The source is
+//! adaptive and as fine as 2 m in the densest sectors, so
+//! [`decode_terrain_hires`] reconstructs the same world at `2048 x 2048` (2 m),
+//! which is what the engine draws near the player.
 //!
 //! # Coordinate convention
 //!
@@ -42,6 +45,8 @@ const TERRAIN_NODE_LEN: usize = 44;
 const OBJECT_NODE_LEN: usize = 32;
 /// Validated reconstruction resolution (samples per side).
 const RECON_GRID: usize = 1024;
+/// Native-resolution reconstruction (2 m spacing on the 4096 m world).
+const HIRES_GRID: usize = 2048;
 /// Hard recursion-depth guard for both trees.
 const MAX_DEPTH: usize = 64;
 /// Hard total-node guards, so malformed data cannot run unbounded.
@@ -144,7 +149,6 @@ struct Header {
     world: f64,
     sector: f64,
     geom_shift: usize,
-    grid: usize,
 }
 
 impl Header {
@@ -179,7 +183,6 @@ impl Header {
             world: n_height as f64 * n_unit as f64,
             sector: n_sector as f64,
             geom_shift: units.trailing_zeros() as usize,
-            grid: RECON_GRID,
         })
     }
 }
@@ -399,8 +402,7 @@ fn surface_global_at(lf: &Leaf, x: f64, y: f64) -> Option<u8> {
     Some(global_surface(lf, (raw & 0x000F) as u8))
 }
 
-fn reconstruct(hdr: &Header, leaves: &[Leaf]) -> Option<Terrain> {
-    let grid = hdr.grid;
+fn reconstruct(hdr: &Header, leaves: &[Leaf], grid: usize) -> Option<Terrain> {
     if grid == 0 {
         return None;
     }
@@ -470,9 +472,38 @@ fn reconstruct(hdr: &Header, leaves: &[Leaf]) -> Option<Terrain> {
 /// Returns `None` for malformed input (truncated header/tree, non-power-of-two
 /// sector units, big-endian variant, or an incomplete grid).
 pub fn decode_terrain(dat: &[u8]) -> Option<Terrain> {
+    decode_terrain_at(dat, RECON_GRID)
+}
+
+/// Reconstruct the heightmap on a `grid` x `grid` sample lattice.
+///
+/// The source quadtree is adaptive: `Class3` mixes leaf sample spacings of
+/// 2 m (`nSize == 33`), 4 m, 8 m, 16 m and 32 m within individual 64 m sectors.
+/// [`decode_terrain`] samples the whole world at 4 m (`grid == 1024`), which
+/// aliases every 2 m leaf down to half resolution. `grid == 2048` samples at the
+/// native 2 m spacing (`make_terrain_hires`), which is what the engine's near
+/// terrain uses; `grid == 4096` is full detail (1 m) at 16x the memory.
+///
+/// Total: returns `None` for `grid == 0`, malformed input, or a grid with any
+/// missing cell rather than emitting holes.
+pub fn decode_terrain_at(dat: &[u8], grid: usize) -> Option<Terrain> {
+    if grid == 0 {
+        return None;
+    }
     let hdr = Header::parse(dat)?;
     let (_, leaves) = walk_terrain(dat, &hdr, true)?;
-    reconstruct(&hdr, &leaves)
+    reconstruct(&hdr, &leaves, grid)
+}
+
+/// Native-resolution reconstruction (2048 samples/side, 2 m spacing).
+///
+/// This is the resolution the terrain data was authored at in the densest
+/// sectors (`nSize == 33` over a 64 m sector), and matches what the shipping
+/// engine renders near the player. Prefer this over [`decode_terrain`] for the
+/// drawn terrain mesh; keep [`decode_terrain`] when a fixed 1024 grid is
+/// expected (tests, cached artefacts).
+pub fn decode_terrain_hires(dat: &[u8]) -> Option<Terrain> {
+    decode_terrain_at(dat, HIRES_GRID)
 }
 
 impl Terrain {
@@ -702,6 +733,10 @@ fn parse_object_block(dat: &[u8], start: usize, end: usize, out: &mut Vec<Static
                 }
                 p = q + adv;
             }
+            // Unrecognised render-node type: stop this block. Types are sorted
+            // ascending and only brush (1) entries are emitted, so nothing
+            // emitted is lost; later decal/road/merged-mesh entries are skipped
+            // (see `architecture::parse_object_block`).
             _ => break,
         }
     }
@@ -894,6 +929,39 @@ mod tests {
             v4.len(),
             objs.len()
         );
+    }
+
+    /// The native 2 m reconstruction must be complete and agree with the 4 m
+    /// one on the global extrema; it simply carries more detail. This is the
+    /// grid the drawn terrain should use (near the player).
+    #[test]
+    fn class3_hires() {
+        let Some(dat) = load(CLASS3) else { return };
+        let lo = decode_terrain(&dat).expect("1024 decode");
+        let hi = decode_terrain_hires(&dat).expect("2048 decode");
+        assert_eq!(hi.samples, 2048);
+        assert_eq!(hi.heights.len(), 2048 * 2048);
+        assert_eq!(hi.surfaces.len(), 2048 * 2048);
+        assert!((hi.spacing - 2.0).abs() < 1e-4, "spacing {}", hi.spacing);
+        assert!((hi.min - lo.min).abs() < 0.05, "hi min {} vs {}", hi.min, lo.min);
+        assert!((hi.max - lo.max).abs() < 0.05, "hi max {} vs {}", hi.max, lo.max);
+        let m = mean(&hi.heights);
+        assert!((m - 140.8888).abs() < 0.05, "hi mean {m}");
+
+        // The 2 m grid carries strictly more distinct heights than the 4 m one
+        // (the densest sectors are 2 m leaves).
+        assert!(hi.heights.len() == 4 * lo.heights.len());
+
+        // A 4 m-stride mesh at hires == native 8 m grid (what the renderer draws
+        // when it keeps the current stride on the finer grid).
+        let (v4, i4) = build_mesh(&hi, 4);
+        assert_eq!(v4.len(), 512 * 512);
+        assert_eq!(i4.len(), 511 * 511 * 6);
+        let (v2, _) = build_mesh(&hi, 2);
+        assert_eq!(v2.len(), 1024 * 1024);
+
+        // decode_terrain_at is total.
+        assert!(decode_terrain_at(&dat, 0).is_none());
     }
 
     #[test]

@@ -32,7 +32,7 @@
 //!
 //! | class | fileModel (script) | native asset | rig |
 //! |---|---|---|---|
-//! | Grunt / FreshGrunt | *(variant)* | male zombie standard body CDF | `zombie_male` |
+//! | Grunt / FreshGrunt | *(variant)* | `noshirt02` + `legs/jeans` + `head01` fragments on the shared zombie rig | `zombie_male` |
 //! | ArmyZombie / SwatZombie | `characters/freaks/armored/armored.chr` | `armored.cdf` | `freaks/armored` |
 //! | Feral | `characters/freaks/feral/feral.cdf` | same | `freaks/feral` |
 //! | Bloater | `characters/freaks/bloater/bloater.cdf` | same | `freaks/bloater` |
@@ -41,7 +41,10 @@
 //!
 //! The `.cdf` sibling is preferred over a bare `fileModel` `.chr` so the
 //! skeleton, all attachments and the explicit `Material=` overrides come from
-//! one place, exactly as the player's character is loaded.
+//! one place, exactly as the player's character is loaded. The grunt is the
+//! exception: the shipped `noshirt_jeans.cdf` carries only a body fragment whose
+//! shins are stripped (the `ZombieVariant` jeans supply them), so it is built
+//! from the authored fragment list against the shared skeleton instead.
 //!
 //! # Separation
 //!
@@ -101,13 +104,33 @@ pub fn capsule_for_class(entity_class: &str) -> Capsule {
 
 /// A zombie class's renderable character: the shipped `.cdf` and the `.caf` rig
 /// its locomotion bank is filtered by.
+///
+/// Some classes are not shipped as one self-contained character. The ambient
+/// Grunt is assembled by `ZombieVariant.xml` from separate Body/Legs/Head
+/// fragments, none of which is a complete body on its own; `parts` carries that
+/// authored fragment list and `skeleton` the shared rig. When `parts` is empty
+/// the single `path` asset is used instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CharacterDef {
-    /// Virtual path of the `.cdf` (or `.chr`) to assemble.
+    /// Virtual path of the `.cdf` (or `.chr`) to assemble (the sole asset when
+    /// `parts` is empty).
     pub path: &'static str,
     /// Rig substring the `ClipBank` scan keeps (`None` would scan everything).
     pub rig: &'static str,
+    /// Shared skeleton `.chr` for an explicit `parts` assembly.
+    pub skeleton: &'static str,
+    /// Authored fragment list `(slot, .chr path)`; empty => use `path`.
+    pub parts: &'static [(&'static str, &'static str)],
 }
+
+/// The male zombie body fragments the `ZombieVariant` "noshirt" type composes
+/// (`body/noshirt02` + `legs/jeans` + `heads/head01`). The body mesh alone has
+/// no shins (that region comes from the jeans), so it must not be drawn alone.
+const GRUNT_PARTS: &[(&str, &str)] = &[
+    ("body", "characters/male/zombie/body/noshirt02/noshirt02.chr"),
+    ("legs", "characters/male/zombie/legs/jeans/jeans.chr"),
+    ("head", "characters/male/zombie/heads/head01/head01.chr"),
+];
 
 /// Map a `ZombieTypes.xml` `EntityClass` to its character asset and rig.
 pub fn character_for_class(entity_class: &str) -> CharacterDef {
@@ -117,29 +140,41 @@ pub fn character_for_class(entity_class: &str) -> CharacterDef {
             // adds the freak skeleton and the armored skin layer.
             path: "characters/freaks/armored/armored.cdf",
             rig: "freaks/armored",
+            skeleton: "",
+            parts: &[],
         },
         "Feral" => CharacterDef {
             path: "characters/freaks/feral/feral.cdf",
             rig: "freaks/feral",
+            skeleton: "",
+            parts: &[],
         },
         "Bloater" => CharacterDef {
             path: "characters/freaks/bloater/bloater.cdf",
             rig: "freaks/bloater",
+            skeleton: "",
+            parts: &[],
         },
         "Screamer" => CharacterDef {
             path: "characters/freaks/screamer/screamer.cdf",
             rig: "freaks/screamer",
+            skeleton: "",
+            parts: &[],
         },
         "Juggernaut" => CharacterDef {
             path: "characters/freaks/juggernaut/juggernaut.cdf",
             rig: "freaks/juggernaut",
+            skeleton: "",
+            parts: &[],
         },
         // Grunt / FreshGrunt: the ZombieVariant system assembles a civilian at
-        // spawn. Use the shipped male standard body CDF (head + clothed body)
-        // as the native stand-in; it carries the full material palette.
+        // spawn from separate body/legs/head meshes. `path` stays the shipped
+        // body CDF (used for logging/tests); rendering uses `parts`.
         _ => CharacterDef {
             path: "characters/male/zombie/body/noshirt_jeans/noshirt_jeans.cdf",
             rig: "zombie_male",
+            skeleton: "characters/male/zombie/skeleton/skeleton.chr",
+            parts: GRUNT_PARTS,
         },
     }
 }
@@ -259,7 +294,13 @@ mod tests {
         let grunt = character_for_class("Grunt");
         assert!(grunt.path.ends_with(".cdf"));
         assert_eq!(grunt.rig, "zombie_male");
-        // Every freak maps to its own asset.
+        // The ambient grunt is assembled from the ZombieVariant fragments
+        // (body + legs + head) against the shared zombie rig, because no single
+        // shipped `.cdf` is a complete body.
+        assert_eq!(grunt.parts.len(), 3, "grunt body/legs/head fragments");
+        assert!(grunt.parts.iter().any(|(n, _)| *n == "legs"));
+        assert!(grunt.skeleton.ends_with("zombie/skeleton/skeleton.chr"));
+        // Every freak maps to its own complete asset (no explicit parts).
         for (class, needle, rig) in [
             ("ArmyZombie", "armored", "freaks/armored"),
             ("SwatZombie", "armored", "freaks/armored"),
@@ -271,6 +312,7 @@ mod tests {
             let d = character_for_class(class);
             assert!(d.path.contains(needle), "{class} -> {}", d.path);
             assert_eq!(d.rig, rig);
+            assert!(d.parts.is_empty(), "{class} is a self-contained asset");
             assert_ne!(d.path, grunt.path, "{class} must not reuse the grunt body");
         }
         // Unknown classes collapse to the grunt stand-in.

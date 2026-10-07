@@ -31,6 +31,7 @@ use crate::mesh;
 use crate::skin;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use std::collections::HashMap;
 
 /// One `<Attachment>` entry of a character definition.
 #[derive(Debug, Clone)]
@@ -64,6 +65,9 @@ pub struct Cdf {
 
 const ZERO_POS: [f32; 3] = [0.0, 0.0, 0.0];
 const IDENTITY_ROT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// Identity in the same **scalar-first** `(w, x, y, z)` packing a `.cdf`
+/// `Rotation` attribute uses (the shipped files write `"1,0,0,0"`).
+const UNIT_ROT: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
 
 /// Parse a `.cdf`. Returns `None` unless the document contains both a
 /// `<CharacterDefinition>` and a non-empty `<Model File="...">`. Never panics.
@@ -266,44 +270,22 @@ fn resolve_slots(
     }
 }
 
-/// The `.cdf` slot that carries the clothed torso garment.
-const BODY_SLOT: &str = "body";
-/// The `.cdf` slot that carries the bare/full-body base layer.
-const SKIN_SLOT: &str = "skin";
-
-/// Indices of `parts` that duplicate the body layer and should be dropped.
+/// Decode the base model plus **every** resolvable attachment of an already
+/// parsed `cdf`.
 ///
-/// A shipped `.cdf` normally lists a `body` attachment (the garment:
-/// `tshirt_jeans`, `jacket01`, ...) *and* a `skin` attachment. The `skin`
-/// binding is a complete, already-clothed body mesh
-/// (`characters/*/human/skin/*/skin.chr`, ~4k vertices spanning neck to hips)
-/// while `body` is the visible garment on top; rendering both stacks two whole
-/// characters at the same transform — the "two overlapping models" bug.
-/// CryEngine treats `skin` as the default under-layer that a `body` slot
-/// replaces, so whenever a decoded `body` part exists every `skin` part is
-/// redundant and dropped.
-///
-/// Only parts whose geometry actually decoded are considered, so a `body`
-/// attachment that failed to load never causes the surviving skin to be culled.
-/// Returns an empty vector when there is no body layer.
-pub fn is_redundant_skin(parts: &[CharacterPart]) -> Vec<usize> {
-    let has_body = parts
-        .iter()
-        .any(|p| p.name.eq_ignore_ascii_case(BODY_SLOT) && !p.model.meshes.is_empty());
-    if !has_body {
-        return Vec::new();
-    }
-    parts
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.name.eq_ignore_ascii_case(SKIN_SLOT))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Decode the base model plus every resolvable attachment of an already-parsed
-/// `cdf`, then drop redundant layers (see [`is_redundant_skin`]) so the result
-/// is a single, non-overlapping character.
+/// The original engine (`CharacterDefinition` loader, `0x00a8fec0`) adds every
+/// `<Attachment>` of the `<AttachmentList>` in document order; `Type="CA_SKIN"`
+/// and `Type="CA_FACE"` both resolve to renderable skinned meshes, and nothing
+/// is culled because a `body` slot is present. A shipped survivor `.cdf`
+/// therefore layers a *bare-skin* body (`skin`, e.g.
+/// `skin/med_sleeve_thin_shirt/skin.chr`, material `UL_Test_Skin` / `skin_d`)
+/// under the `body` garment, `legs` and `head` meshes. The garments are authored
+/// slightly larger so they occlude the skin they cover, while the uncovered
+/// regions — lower forearms, hands and fingers, neck — come from the skin
+/// layer. Dropping `skin` whenever a `body` exists (an earlier misreading of
+/// the "two overlapping models" bug, which was really the pre-controller-id
+/// binding displacing the under-layer) is exactly what removed the player's
+/// arms below the sleeve cuff.
 ///
 /// Missing/unreadable attachments are skipped rather than failing the whole
 /// load; `None` only when the base `.chr` or its skeleton cannot be read.
@@ -350,28 +332,147 @@ fn assemble(vfs: &Vfs, cdf: &Cdf) -> Option<(skin::Skeleton, Vec<CharacterPart>)
         });
     }
 
-    // Remove in reverse so earlier indices stay valid.
-    for i in is_redundant_skin(&parts).into_iter().rev() {
-        parts.remove(i);
-    }
     Some((skeleton, parts))
 }
 
 /// Load the base model plus every resolvable attachment of `cdf_path`.
 ///
-/// Historical entry point (the app calls it); it now delegates to
-/// [`load_assembled`], so the returned parts are already de-duplicated.
+/// Historical entry point (the app calls it); it delegates to
+/// [`load_assembled`]. Every CA_SKIN attachment is kept, matching the engine.
 pub fn load_parts(vfs: &Vfs, cdf_path: &str) -> Option<(skin::Skeleton, Vec<CharacterPart>)> {
     load_assembled(vfs, cdf_path)
 }
 
-/// Load and assemble `cdf_path` into a single, non-overlapping character.
+/// One explicit attachment of an in-memory assembly.
+#[derive(Debug, Clone, Copy)]
+pub struct AssemblyPart<'a> {
+    /// Slot label (`body`, `legs`, `head`, ...).
+    pub name: &'a str,
+    /// Source `.chr` path (forward-slash normalised).
+    pub binding: &'a str,
+}
+
+/// Assemble an explicit part list against a shared skeleton `.chr`.
 ///
-/// Identical to [`load_parts`] but named for the assembly semantics: the bare
-/// `skin` layer is dropped when a `body` garment is present (see
-/// [`is_redundant_skin`]), so the player renders as one model rather than two
-/// stacked ones. The base `Model` contributes a part only when its `.chr`
-/// actually carries geometry (a bare `skeleton.chr` usually does not).
+/// Some characters are not shipped as a self-contained `.cdf`: the ambient
+/// zombie (`ZombieVariant.xml`) is composed at spawn from separate Body, Legs
+/// and Head meshes, each of which is only a fragment of the body on its own
+/// (for example `body/noshirt02.chr` carries the torso/arms/shorts and the
+/// soles, but no shins — those come from `legs/jeans/jeans.chr`). Loading one
+/// fragment in isolation leaves the other pieces as disconnected islands that
+/// fly apart once the skeleton is animated. This entry point assembles the
+/// authored fragment set against the rig so the result is one intact body.
+///
+/// The local bind transform of an explicit part is identity: the meshes are
+/// authored in the rig's model space (same convention as a `.cdf` attachment
+/// with `Position="0,0,0" Rotation="1,0,0,0"`).
+pub fn assemble_explicit(
+    vfs: &Vfs,
+    skeleton_chr: &str,
+    parts: &[AssemblyPart],
+) -> Option<(skin::Skeleton, Vec<CharacterPart>)> {
+    let base = vfs.read(skeleton_chr)?;
+    let skeleton = skin::parse_skeleton(&base)?;
+    let mut out = Vec::new();
+    for p in parts {
+        let Some(ab) = vfs.read(p.binding) else { continue };
+        let Some(model) = mesh::decode_model_with(&ab, false) else { continue };
+        let slots = resolve_slots(vfs, p.binding, None, model.material_name.as_deref());
+        out.push(CharacterPart {
+            name: p.name.to_string(),
+            path: p.binding.to_string(),
+            model,
+            slots,
+            bone: None,
+            position: ZERO_POS,
+            rotation: UNIT_ROT,
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some((skeleton, out))
+    }
+}
+
+/// A character assembled from [`CharacterPart`]s and merged into a single
+/// skeleton-driven model, mirroring the app's `.cdf` merge.
+#[derive(Clone, Default)]
+pub struct MergedParts {
+    /// All attachment meshes baked into model space, in part order.
+    pub model: mesh::DecodedModel,
+    /// Per-mesh influence groups (parallel to `model.meshes`).
+    pub influences: Vec<Vec<[skin::BoneWeight; 4]>>,
+    /// Concatenated material palette.
+    pub slots: Vec<MaterialSlot>,
+    /// Every referenced texture, deduplicated by path.
+    pub tex_bytes: HashMap<String, Vec<u8>>,
+}
+
+/// Merge assembled parts into one model, baking each part's local bind transform
+/// (CDF rotations are scalar-first `(w,x,y,z)`) and offsetting its submesh
+/// material indices into the concatenated palette.
+pub fn merge_parts(vfs: &Vfs, parts: &[CharacterPart]) -> MergedParts {
+    let mut merged = MergedParts::default();
+    for part in parts {
+        // The base `skeleton/skeleton.chr` is a rig proxy, not body geometry.
+        if part.path.to_ascii_lowercase().contains("skeleton/skeleton") {
+            continue;
+        }
+        let rot = skin::Mat4::from_quat([
+            part.rotation[1],
+            part.rotation[2],
+            part.rotation[3],
+            part.rotation[0],
+        ]);
+        let tr = part.position;
+        let infl = vfs
+            .read(&part.path)
+            .and_then(|b| skin::decode_influences(&b))
+            .unwrap_or_default();
+        let base = merged.slots.len() as u32;
+        for (mi, m) in part.model.meshes.iter().enumerate() {
+            let mut m2 = m.clone();
+            for p in &mut m2.positions {
+                let t = rot.transform_point(*p);
+                *p = [t[0] + tr[0], t[1] + tr[1], t[2] + tr[2]];
+            }
+            for n in &mut m2.normals {
+                let t = rot.transform_dir(*n);
+                let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                *n = if len > 1e-8 {
+                    [t[0] / len, t[1] / len, t[2] / len]
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+            }
+            for sm in &mut m2.submeshes {
+                sm.material = sm.material.saturating_add(base);
+            }
+            merged.model.meshes.push(m2);
+            merged.influences.push(infl.get(mi).cloned().unwrap_or_default());
+        }
+        merged.slots.extend(part.slots.iter().cloned());
+        for slot in &part.slots {
+            for (_, tp) in &slot.textures {
+                if !merged.tex_bytes.contains_key(tp) {
+                    if let Some(b) = vfs.read(tp) {
+                        merged.tex_bytes.insert(tp.clone(), b);
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Load and assemble `cdf_path` into every authored attachment layer.
+///
+/// Identical to [`load_parts`] but named for the assembly semantics. Every
+/// `<Attachment>` is kept in document order (bare `skin` under `body`/`legs`/
+/// `head`/`hair`), matching the engine's `CharacterDefinition` loader. The base
+/// `Model` contributes a part only when its `.chr` actually carries geometry (a
+/// bare `skeleton.chr` usually does not).
 pub fn load_assembled(vfs: &Vfs, cdf_path: &str) -> Option<(skin::Skeleton, Vec<CharacterPart>)> {
     let bytes = vfs.read(cdf_path)?;
     let cdf = parse(&bytes)?;
@@ -552,9 +653,11 @@ mod tests {
         assert!(parts.iter().all(|p| !p.model.meshes.is_empty()));
     }
 
-    /// Real `v01.cdf`: assembly must leave exactly one body layer.
+    /// Real `v01.cdf`: assembly must keep **all** authored layers, including
+    /// the bare `skin` under-layer that carries the hands/fingers and the lower
+    /// forearms exposed below the shirt cuff.
     #[test]
-    fn real_v01_assembles_single_body_layer() {
+    fn real_v01_assembles_all_layers() {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extracted-game/characters");
         let Ok(root) = root.canonicalize() else { return };
@@ -570,14 +673,14 @@ mod tests {
         let bodies = parts.iter().filter(|p| p.name.eq_ignore_ascii_case("body")).count();
         let skins = parts.iter().filter(|p| p.name.eq_ignore_ascii_case("skin")).count();
         assert_eq!(bodies, 1, "exactly one body layer");
-        assert_eq!(skins, 0, "bare skin layer culled");
+        assert_eq!(skins, 1, "bare skin under-layer is kept");
         assert!(parts.iter().all(|p| !p.model.meshes.is_empty()));
     }
 
-    /// Synthetic CDF listing both `body` and `skin` against real assets: the
-    /// skin layer must be dropped while body/legs survive.
+    /// Synthetic CDF listing both `body` and `skin` against real assets: both
+    /// layers must survive, body first and skin retained beneath it.
     #[test]
-    fn synthetic_body_and_skin_drops_skin() {
+    fn synthetic_body_and_skin_keeps_both() {
         const SYNTH: &str = r#"<CharacterDefinition>
  <Model File="characters/male/human/skeleton/skeleton.chr"/>
  <AttachmentList>
@@ -602,40 +705,88 @@ mod tests {
         let (skel, parts) = assemble(&vfs, &cdf).expect("synthetic cdf assembles");
         assert!(skel.bones.len() > 0);
         assert!(parts.iter().any(|p| p.name.eq_ignore_ascii_case("body")));
-        assert!(!parts.iter().any(|p| p.name.eq_ignore_ascii_case("skin")));
+        assert!(parts.iter().any(|p| p.name.eq_ignore_ascii_case("skin")));
         assert!(parts.iter().any(|p| p.name.eq_ignore_ascii_case("legs")));
+        // Document order is preserved: body precedes skin.
+        let bi = parts.iter().position(|p| p.name.eq_ignore_ascii_case("body")).unwrap();
+        let si = parts.iter().position(|p| p.name.eq_ignore_ascii_case("skin")).unwrap();
+        assert!(bi < si, "body layer stays ahead of the skin under-layer");
     }
 
-    fn fake_part(name: &str, meshes: usize) -> CharacterPart {
-        let mut model = crate::mesh::DecodedModel::default();
-        for _ in 0..meshes {
-            model.meshes.push(crate::mesh::DecodedMesh::default());
-        }
-        CharacterPart {
-            name: name.to_string(),
-            path: format!("{name}.chr"),
-            model,
-            slots: Vec::new(),
-            bone: None,
-            position: ZERO_POS,
-            rotation: IDENTITY_ROT,
-        }
-    }
-
+    /// The ambient zombie is not a self-contained `.cdf`: its `body/noshirt02`
+    /// mesh has the shin region stripped (the jeans supply it), so drawn alone
+    /// it renders as a torso with detached shoes. Assembling the authored
+    /// `ZombieVariant` "noshirt" fragments (body + legs + head) against the
+    /// shared skeleton must produce one continuous body. Skips when the game
+    /// assets are absent.
     #[test]
-    fn is_redundant_skin_culls_only_with_body() {
-        let with_body = [fake_part("body", 1), fake_part("skin", 1), fake_part("legs", 1)];
-        assert_eq!(is_redundant_skin(&with_body), vec![1]);
+    fn explicit_zombie_assembly_is_one_continuous_body() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extracted-game/characters");
+        let Ok(root) = root.canonicalize() else { return };
+        let mut vfs = Vfs::new();
+        vfs.set_loose_root(&root);
+        let skeleton = "characters/male/zombie/skeleton/skeleton.chr";
+        let spec = [
+            AssemblyPart {
+                name: "body",
+                binding: "characters/male/zombie/body/noshirt02/noshirt02.chr",
+            },
+            AssemblyPart {
+                name: "legs",
+                binding: "characters/male/zombie/legs/jeans/jeans.chr",
+            },
+            AssemblyPart {
+                name: "head",
+                binding: "characters/male/zombie/heads/head01/head01.chr",
+            },
+        ];
+        if vfs.read(skeleton).is_none() || spec.iter().any(|p| vfs.read(p.binding).is_none()) {
+            return; // assets absent
+        }
+        let (skel, parts) = assemble_explicit(&vfs, skeleton, &spec).expect("zombie assembles");
+        assert!(skel.bones.len() >= 40, "shared rig present");
+        assert_eq!(parts.len(), 3, "body + legs + head");
+        let merged = merge_parts(&vfs, &parts);
+        assert_eq!(merged.model.meshes.len(), merged.influences.len());
+        for (m, infl) in merged.model.meshes.iter().zip(&merged.influences) {
+            assert_eq!(m.positions.len(), infl.len(), "per-vertex influences");
+        }
 
-        let no_body = [fake_part("skin", 1), fake_part("legs", 1)];
-        assert!(is_redundant_skin(&no_body).is_empty());
+        // Geometry must span feet..head with no hollow slab. The body fragment
+        // alone has a ~0.38 m hole between the shoes (z<0.2) and the knees
+        // (z>0.55) where the jeans were stripped.
+        let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut hist = [0usize; 32];
+        for m in &merged.model.meshes {
+            for p in &m.positions {
+                mn = mn.min(p[2]);
+                mx = mx.max(p[2]);
+                hist[((p[2].max(0.0) * 10.0) as usize).min(31)] += 1;
+            }
+        }
+        assert!(mn < 0.1, "feet reach the ground (min z {mn})");
+        assert!(mx > 1.7, "head reaches the top (max z {mx})");
+        let lo = (mn.max(0.0) * 10.0) as usize;
+        let hi = ((mx * 10.0) as usize).min(31);
+        for b in lo..=hi {
+            assert!(hist[b] > 0, "hollow z-slab {b}: a limb is detached");
+        }
 
-        // A body attachment that decoded no geometry must not cull the skin.
-        let empty_body = [fake_part("body", 0), fake_part("skin", 1)];
-        assert!(is_redundant_skin(&empty_body).is_empty());
-
-        // The base model slot (empty name) is not a body layer.
-        let base_only = [fake_part("", 1), fake_part("skin", 1)];
-        assert!(is_redundant_skin(&base_only).is_empty());
+        // The explicit bind transform is identity, so the merged body vertices
+        // must match the standalone decoded fragment bit-for-bit in f32.
+        let raw = vfs.read(spec[0].binding).unwrap();
+        let decoded = crate::mesh::decode_model_with(&raw, false).unwrap();
+        let a = &merged.model.meshes[0].positions;
+        let b = &decoded.meshes[0].positions;
+        assert_eq!(a.len(), b.len());
+        for (p, q) in a.iter().zip(b) {
+            assert!(
+                (p[0] - q[0]).abs() < 1e-6
+                    && (p[1] - q[1]).abs() < 1e-6
+                    && (p[2] - q[2]).abs() < 1e-6,
+                "explicit assembly must not rotate the fragment ({p:?} vs {q:?})"
+            );
+        }
     }
 }

@@ -351,6 +351,42 @@ fn ensure_template(br: &mut ZombieBridge, cry: &CryHost, class: &str) -> bool {
 /// overrides); the clip bank is then rebuilt filtered to the class rig so freaks
 /// do not animate on human clips.
 fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTemplate> {
+    // Classes whose shipped asset is only a fragment of the body (the ambient
+    // Grunt: `ZombieVariant` composes Body + Legs + Head at spawn) are built
+    // from the authored part list against the shared skeleton. Drawing one
+    // fragment alone leaves the rest of the body as disconnected islands that
+    // detach once the skeleton animates.
+    if !def.parts.is_empty() {
+        let spec: Vec<sod_core::cdf::AssemblyPart> = def
+            .parts
+            .iter()
+            .map(|(name, binding)| sod_core::cdf::AssemblyPart { name, binding })
+            .collect();
+        let (skeleton, parts) = sod_core::cdf::assemble_explicit(vfs, def.skeleton, &spec)?;
+        let merged = sod_core::cdf::merge_parts(vfs, &parts);
+        // Filter the scan to this class's rig so the fallback bank cannot pick a
+        // human clip, and so the scan stays cheap.
+        let bank = sod_core::character::ClipBank::build(vfs, def.skeleton, Some(def.rig), 3000);
+        let idle = pick_clip(vfs, def.rig, IDLE_CLIPS)
+            .or_else(|| bank.caf_for(anim::Locomotion::Idle).cloned())?;
+        let walk = pick_clip(vfs, def.rig, WALK_CLIPS)
+            .or_else(|| bank.caf_for(anim::Locomotion::Walk).cloned())
+            .unwrap_or_else(|| idle.clone());
+        let death = pick_clip(vfs, def.rig, DEATH_CLIPS);
+        let react = pick_clip(vfs, def.rig, REACT_CLIPS);
+        return Some(ZombieTemplate {
+            model: merged.model,
+            slots: merged.slots,
+            tex_bytes: merged.tex_bytes,
+            skeleton,
+            influences: merged.influences,
+            idle,
+            walk,
+            death,
+            react,
+            mats: Vec::new(),
+        });
+    }
     if def.path.to_ascii_lowercase().ends_with(".cdf") {
         let (model, slots, tex_bytes, skeleton, influences, _caf, bank) =
             crate::load_cdf_character(vfs, def.path)?;

@@ -3,6 +3,9 @@
 //! re-written here; it runs from the original scripts loaded at runtime.
 
 pub mod actor;
+pub mod ai;
+pub mod ai_data;
+pub mod ai_loader;
 pub mod binds_entity;
 pub mod binds_sound;
 pub mod binds_system;

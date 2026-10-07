@@ -97,10 +97,61 @@ struct LevelLighting {
 }
 
 /// The player's AnimationGraph (playerfullbody.xml) driven from movement.
-/// Clips are not taken from it yet: graph animation names resolve to clip
-/// files through the template/alias chain still being recovered.
 #[derive(Resource)]
 struct PlayerGraph(sod_core::ag_driver::CharacterGraph);
+
+/// Player AnimationGraph resolution context: the character's animation-name
+/// table (`<chr>.chrparams` aliases + LocomotionGroups), the VFS to load the
+/// resolved `.caf` clips, and the rig used for their root motion.
+#[derive(Resource)]
+struct AnimCtx {
+    table: sod_core::anim_alias::AnimNameTable,
+    vfs: Vfs,
+    skeleton: Skeleton,
+}
+
+/// One resolved clip of a graph state, loaded for playback.
+#[derive(Clone)]
+struct AnimClipDef {
+    caf: anim::Caf,
+    /// LocomotionGroup blend position (`[0,0,0]` for a single clip).
+    pos: [f32; 3],
+    /// Root-motion ground speed (m/s).
+    speed: f32,
+    /// Blend weight for the current frame.
+    weight: f32,
+}
+
+/// A graph state's resolved animation, ready to blend and play. The state's
+/// animation name is resolved through [`AnimCtx::table`]; a `.lmg` becomes a
+/// blend of its examples, a single alias one clip. States with no explicit
+/// animation (the idle `Default`/`HumanAlive` templates) fall back to the
+/// character's [`character::ClipBank`].
+#[derive(Clone)]
+struct LoadedAnim {
+    clips: Vec<AnimClipDef>,
+    /// `Some` when the state resolves to a LocomotionGroup.
+    blend_type: Option<sod_core::anim_alias::BlendType>,
+    /// Blend positions, parallel to `clips`.
+    params: Vec<[f32; 3]>,
+    /// Template `playback_speed` (`1.0` default).
+    playback_speed: f32,
+    /// One-shot transition state (hold, then release the graph link).
+    one_shot: bool,
+    /// Motion profile used by the engine's expensive locomotion selection.
+    motion: sod_core::ag_cost::CandidateMotion,
+    /// Weighted clip speed (m/s) at the current blend, for foot-slide matching.
+    ref_speed: f32,
+    /// Phase cycles per second.
+    rate: f32,
+}
+
+/// One animation layer: the current state, or the outgoing crossfade source.
+struct AnimLayer {
+    anim: LoadedAnim,
+    /// Normalised clip phase `0..1`.
+    phase: f32,
+}
 
 /// Static collision world (CryPhysics replacement): terrain plus the physics
 /// proxies of every placed brush and script-loaded prop.
@@ -136,6 +187,22 @@ struct Player {
     mstate: sod_core::class3_move::MoveState,
     /// Decompiled locomotion state machine (idle/walk/run/sprint transitions).
     ploco: player_locomotion::PlayerLocomotion,
+    /// Per-graph-state resolved animation (workerA2b), keyed by state index.
+    anim_cache: HashMap<usize, Option<LoadedAnim>>,
+    /// Parsed `.caf` per path.
+    caf_cache: HashMap<String, anim::Caf>,
+    /// Current animation layer (the graph's current state).
+    cur_layer: Option<AnimLayer>,
+    /// Outgoing layer while crossfading.
+    prev_layer: Option<AnimLayer>,
+    /// Crossfade factor `0` (prev) .. `1` (cur).
+    blend: f32,
+    /// Crossfade duration (link `transitionTime` seconds).
+    blend_dur: f32,
+    /// The current one-shot clip has finished.
+    anim_finished: bool,
+    /// Graph state index currently playing.
+    anim_state: Option<usize>,
 }
 
 #[derive(Resource)]
@@ -850,6 +917,28 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         tanner,
     };
 
+    // AnimationGraph clip resolution (workerA2b): the character's alias table
+    // and the master rig its locomotion clips' root motion is measured on. The
+    // VFS moves into `AnimCtx` after the resource chain stops using it.
+    let anim_parts = if play {
+        let table = sod_core::anim_alias::AnimNameTable::load_character(&vfs, &player_model);
+        let skeleton = vfs
+            .read("characters/male/human/skeleton/skeleton.chr")
+            .and_then(|b| sod_core::skin::parse_skeleton(&b));
+        match (table, skeleton) {
+            (Some(table), Some(skeleton)) => {
+                println!("[anim] graph alias table: {} aliases / {} clips", table.alias_count(), table.clip_count());
+                Some((table, skeleton))
+            }
+            _ => {
+                println!("[anim] no graph alias table; using the clip bank");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut app = App::new();
     app.add_plugins(DefaultPlugins
         .set(WindowPlugin {
@@ -872,6 +961,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .insert_resource(CamLagRes(sod_core::camera::CameraLag::new()))
     .insert_resource(HudRes(hud::HudState::new()))
     .add_systems(Startup, setup_world);
+    if let Some((table, skeleton)) = anim_parts {
+        app.insert_resource(AnimCtx { table, skeleton, vfs });
+    }
     if let Some(c) = collision {
         app.insert_resource(c);
     }
@@ -1116,7 +1208,7 @@ fn setup_world(
         });
         let mut mstate = sod_core::class3_move::MoveState::new([ps.spawn[0], ps.spawn[1], ps.spawn[2]]);
         mstate.yaw = yaw;
-        commands.insert_resource(Player { yaw, pos: [ps.spawn[0], ps.spawn[1]], parts, skeleton: ps.skeleton.clone(), caf: ps.caf.clone(), time: 0.0, moving: false, rate: 1.0, bank: ps.bank.clone(), loc: anim::Locomotion::Idle, mstate, ploco: player_locomotion::PlayerLocomotion::with_decoupled(tuning::default_movement(), true) });
+        commands.insert_resource(Player { yaw, pos: [ps.spawn[0], ps.spawn[1]], parts, skeleton: ps.skeleton.clone(), caf: ps.caf.clone(), time: 0.0, moving: false, rate: 1.0, bank: ps.bank.clone(), loc: anim::Locomotion::Idle, mstate, ploco: player_locomotion::PlayerLocomotion::with_decoupled(tuning::default_movement(), true), anim_cache: HashMap::new(), caf_cache: HashMap::new(), cur_layer: None, prev_layer: None, blend: 1.0, blend_dur: 0.0, anim_finished: false, anim_state: None });
         // Start the camera behind the player and re-seed the lag so it snaps.
         if let Some(mut cs) = cam_state {
             cs.0.yaw = yaw;
@@ -1423,6 +1515,264 @@ fn menu_input(
     }
 }
 
+/// Map a ground speed to the LocomotionGroup gait axis: `-1` at the shipped
+/// walk speed, `+1` at the run speed (clamped outside), so `relaxed_walk.lmg`'s
+/// walk row (`y=-1`) and run row (`y=+1`) are selected by how fast the
+/// character is actually moving.
+fn gait_param(speed: f32, t: &tuning::MovementTuning) -> f32 {
+    if !speed.is_finite() || speed <= t.walk {
+        return -1.0;
+    }
+    if speed >= t.run {
+        return 1.0;
+    }
+    if (t.run - t.walk).abs() < 1e-6 {
+        return 0.0;
+    }
+    ((speed - t.walk) / (t.run - t.walk)) * 2.0 - 1.0
+}
+
+/// Horizontal root-motion ground speed of a clip (m/s).
+fn clip_speed(caf: &anim::Caf, skeleton: &Skeleton) -> f32 {
+    let rm = locomotion::root_motion(caf, skeleton, caf.start as f32, caf.end as f32);
+    let dur = caf.duration_secs();
+    if !(dur > 0.0) {
+        return 0.0;
+    }
+    (rm.translation[0] * rm.translation[0] + rm.translation[1] * rm.translation[1]).sqrt() / dur
+}
+
+/// Parse a clip from the VFS, cached on the player.
+fn read_caf(ctx: &AnimCtx, cache: &mut HashMap<String, anim::Caf>, path: &str) -> Option<anim::Caf> {
+    if let Some(c) = cache.get(path) {
+        return Some(c.clone());
+    }
+    let caf = anim::Caf::parse(&ctx.vfs.read(path)?)?;
+    cache.insert(path.to_string(), caf.clone());
+    Some(caf)
+}
+
+/// Resolve one graph state's animation via `anim_alias` and load its clips.
+///
+/// A single alias is one clip (played at the template's `playback_speed`); a
+/// `.lmg` LocomotionGroup is a blend of its examples whose motion profile is the
+/// `min..max` of their root-motion speeds. States with no explicit animation
+/// (the idle `Default`/`HumanAlive` templates) fall back to the character's
+/// clip bank, picked by the state name.
+fn build_state_anim(
+    graph: &sod_core::ag_runtime::Graph,
+    state: usize,
+    ctx: &AnimCtx,
+    stance: &str,
+    item: &str,
+    caf_cache: &mut HashMap<String, anim::Caf>,
+    bank: &character::ClipBank,
+) -> Option<LoadedAnim> {
+    use sod_core::anim_alias::{AnimInputs, ResolvedKind};
+    let tpl = sod_core::ag_driver::state_template(graph, state);
+    let playback_speed = tpl.speed();
+    let one_shot = tpl.one_shot();
+
+    if let Some(name) = tpl.animation.as_deref() {
+        let inputs = AnimInputs::new()
+            .with("stance", stance)
+            .with("item", item)
+            .with("dir", "fwd")
+            .with("direction", "fwd")
+            .with("version", "01");
+        if let Some(res) = ctx.table.resolve(name, &inputs) {
+            let mut clips = Vec::new();
+            let mut speeds = Vec::new();
+            for (path, _) in &res.clips {
+                let Some(caf) = read_caf(ctx, caf_cache, path) else { continue };
+                let speed = clip_speed(&caf, &ctx.skeleton);
+                speeds.push(speed);
+                clips.push(AnimClipDef { caf, pos: [0.0; 3], speed, weight: 0.0 });
+            }
+            if !clips.is_empty() {
+                let (blend_type, params) = match &res.kind {
+                    ResolvedKind::Blend(info) => {
+                        for (i, p) in info.params.iter().enumerate() {
+                            if let Some(c) = clips.get_mut(i) {
+                                c.pos = *p;
+                            }
+                        }
+                        (Some(info.blend_type.clone()), info.params.clone())
+                    }
+                    ResolvedKind::Single => (None, Vec::new()),
+                };
+                let motion = sod_core::ag_driver::motion_from_resolved(&res, &speeds)
+                    .unwrap_or_else(|| sod_core::ag_cost::CandidateMotion::from_speed(0.0, 0.0));
+                return Some(LoadedAnim { clips, blend_type, params, playback_speed, one_shot, motion, ref_speed: 0.0, rate: playback_speed });
+            }
+        }
+    }
+
+    let id = graph.states.get(state).map(|s| s.id.to_ascii_lowercase()).unwrap_or_default();
+    let loc = if id.contains("sprint") {
+        anim::Locomotion::Sprint
+    } else if id.contains("run") {
+        anim::Locomotion::Run
+    } else if id.contains("walk") || id.contains("creep") {
+        anim::Locomotion::Walk
+    } else {
+        anim::Locomotion::Idle
+    };
+    let caf = bank.caf_for(loc).or_else(|| bank.caf_for(anim::Locomotion::Idle))?.clone();
+    let speed = clip_speed(&caf, &ctx.skeleton);
+    Some(LoadedAnim {
+        clips: vec![AnimClipDef { caf, pos: [0.0; 3], speed, weight: 1.0 }],
+        blend_type: None,
+        params: Vec::new(),
+        playback_speed,
+        one_shot,
+        motion: sod_core::ag_cost::CandidateMotion::from_clip_speed(speed),
+        ref_speed: speed,
+        rate: playback_speed,
+    })
+}
+
+type AnimSample = HashMap<u32, (Option<[f32; 3]>, [f32; 4])>;
+
+/// Accumulate one clip's sampled controllers at normalised `phase` with weight
+/// `w` into `out`, sign-correcting quaternions (nlerp).
+fn accumulate_sample(out: &mut AnimSample, caf: &anim::Caf, phase: f32, w: f32) {
+    if w <= 0.0 || !phase.is_finite() {
+        return;
+    }
+    let dur = caf.duration_secs().max(1e-6);
+    let tick = caf.start as f32 + (phase * dur) / caf.secs_per_tick.max(1e-9);
+    for (id, (p, q)) in caf.sample_tick(tick) {
+        let e = out.entry(id).or_insert((None, [0.0, 0.0, 0.0, 0.0]));
+        if let Some(pv) = p {
+            let cur = e.0.get_or_insert([0.0; 3]);
+            cur[0] += pv[0] * w;
+            cur[1] += pv[1] * w;
+            cur[2] += pv[2] * w;
+        }
+        let dot = e.1[0] * q[0] + e.1[1] * q[1] + e.1[2] * q[2] + e.1[3] * q[3];
+        let s = if dot < 0.0 { -1.0 } else { 1.0 };
+        for k in 0..4 {
+            e.1[k] += q[k] * w * s;
+        }
+    }
+}
+
+fn normalize_samples(s: &mut AnimSample) {
+    for e in s.values_mut() {
+        let l = (e.1[0] * e.1[0] + e.1[1] * e.1[1] + e.1[2] * e.1[2] + e.1[3] * e.1[3]).sqrt();
+        if l > 1e-8 {
+            for t in 0..4 {
+                e.1[t] /= l;
+            }
+        } else {
+            e.1 = [0.0, 0.0, 0.0, 1.0];
+        }
+    }
+}
+
+/// A layer's composed sample: its clips blended by their current weights.
+fn layer_sample(layer: &AnimLayer) -> AnimSample {
+    let mut out = AnimSample::new();
+    let n = layer.anim.clips.len();
+    if n == 0 {
+        return out;
+    }
+    let wsum: f32 = layer.anim.clips.iter().map(|c| c.weight.max(0.0)).sum();
+    for c in &layer.anim.clips {
+        let w = if wsum > 1e-6 { c.weight.max(0.0) / wsum } else { 1.0 / n as f32 };
+        accumulate_sample(&mut out, &c.caf, layer.phase, w);
+    }
+    normalize_samples(&mut out);
+    out
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Crossfade two layer samples (`blend` 0 = prev, 1 = cur).
+fn mix_layers(prev: &AnimSample, cur: &AnimSample, blend: f32) -> AnimSample {
+    let t = smoothstep(blend);
+    let mut out = AnimSample::new();
+    for (id, (p, q)) in prev {
+        let e = out.entry(*id).or_insert((None, [0.0, 0.0, 0.0, 0.0]));
+        if let Some(pv) = p {
+            let c = e.0.get_or_insert([0.0; 3]);
+            for k in 0..3 {
+                c[k] += pv[k] * (1.0 - t);
+            }
+        }
+        let dot = q[0] * e.1[0] + q[1] * e.1[1] + q[2] * e.1[2] + q[3] * e.1[3];
+        let s = if dot < 0.0 { -1.0 } else { 1.0 };
+        for k in 0..4 {
+            e.1[k] += q[k] * (1.0 - t) * s;
+        }
+    }
+    for (id, (p, q)) in cur {
+        let e = out.entry(*id).or_insert((None, [0.0, 0.0, 0.0, 0.0]));
+        if let Some(pv) = p {
+            let c = e.0.get_or_insert([0.0; 3]);
+            for k in 0..3 {
+                c[k] += pv[k] * t;
+            }
+        }
+        let dot = q[0] * e.1[0] + q[1] * e.1[1] + q[2] * e.1[2] + q[3] * e.1[3];
+        let s = if dot < 0.0 { -1.0 } else { 1.0 };
+        for k in 0..4 {
+            e.1[k] += q[k] * t * s;
+        }
+    }
+    normalize_samples(&mut out);
+    out
+}
+
+fn deform_parts(parts: &[AnimPart], skin_m: &[skin::Mat4], meshes: &mut Assets<Mesh>) {
+    for part in parts {
+        let npos = skin::deform(&part.bind_pos, &part.infl, skin_m);
+        let nnrm = skin::deform_normals(&part.bind_nrm, &part.infl, skin_m);
+        if let Some(mut m) = meshes.get_mut(&part.handle) {
+            m.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(npos));
+            m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(nnrm));
+        }
+    }
+}
+
+impl Player {
+    /// Resolve and cache a graph state's animation (motion + clips).
+    fn ensure_state_anim(&mut self, graph: &sod_core::ag_runtime::Graph, ctx: &AnimCtx, state: usize, stance: &str, item: &str) {
+        if self.anim_cache.contains_key(&state) {
+            return;
+        }
+        let loaded = build_state_anim(graph, state, ctx, stance, item, &mut self.caf_cache, &self.bank);
+        self.anim_cache.insert(state, loaded);
+    }
+
+    /// Switch the current animation to a graph state, crossfading from the
+    /// previous one over the link `transitionTime`.
+    fn switch_state(&mut self, state: usize, trans: f32) {
+        let Some(anim) = self.anim_cache.get(&state).and_then(|a| a.clone()) else { return };
+        let start_phase = if anim.one_shot {
+            0.0
+        } else {
+            self.cur_layer.as_ref().map(|l| l.phase).unwrap_or(0.0)
+        };
+        self.prev_layer = self.cur_layer.take();
+        self.cur_layer = Some(AnimLayer { anim, phase: start_phase });
+        if self.prev_layer.is_some() && trans > 1e-4 {
+            self.blend = 0.0;
+            self.blend_dur = trans;
+        } else {
+            self.prev_layer = None;
+            self.blend = 1.0;
+            self.blend_dur = 0.0;
+        }
+        self.anim_finished = false;
+        self.anim_state = Some(state);
+    }
+}
+
 fn move_player(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -1435,6 +1785,7 @@ fn move_player(
     mut q: Query<&mut Transform, With<PlayerRoot>>,
     collision: Option<Res<Collision>>,
     graph: Option<ResMut<PlayerGraph>>,
+    anim_ctx: Option<Res<AnimCtx>>,
 ) {
     if menu.active {
         return;
@@ -1507,25 +1858,86 @@ fn move_player(
     player.pos = [player.mstate.pos[0], player.mstate.pos[1]];
     player.yaw = player.mstate.yaw;
 
-    // Animation graph: inputs from this frame's movement.
-    if let Some(mut g) = graph {
-        let req_speed = if sprint { t.sprint } else { t.run } * mag.min(1.0);
+    // AnimationGraph: drive the player's clips exactly as the engine does —
+    // resolve the current state's animation through `anim_alias`, play/blend
+    // its clips, and walk the link path when a one-shot transition finishes.
+    let use_graph = graph.is_some() && anim_ctx.is_some();
+    if let (Some(mut g), Some(ctx)) = (graph, anim_ctx) {
+        let desired_speed = if sprint { t.sprint } else { t.run } * mag.min(1.0);
         let wl = (wdx * wdx + wdy * wdy).sqrt().max(1e-6);
         let v = player.mstate.vel;
+        let actual_speed = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        // The requested speed tracks the controller as it accelerates from
+        // rest; the graph's expensive locomotion cost then walks
+        // Idle -> IdleToMovement -> Walk -> Run and back down the same ramp.
+        let req_mag = actual_speed.min(desired_speed);
         let snap = sod_core::ag_driver::MovementSnapshot {
-            requested_vel: [wdx / wl * req_speed, wdy / wl * req_speed],
+            requested_vel: [wdx / wl * req_mag, wdy / wl * req_mag],
             actual_vel: [v[0], v[1]],
             body_yaw: sod_core::class3_move::render_yaw(player.mstate.yaw),
-            pseudo_speed: sod_core::class3_move::pseudo_speed_from_speed((v[0] * v[0] + v[1] * v[1]).sqrt(), t.run),
+            pseudo_speed: sod_core::class3_move::pseudo_speed_from_speed(actual_speed, t.run),
             stance: if crouch { "crouch".into() } else { "relaxed".into() },
             ..Default::default()
         };
+        // Resolve every candidate state's animation once (cached per state).
+        {
+            let values = sod_core::ag_driver::graph_inputs(&g.0.graph, &snap);
+            let cands = g.0.graph.candidates(&values);
+            for &i in &cands {
+                player.ensure_state_anim(&g.0.graph, &ctx, i, &snap.stance, &snap.item);
+            }
+        }
+        let motion_of = |i: usize| player.anim_cache.get(&i).and_then(|a| a.as_ref()).map(|a| a.motion);
         let before = g.0.current_name().map(str::to_string);
-        // INTERIM: one link per frame; the engine advances when the current
-        // state's animation allows leaving it (needs the resolved clips).
-        g.0.update(&snap, |_| None, true);
-        if std::env::var("SOD_AGDBG").is_ok() && g.0.current_name().map(str::to_string) != before {
-            eprintln!("[ag] {:?} -> {:?} (target {:?}, pseudo {:.2})", before, g.0.current_name(), g.0.target_name(), snap.pseudo_speed);
+        let idx_before = g.0.inst.current;
+        // A one-shot transition state holds until its clip finishes; steady
+        // states release their link immediately (engine's "can leave" check).
+        let cur_one_shot = player.cur_layer.as_ref().map(|l| l.anim.one_shot).unwrap_or(false);
+        let step = if cur_one_shot { player.anim_finished } else { true };
+        g.0.update(&snap, motion_of, step);
+        let idx_now = g.0.inst.current;
+        if idx_now != idx_before {
+            if let Some(i) = idx_now {
+                player.ensure_state_anim(&g.0.graph, &ctx, i, &snap.stance, &snap.item);
+                let trans = g.0.inst.blend;
+                player.switch_state(i, trans);
+            }
+            if std::env::var("SOD_AGDBG").is_ok() {
+                eprintln!(
+                    "[ag] {:?} -> {:?} (target {:?}, v {:.2}, pseudo {:.2})",
+                    before, g.0.current_name(), g.0.target_name(), actual_speed, snap.pseudo_speed
+                );
+            }
+        }
+        // Refresh the current layer's LocomotionGroup blend and playback rate
+        // from this frame's movement (requested speed/direction).
+        let lateral = if mag > 1e-4 { (strafe_l / mag).clamp(-1.0, 1.0) } else { 0.0 };
+        let gait = gait_param(actual_speed, &t);
+        if let Some(l) = player.cur_layer.as_mut() {
+            let n = l.anim.clips.len();
+            if n > 0 {
+                let w = if n == 1 {
+                    vec![1.0]
+                } else {
+                    sod_core::ag_driver::blend_weights_for(l.anim.blend_type.as_ref(), &l.anim.params, lateral, gait)
+                };
+                let mut wsum = 0.0f32;
+                for (i, c) in l.anim.clips.iter_mut().enumerate() {
+                    c.weight = w.get(i).copied().unwrap_or(1.0 / n as f32);
+                    wsum += c.weight.max(0.0);
+                }
+                let ref_speed = if wsum > 1e-6 {
+                    l.anim.clips.iter().map(|c| c.weight.max(0.0) * c.speed).sum::<f32>() / wsum
+                } else {
+                    0.0
+                };
+                l.anim.ref_speed = ref_speed;
+                l.anim.rate = if l.anim.blend_type.is_some() && ref_speed > 0.1 && actual_speed > 0.05 {
+                    (l.anim.playback_speed * (actual_speed / ref_speed)).clamp(0.25, 2.5)
+                } else {
+                    l.anim.playback_speed
+                };
+            }
         }
     }
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();
@@ -1554,7 +1966,9 @@ fn move_player(
         locomotion::Gait::Run => anim::Locomotion::Run,
         locomotion::Gait::Sprint => anim::Locomotion::Sprint,
     };
-    if loc != player.loc {
+    // When the AnimationGraph drives the rig the old bank clip-swap is unused;
+    // it remains the fallback for a character without a graph/alias table.
+    if !use_graph && loc != player.loc {
         let c = player.bank.caf_for(loc).cloned();
         if let Some(c) = c {
             player.caf = c;
@@ -1576,20 +1990,69 @@ fn move_player(
 fn animate_player(anim: Option<ResMut<Player>>, mut meshes: ResMut<Assets<Mesh>>, time: Res<Time>) {
     let Some(mut anim) = anim else { return };
     if anim.parts.is_empty() { return; }
-    // Clip selection happens in `move_player`; here we just advance the clip at
-    // the speed-matched rate.
-    anim.time += time.delta_secs() * anim.rate.max(0.05);
-    let dur = anim.caf.duration_secs().max(1.0 / 30.0);
-    let tick = anim.caf.tick_from_seconds(anim.time % dur);
-    let sample = anim.caf.sample_tick(tick);
+    let dt = time.delta_secs();
+
+    // Fallback when the AnimationGraph is unavailable: the old speed-matched
+    // single clip.
+    if anim.cur_layer.is_none() {
+        anim.time += dt * anim.rate.max(0.05);
+        let dur = anim.caf.duration_secs().max(1.0 / 30.0);
+        let tick = anim.caf.tick_from_seconds(anim.time % dur);
+        let sample = anim.caf.sample_tick(tick);
+        let posed = anim.skeleton.pose_anchored(&sample);
+        let skin_m = anim.skeleton.skin_matrices(&posed);
+        deform_parts(&anim.parts, &skin_m, &mut meshes);
+        return;
+    }
+
+    // Advance the current (and outgoing) layers. A one-shot transition stops on
+    // its last frame and flags completion so `move_player` can walk the link.
+    let mut finished = false;
+    if let Some(l) = anim.cur_layer.as_mut() {
+        let dur = l.anim.clips.first().map(|c| c.caf.duration_secs()).filter(|d| *d > 0.0).unwrap_or(1.0);
+        let advance = dt * l.anim.rate.max(0.05) / dur;
+        if l.anim.one_shot {
+            if l.phase < 1.0 {
+                l.phase = (l.phase + advance).min(1.0);
+                if l.phase >= 1.0 {
+                    finished = true;
+                }
+            }
+        } else {
+            l.phase = (l.phase + advance).rem_euclid(1.0);
+        }
+    }
+    if finished {
+        anim.anim_finished = true;
+    }
+    if let Some(l) = anim.prev_layer.as_mut() {
+        let dur = l.anim.clips.first().map(|c| c.caf.duration_secs()).filter(|d| *d > 0.0).unwrap_or(1.0);
+        let advance = dt * l.anim.rate.max(0.05) / dur;
+        l.phase = (l.phase + advance).rem_euclid(1.0);
+    }
+
+    // Compose the pose: each layer's LMG blend, then the state crossfade.
+    let sample = {
+        let cur = anim.cur_layer.as_ref().map(layer_sample);
+        let prev = anim.prev_layer.as_ref().map(layer_sample);
+        let blend = anim.blend.clamp(0.0, 1.0);
+        match (cur, prev) {
+            (Some(c), Some(p)) => mix_layers(&p, &c, blend),
+            (Some(c), None) => c,
+            (None, Some(p)) => p,
+            (None, None) => return,
+        }
+    };
     let posed = anim.skeleton.pose_anchored(&sample);
     let skin_m = anim.skeleton.skin_matrices(&posed);
-    for part in &anim.parts {
-        let npos = skin::deform(&part.bind_pos, &part.infl, &skin_m);
-        let nnrm = skin::deform_normals(&part.bind_nrm, &part.infl, &skin_m);
-        if let Some(mut m) = meshes.get_mut(&part.handle) {
-            m.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(npos));
-            m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(nnrm));
+    deform_parts(&anim.parts, &skin_m, &mut meshes);
+
+    // Finish the crossfade.
+    if anim.blend < 1.0 {
+        let d = anim.blend_dur.max(1e-4);
+        anim.blend = (anim.blend + dt / d).min(1.0);
+        if anim.blend >= 1.0 {
+            anim.prev_layer = None;
         }
     }
 }

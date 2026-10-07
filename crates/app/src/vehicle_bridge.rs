@@ -17,7 +17,7 @@
 //!    hand-brake, `E` to enter/exit) and the original per-class vehicle camera
 //!    (`<View class="ActionThirdPerson">` / `<ThirdPerson>` params).
 //!
-//! It is always on in play mode; there is no demo flag. `SOD_AUTOSTART` (used
+//! It is always on in play mode; there is no demo flag. `SOD_VEHICLE_TEST` (used
 //! by the screenshot harness) additionally scripts an enter-and-drive so the
 //! verification screenshots show a spawned and a moving car.
 
@@ -399,7 +399,7 @@ fn vehicle_control(
     mut vw: ResMut<VehicleWorld>,
 ) {
     vw.frame = vw.frame.wrapping_add(1);
-    let auto = std::env::var("SOD_AUTOSTART").is_ok() || std::env::var("SOD_AUTODRIVE").is_ok();
+    let auto = std::env::var("SOD_VEHICLE_TEST").is_ok() || std::env::var("SOD_AUTODRIVE").is_ok();
     let dt = time.delta_secs().clamp(0.0, 1.0 / 20.0);
 
     let player_xy = player

@@ -10,3 +10,15 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 log = "0.4"
+
+# Debug iteration profile. At the default `opt-level = 0` the per-frame engine
+# and simulation code is CPU-bound (~100 ms/frame); profiling showed the cost is
+# spread across Bevy's ECS/render plus `sod-core` (skinning, collision, AI,
+# animation), not any single system, so building the whole graph optimised is the
+# fix. `[profile.dev]` covers the workspace crates, `package."*"` the registry
+# dependencies. See /tmp/opencode-p1/REPORT.md (workerP1) for frame times.
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3

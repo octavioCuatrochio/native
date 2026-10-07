@@ -95,6 +95,12 @@ struct LevelLighting {
     sun_dir: Vec3,
 }
 
+/// The player's AnimationGraph (playerfullbody.xml) driven from movement.
+/// Clips are not taken from it yet: graph animation names resolve to clip
+/// files through the template/alias chain still being recovered.
+#[derive(Resource)]
+struct PlayerGraph(sod_core::ag_driver::CharacterGraph);
+
 /// Static collision world (CryPhysics replacement): terrain plus the physics
 /// proxies of every placed brush and script-loaded prop.
 #[derive(Resource)]
@@ -650,6 +656,12 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         LevelLighting { sun_dir }
     });
 
+    let player_graph = vfs
+        .read("animations/graphs/playerfullbody.xml")
+        .and_then(|b| sod_core::ag_runtime::Graph::parse(&b))
+        .map(|g| PlayerGraph(sod_core::ag_driver::CharacterGraph::new(g)));
+    println!("[world] player animation graph: {}", player_graph.as_ref().map(|g| g.0.graph.states.len()).unwrap_or(0));
+
     // Collision from the same geometry the renderer draws.
     let collision = if std::env::var("SOD_NOCOLLIDE").is_ok() {
         None
@@ -861,6 +873,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .add_systems(Startup, setup_world);
     if let Some(c) = collision {
         app.insert_resource(c);
+    }
+    if let Some(g) = player_graph {
+        app.insert_resource(g);
     }
     if let Some(l) = level_lighting {
         app.insert_resource(l);
@@ -1417,6 +1432,7 @@ fn move_player(
     mut game: ResMut<GameState>,
     mut q: Query<&mut Transform, With<PlayerRoot>>,
     collision: Option<Res<Collision>>,
+    graph: Option<ResMut<PlayerGraph>>,
 ) {
     if menu.active {
         return;
@@ -1488,6 +1504,28 @@ fn move_player(
     }
     player.pos = [player.mstate.pos[0], player.mstate.pos[1]];
     player.yaw = player.mstate.yaw;
+
+    // Animation graph: inputs from this frame's movement.
+    if let Some(mut g) = graph {
+        let req_speed = if sprint { t.sprint } else { t.run } * mag.min(1.0);
+        let wl = (wdx * wdx + wdy * wdy).sqrt().max(1e-6);
+        let v = player.mstate.vel;
+        let snap = sod_core::ag_driver::MovementSnapshot {
+            requested_vel: [wdx / wl * req_speed, wdy / wl * req_speed],
+            actual_vel: [v[0], v[1]],
+            body_yaw: sod_core::class3_move::render_yaw(player.mstate.yaw),
+            pseudo_speed: sod_core::class3_move::pseudo_speed_from_speed((v[0] * v[0] + v[1] * v[1]).sqrt(), t.run),
+            stance: if crouch { "crouch".into() } else { "relaxed".into() },
+            ..Default::default()
+        };
+        let before = g.0.current_name().map(str::to_string);
+        // INTERIM: one link per frame; the engine advances when the current
+        // state's animation allows leaving it (needs the resolved clips).
+        g.0.update(&snap, |_| None, true);
+        if std::env::var("SOD_AGDBG").is_ok() && g.0.current_name().map(str::to_string) != before {
+            eprintln!("[ag] {:?} -> {:?} (target {:?}, pseudo {:.2})", before, g.0.current_name(), g.0.target_name(), snap.pseudo_speed);
+        }
+    }
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();
     player.moving = speed > 0.05;
 

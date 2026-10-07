@@ -210,6 +210,13 @@ pub trait SmEnv {
     ) -> Option<bool> {
         None
     }
+    /// Optional override consulted for *every* trigger before its built-in
+    /// evaluator runs. Returning `Some(v)` forces the output; `None` runs the
+    /// default. Lets an environment suppress engine-context fallbacks (e.g. the
+    /// idle taunt / juke delay timers) while the AI is engaged.
+    fn eval_trigger(&self, state: u32, output: u32, type_id: u8, operand: &[u8]) -> Option<bool> {
+        None
+    }
 }
 
 /// The engine's transition-selection RNG (`0x1ee28ec` / `0x1ee28f0`).
@@ -272,6 +279,24 @@ pub struct SmPending {
     pub list: SmTransitionList,
     /// `candidate.flags != 0`, copied to instance `+0x19`.
     pub flag: bool,
+}
+
+/// A transition the machine selected on its own this tick (`FUN_01698870`).
+///
+/// Recorded so the caller can observe the signal -> trigger output ->
+/// transition chain that the machine uses to enter an attack state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmTransitionEvent {
+    /// State the machine was in before the tick.
+    pub from: u32,
+    /// The trigger-output / condition index that fired.
+    pub condition: u16,
+    /// Trigger type id of that condition in the source state.
+    pub trigger_type: u8,
+    /// State the machine switched to.
+    pub target: u32,
+    /// Which of the source block's two condition lists matched.
+    pub list: SmTransitionList,
 }
 
 /// Ownership of locomotion, derived from the current state's name.
@@ -440,6 +465,51 @@ pub fn is_strike_state_name(name: &str) -> bool {
             .any(|k| n.contains(k))
 }
 
+/// The context-tag registry (`tags.win.tagdb`), decoded to `name[id]`.
+///
+/// The ULSM's type-19 trigger (`FUN_01376640`, actor `+0x12e0`) tests a numeric
+/// context tag in the actor's tag set. The AI raises those tags by name
+/// (`actor.AddContextTag(0, id, "Fast")`, `"Slow"`, `"Dormant"`, ...), and the
+/// engine resolves the name to the id through this registry. The file is a
+/// little-endian `ULTD` container: a header (`count` at `+0x0c`, blob size at
+/// `+0x10`), a `count`-entry `u32` offset table at `+0x14`, then the
+/// NUL-terminated name blob. An offset of `0xffffffff` marks a removed tag.
+pub fn parse_tagdb(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() < 20 || &bytes[..4] != b"ULTD" {
+        return Vec::new();
+    }
+    let rd32 = |o: usize| -> usize {
+        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+    };
+    let count = rd32(12);
+    let blob = rd32(16);
+    let off0 = 20usize;
+    let bstart = off0 + count.saturating_mul(4);
+    if bstart > bytes.len() {
+        return Vec::new();
+    }
+    let mut names = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = rd32(off0 + i * 4);
+        let next = if i + 1 < count { rd32(off0 + (i + 1) * 4) } else { blob };
+        if o == u32::MAX as usize || o >= blob {
+            names.push(String::new());
+            continue;
+        }
+        let start = bstart + o;
+        let end = (bstart + next.min(blob)).max(start).min(bytes.len());
+        let seg = &bytes[start..end];
+        let nul = seg.iter().position(|&c| c == 0).unwrap_or(seg.len());
+        names.push(String::from_utf8_lossy(&seg[..nul]).into_owned());
+    }
+    names
+}
+
+/// Look up a context tag's id by name in a [`parse_tagdb`] table (exact match).
+pub fn tag_id(names: &[String], name: &str) -> Option<u16> {
+    names.iter().position(|n| n == name).map(|i| i as u16)
+}
+
 /// A typed command emitted by a tick. The engine would apply these to the
 /// actor; the re-implementation publishes them so the caller owns the policy.
 #[derive(Debug, Clone, PartialEq)]
@@ -496,6 +566,8 @@ pub struct SmInstance<'a> {
     persist: HashMap<(u32, u32), Persist>,
     /// Transition chosen this tick, applied at the end of the tick.
     pub pending: Option<SmPending>,
+    /// The last transition the machine selected itself (see [`SmTransitionEvent`]).
+    pub last_transition: Option<SmTransitionEvent>,
     /// Commands emitted since the last `take_commands`.
     pub commands: Vec<SmCommand>,
     pub rng: SmRng,
@@ -531,6 +603,7 @@ impl<'a> SmInstance<'a> {
             transition_index,
             persist: HashMap::new(),
             pending: None,
+            last_transition: None,
             commands: Vec::new(),
             rng: SmRng::new(seed),
             drive: SmDriveMode::MachineDriven,
@@ -674,8 +747,27 @@ impl<'a> SmInstance<'a> {
         self.run_actions();
 
         if let Some(p) = self.pending.take() {
+            let trigger_type = self.condition_trigger_type(p.condition).unwrap_or(0);
+            self.last_transition = Some(SmTransitionEvent {
+                from: self.state,
+                condition: p.condition,
+                trigger_type,
+                target: p.target,
+                list: p.list,
+            });
             self.enter_state(p.target, Some(p.blend_in), Some(p.blend_out));
         }
+    }
+
+    /// The evaluated value of a trigger-output / condition index this tick.
+    pub fn output(&self, condition: u16) -> bool {
+        self.outputs.get(condition as usize).copied().unwrap_or(false)
+    }
+
+    /// Trigger type id of the condition output that last fired, for telemetry.
+    pub fn condition_trigger_type(&self, condition: u16) -> Option<u8> {
+        let idx = self.trigger_of_output.get(condition as usize).copied().flatten()?;
+        self.sm.payloads.triggers.get(idx).map(|t| t.type_id)
     }
 
     /// Evaluate every trigger of the current state in output order, so a
@@ -698,6 +790,10 @@ impl<'a> SmInstance<'a> {
 
     /// Evaluate one trigger record. Returns the output boolean.
     fn eval_record(&mut self, env: &dyn SmEnv, t: &crate::sm_payload::SmTriggerRecord, out: u32) -> bool {
+        let operand = raw(t).unwrap_or(&[]);
+        if let Some(v) = env.eval_trigger(t.state, out, t.type_id, operand) {
+            return v;
+        }
         let kind = trigger_kind(t.type_id);
         match kind {
             TriggerKind::ConstTrue => true,
@@ -1371,6 +1467,170 @@ mod tests {
         assert!(!inst.is_graph_driven());
         let cmds = inst.take_commands();
         assert!(cmds.iter().any(|c| matches!(c, SmCommand::PlayFragment { .. })));
+    }
+
+    /// Environment that models the AI-side inputs a live zombie supplies to its
+    /// ULSM: the context tags it has raised (type-19 signals) and the attention
+    /// target the engine-side transform/query triggers read.
+    struct ZedTestEnv {
+        tags: std::collections::HashSet<u16>,
+        has_target: bool,
+        in_range: bool,
+        /// True while the machine is in a `Combat.*` state.
+        combat: bool,
+        target_bits: u32,
+        dt: f32,
+    }
+
+    impl SmEnv for ZedTestEnv {
+        fn delta_seconds(&self) -> f32 {
+            self.dt
+        }
+        fn signal(&self, id: u16) -> bool {
+            self.tags.contains(&id)
+        }
+        fn eval_raw_trigger(
+            &self,
+            _state: u32,
+            _output: u32,
+            type_id: u8,
+            operand: &[u8],
+        ) -> Option<bool> {
+            match type_id {
+                // Transform predicate: the AI's attention-target transform is
+                // populated while it holds a target.
+                97 => Some(self.has_target),
+                // Transform distance band: only meaningful inside the combat
+                // logic; outside it the predicate is inert.
+                99 => Some(self.in_range && self.combat),
+                // Actor state flag bitmask (stand / down / ...).
+                27 => Some(self.target_bits & operand.first().copied().unwrap_or(0) as u32 != 0),
+                _ => None,
+            }
+        }
+        fn eval_trigger(&self, _state: u32, _output: u32, type_id: u8, _operand: &[u8]) -> Option<bool> {
+            if type_id == 82 && self.has_target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn parse_tagdb_decodes_the_context_tag_registry() {
+        // Synthetic ULTd container: header + 2 offsets + name blob.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"ULTD");
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&10u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&5u32.to_le_bytes());
+        b.extend_from_slice(b"Fast\0Slow\0");
+        let names = parse_tagdb(&b);
+        assert_eq!(names, vec!["Fast".to_string(), "Slow".to_string()]);
+        assert_eq!(tag_id(&names, "Slow"), Some(1));
+        assert_eq!(tag_id(&names, "Nope"), None);
+    }
+
+    /// The zombie's own machine must reach a `Combat.*Strike*` state through its
+    /// transition graph (no `go_to`): feeding the AI context tags and the
+    /// attention-target inputs it reads selects the attack transition.
+    #[test]
+    fn zombie_machine_selects_attack_state_from_ai_context() {
+        let Some(bytes) = real_sm("zombie", "win") else { return };
+        let sm = parse_sm(&bytes).expect("zombie parses");
+        let mut inst = SmInstance::new(&sm, 0x1234);
+        assert_eq!(inst.state_name(), "GraphDriven.Observer");
+        let tags = tag_names_for_test();
+        let mut env = ZedTestEnv {
+            tags: std::collections::HashSet::new(),
+            has_target: true,
+            in_range: false,
+            combat: false,
+            target_bits: 2,
+            dt: 0.1,
+        };
+        if let Some(id) = tag_id(&tags, "Slow") {
+            env.tags.insert(id);
+        }
+        // Approach: the machine enters the combat logic while still out of the
+        // strike band (type-99 distance trigger false).
+        let mut in_slow_eval = false;
+        for _ in 0..40 {
+            env.combat = inst.state_name().contains(".Combat.");
+            inst.tick(&env);
+            if inst.state_name() == "MachineDriven.Combat.Slow.Evaluate" {
+                in_slow_eval = true;
+                break;
+            }
+        }
+        assert!(
+            in_slow_eval,
+            "slow zombie should reach the slow combat logic, got {}",
+            inst.state_name()
+        );
+        // In the strike band: the machine's own transition selection enters the
+        // attack state (no `go_to`).
+        env.in_range = true;
+        let mut reached = None;
+        for _ in 0..12 {
+            env.combat = inst.state_name().contains(".Combat.");
+            inst.tick(&env);
+            if is_strike_state_name(inst.state_name()) {
+                reached = Some(inst.state.clone());
+                break;
+            }
+        }
+        assert!(reached.is_some(), "machine should select an attack state on its own, got {}", inst.state_name());
+        assert!(inst.last_transition.is_some(), "a transition was selected");
+        assert!(
+            inst.state_name().contains("Combat.Slow.Strike"),
+            "slow zombie -> slow strike, got {}",
+            inst.state_name()
+        );
+        assert!(inst.take_commands().iter().any(|c| matches!(c, SmCommand::PlayFragment { .. })));
+
+        // The `Fast` context tag routes the same machine into the fast strike.
+        let mut fast = SmInstance::new(&sm, 0x99);
+        let mut fenv = ZedTestEnv { tags: std::collections::HashSet::new(), has_target: true, in_range: false, combat: false, target_bits: 2, dt: 0.1 };
+        if let Some(id) = tag_id(&tags, "Fast") {
+            fenv.tags.insert(id);
+        }
+        let mut in_fast_eval = false;
+        for _ in 0..40 {
+            fenv.combat = fast.state_name().contains(".Combat.");
+            fast.tick(&fenv);
+            if fast.state_name() == "MachineDriven.Combat.Fast.Evaluate" {
+                in_fast_eval = true;
+                break;
+            }
+        }
+        assert!(in_fast_eval, "fast zombie should reach the fast combat logic, got {}", fast.state_name());
+        fenv.in_range = true;
+        let mut fast_strike = None;
+        for _ in 0..12 {
+            fenv.combat = fast.state_name().contains(".Combat.");
+            fast.tick(&fenv);
+            if is_strike_state_name(fast.state_name()) {
+                fast_strike = Some(fast.state.clone());
+                break;
+            }
+        }
+        assert!(fast_strike.is_some(), "fast zombie should reach a strike, got {}", fast.state_name());
+        assert!(
+            fast.state_name().contains("Combat.Fast"),
+            "fast zombie -> fast strike, got {}",
+            fast.state_name()
+        );
+    }
+
+    /// Load the shipped context-tag registry from the extracted data, if present.
+    fn tag_names_for_test() -> Vec<String> {
+        let p = "/home/battlestation/Desktop/sod-re/extracted-game/gamedata/libs/class3/tags.win.tagdb";
+        std::fs::read(p).map(|b| parse_tagdb(&b)).unwrap_or_default()
     }
 
     #[test]

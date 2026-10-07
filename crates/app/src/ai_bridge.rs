@@ -84,6 +84,10 @@ struct ZombieCombat {
     attack_cd: f32,
     /// True once the zombie's perception acquired the player.
     alerted: bool,
+    /// Seconds of lost-target grace left. The engine keeps a 0.5 s post timer
+    /// after the last sighting (`DAT_01deff58[z]`, `zombie_ai.md` §4), so a
+    /// one-frame cone/LOS flicker does not drop the AI out of combat.
+    lost: f32,
     /// Hit-reaction timer (seconds); drives the visible knock-back.
     reaction: f32,
 }
@@ -154,6 +158,10 @@ pub struct ZombieBridge {
     /// Leaked parsed state machines, keyed by actor family (`zombie`,
     /// `freak_feral`, ...). Each live zombie runs the machine for its class.
     sm_machines: HashMap<&'static str, &'static StateMachine>,
+    /// The shipped context-tag registry (`libs/class3/tags.win.tagdb`), indexed
+    /// by tag id. The ULSM's type-19 signal triggers read these ids; the AI
+    /// raises the tags by name (`Fast`, `Slow`, `Dormant`, ...).
+    tag_names: Vec<String>,
     /// Logical handle -> the zombie's running ULSM instance.
     sm_instances: HashMap<u32, SmInstance<'static>>,
     /// Logical handle -> the in-flight attack (present while a strike runs).
@@ -299,6 +307,17 @@ fn ensure_init(br: &mut ZombieBridge, cry: &CryHost) -> bool {
             }
             None => eprintln!("[zombie] WARNING: state machine {rel} unavailable"),
         }
+    }
+
+    // The context-tag registry the ULSM's type-19 signal triggers read. The AI
+    // raises tags by name; the id is the tag's index in this file.
+    br.tag_names = vfs
+        .read("libs/class3/tags.win.tagdb")
+        .or_else(|| vfs.read("gamedata/libs/class3/tags.win.tagdb"))
+        .map(|b| sm_runtime::parse_tagdb(&b))
+        .unwrap_or_default();
+    if !br.tag_names.is_empty() {
+        println!("[zombie] context tags: {} registered", br.tag_names.len());
     }
     true
 }
@@ -618,6 +637,9 @@ const PLAYER_GUN_RANGE: f32 = 45.0;
 /// Range at which the perception loop lets a zombie's state machine strike:
 /// `melee.damageRadius` (1.1 m) plus the actor reach band.
 const ZOMBIE_STRIKE_RANGE: f32 = 2.2;
+/// Lost-target grace after the last sighting (engine post timer, `zombie_ai.md`
+/// §4: `DAT_01deff58[z]` = `0x3f000000` = 0.5 s).
+const LOST_TARGET_HOLD: f32 = 0.5;
 /// How long a forced `MachineDriven.Combat.*` strike state may run before the
 /// machine is handed back to the graph. Covers the longest strike fragment.
 const STRIKE_WINDOW: f32 = 1.6;
@@ -631,33 +653,6 @@ fn machine_family(class: &str) -> &'static str {
         "Screamer" => "freak_screamer",
         _ => "zombie",
     }
-}
-
-/// The `MachineDriven.Combat.*` attack state this class uses, in preference
-/// order. Feral swipes, the Juggernaut slams, the rest use the slow or fast
-/// claw strike (`fast` = the `Fast` context tag / hunt pipe scale).
-fn pick_strike_state(inst: &SmInstance, family: &str, fast: bool) -> Option<u32> {
-    let candidates: &[&str] = match family {
-        "freak_feral" => &[
-            "Combat.Basic.DoubleSwipe",
-            "Combat.Basic.JumpAttack",
-            "Combat.TargetDown.Attacks",
-        ],
-        "freak_juggernaut" => &[
-            "Combat.Slam.Normal",
-            "Combat.Slam.Walking",
-            "Combat.Charge.FollowupSlam",
-        ],
-        _ if fast => &[
-            "Combat.Fast.Strike.TargetStand.Left",
-            "Combat.Fast.Strike.TargetStand.Right",
-        ],
-        _ => &[
-            "Combat.Slow.Strike.TargetStand.Left",
-            "Combat.Slow.Strike.TargetStand.Right",
-        ],
-    };
-    candidates.iter().find_map(|c| inst.find_state(c))
 }
 
 /// The damage tier named by `state`'s own action block. Only the strike tiers
@@ -721,16 +716,33 @@ fn load_strike_clip(vfs: &Vfs, class: &str, clip: &str) -> Option<anim::Caf> {
     None
 }
 
-/// Engine inputs for a zombie's ULSM. The native perception loop drives the
-/// machine (it forces the attack state with `go_to`), so the engine trigger
-/// inputs are inert; only the timers / phase are fed.
-struct ZedSmEnv {
+/// Engine inputs for a zombie's ULSM, built from the native perception loop.
+///
+/// The original AI does not drive the compiled machine by hand: it raises
+/// context tags by name (`actor.AddContextTag(0, id, "Fast")`, `"Slow"`,
+/// `"Dormant"`, ...), the engine resolves each name to its id in
+/// `tags.win.tagdb`, and the machine's own type-19 signal triggers read those
+/// ids. In parallel the engine's attention-target transforms / query slots
+/// answer the type-97 / type-99 / type-40 predicates. This env supplies the
+/// same inputs, so the machine's trigger graph selects the attack state.
+struct ZedSmEnv<'a> {
     dt: f32,
     time: f32,
     phase: f32,
+    /// The machine being ticked, so the distance predicate can tell whether the
+    /// current state is inside the combat logic.
+    machine: &'a StateMachine,
+    /// Active context-tag ids (type-19 signals) raised for this zombie.
+    tags: &'a [u16],
+    /// The perception loop holds an attention target.
+    has_target: bool,
+    /// The target is inside the melee strike band (transform distance).
+    in_range: bool,
+    /// Actor state flag bits read by type 27 (bit 1 = target standing).
+    target_bits: u32,
 }
 
-impl SmEnv for ZedSmEnv {
+impl SmEnv for ZedSmEnv<'_> {
     fn delta_seconds(&self) -> f32 {
         self.dt
     }
@@ -739,6 +751,50 @@ impl SmEnv for ZedSmEnv {
     }
     fn animation_phase(&self) -> f32 {
         self.phase
+    }
+    fn signal(&self, id: u16) -> bool {
+        self.tags.contains(&id)
+    }
+    fn eval_raw_trigger(
+        &self,
+        state: u32,
+        _output: u32,
+        type_id: u8,
+        operand: &[u8],
+    ) -> Option<bool> {
+        match type_id {
+            // Type 97: a transform predicate (the attention target transform).
+            97 => Some(self.has_target),
+            // Type 99: a transform-to-transform distance band. It is only
+            // meaningful inside the combat logic; in the ambient/idle states the
+            // same predicate is inert, so those states can still hand back to
+            // `Combat.Logic.ContextTest`.
+            99 => {
+                let combat = self
+                    .machine
+                    .states
+                    .get(state as usize)
+                    .map(|s| s.name.contains(".Combat."))
+                    .unwrap_or(false);
+                Some(self.in_range && combat)
+            }
+            // Type 27: actor state flag bitmask (stand / down / ...).
+            27 => Some(
+                self.target_bits & operand.first().copied().unwrap_or(0) as u32 != 0,
+            ),
+            // Type 94: a per-actor flag query the demo does not set.
+            94 => Some(false),
+            _ => None,
+        }
+    }
+    fn eval_trigger(&self, _state: u32, _output: u32, type_id: u8, _operand: &[u8]) -> Option<bool> {
+        // While the AI is engaged, suppress the idle taunt / juke delay
+        // fallbacks (type 82) so the combat logic can select the strike.
+        if type_id == 82 && self.has_target {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -1034,15 +1090,20 @@ fn combat_step(
                         println!("[combat] zombie #{} {class} acquired player at {dist:.1}m", handle);
                         let _ = cry.host.event(entity, "OnSignal", ("TO_FRESHMEAT".to_string(), 0i64, 0i64));
                     }
+                    entry.lost = LOST_TARGET_HOLD;
                     rt.zombies[i].target = Some(player_pos);
                 } else {
-                    entry.alerted = false;
-                    rt.zombies[i].target = None;
+                    // Hold the acquired state briefly (engine 0.5 s post timer)
+                    // so perception flicker does not break the combat logic.
+                    entry.lost = (entry.lost - dt).max(0.0);
+                    if entry.lost <= 0.0 {
+                        entry.alerted = false;
+                        rt.zombies[i].target = None;
+                    }
                 }
                 entry.attack_cd = (entry.attack_cd - dt).max(0.0);
             }
             let alerted = br.combat.get(&handle).map(|c| c.alerted).unwrap_or(false);
-            let ready = br.combat.get(&handle).map(|c| c.attack_cd <= 0.0).unwrap_or(false);
 
             // --- the zombie's own state machine ---
             let family = machine_family(&class);
@@ -1054,32 +1115,91 @@ fn combat_step(
                 .remove(&handle)
                 .unwrap_or_else(|| SmInstance::new(machine, handle.wrapping_mul(0x9e37_79b1) | 1));
 
-            // Force-enter the class's melee attack state when perception, range
-            // and the strike gap agree (the engine would reach it through the
-            // `TO_ATTACK` signal; the native loop exercises the same state).
-            let strike_active = br.sm_strikes.contains_key(&handle);
-            if alerted && !strike_active && ready && dist <= ZOMBIE_STRIKE_RANGE {
-                if let Some(st) = pick_strike_state(&inst, family, !walk_only) {
-                    let profile = strike_profile(machine, st);
-                    if std::env::var("SOD_ZEDSMDBG").is_ok() {
-                        println!(
-                            "[combat] zombie #{} {class} SM -> [{}] {} (profile {:?})",
-                            handle,
-                            st,
-                            machine.states.get(st as usize).map(|s| s.name.as_str()).unwrap_or("?"),
-                            profile
-                        );
-                    }
-                    inst.go_to(st);
-                    br.sm_strikes.insert(
-                        handle,
-                        SmStrike { state: st, left: STRIKE_WINDOW, struck: false, profile },
-                    );
+            // The AI signals the perception loop raises are delivered as the
+            // context tags the behaviour layer adds in the original: the
+            // `TO_FAST`/`TO_SLOW` locomotion tag, `TO_FRESHMEAT` (target
+            // acquired), `TO_ATTACK` (in the strike band) and `TO_IDLE`
+            // (dormant). The machine's own type-19 triggers read these tag ids
+            // (recovered from `libs/class3/tags.win.tagdb`); the attention
+            // target feeds the type-97/99/40 context predicates.
+            let in_range = dist <= ZOMBIE_STRIKE_RANGE;
+            let fast = !walk_only;
+            let mut tags: Vec<u16> = Vec::with_capacity(4);
+            let signal_tags: [&str; 4] = [
+                if fast { "Fast" } else { "Slow" },
+                if class == "FreshGrunt" { "FreshZombie" } else { "" },
+                if in_range { "Attacking" } else if alerted { "TargetInside" } else { "Dormant" },
+                "",
+            ];
+            for name in signal_tags {
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(id) = sm_runtime::tag_id(&br.tag_names, name) {
+                    tags.push(id);
                 }
             }
 
-            let env = ZedSmEnv { dt, time: inst.time, phase: 0.0 };
+            let prev_state = inst.state;
+            let env = ZedSmEnv {
+                dt,
+                time: inst.time,
+                phase: 0.0,
+                machine,
+                tags: &tags,
+                // Inside the strike band the actor is on top of the player even
+                // if the cone/LOS check flickers, so treat it as targeted.
+                has_target: alerted || in_range,
+                in_range,
+                // bit 1 = target standing (the player is always upright here).
+                target_bits: 0b10,
+            };
             inst.tick(&env);
+
+            // The machine selected a transition on its own: log the
+            // signal -> trigger output -> transition chain.
+            if let Some(ev) = inst.last_transition {
+                if std::env::var("SOD_ZEDSMDBG").is_ok() {
+                    let names: Vec<&str> = tags
+                        .iter()
+                        .filter_map(|id| br.tag_names.get(*id as usize).map(|s| s.as_str()))
+                        .collect();
+                    println!(
+                        "[combat] zombie #{} {class} SM signals{:?} -> trigger cond {} (type {}) -> [{}] {} -> [{}] {}",
+                        handle,
+                        names,
+                        ev.condition,
+                        ev.trigger_type,
+                        ev.from,
+                        machine.states.get(ev.from as usize).map(|s| s.name.as_str()).unwrap_or("?"),
+                        ev.target,
+                        machine.states.get(ev.target as usize).map(|s| s.name.as_str()).unwrap_or("?")
+                    );
+                }
+            }
+            // Entering a `Combat.*` attack state is the machine's own choice;
+            // register the strike it selected.
+            if !br.sm_strikes.contains_key(&handle)
+                && inst.state != prev_state
+                && sm_runtime::is_strike_state_name(inst.state_name())
+            {
+                let st = inst.state;
+                let profile = strike_profile(machine, st);
+                if std::env::var("SOD_ZEDSMDBG").is_ok() {
+                    println!(
+                        "[combat] zombie #{} {class} attack state [{}] {} (profile {:?})",
+                        handle,
+                        st,
+                        machine.states.get(st as usize).map(|s| s.name.as_str()).unwrap_or("?"),
+                        profile
+                    );
+                }
+                br.sm_strikes.insert(
+                    handle,
+                    SmStrike { state: st, left: STRIKE_WINDOW, struck: false, profile },
+                );
+            }
+
             let mut struck = false;
             for cmd in inst.take_commands() {
                 match cmd {
@@ -1123,7 +1243,8 @@ fn combat_step(
             };
             if finish {
                 if let Some(s) = br.sm_strikes.remove(&handle) {
-                    inst.go_to(machine.start_state);
+                    // No forced `go_to`: the machine stays in the state it
+                    // selected and leaves it through its own transitions.
                     if let Some(c) = br.combat.get_mut(&handle) {
                         c.attack_cd = cry_combat::melee_recovery(s.profile);
                     }

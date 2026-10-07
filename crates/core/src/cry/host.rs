@@ -526,12 +526,18 @@ impl AreaRt {
     }
 }
 
+/// Actor classes the game module registers with the actor system (class ->
+/// script), as opposed to `.ent`-registered entity classes.
+pub const ACTOR_CLASSES: &[(&str, &str)] = &[("Player", "scripts/entities/actor/player.lua")];
+
 pub struct ScriptHost {
     pub lua: Lua,
     pub ctx: Ctx,
     pub areas: RefCell<Vec<AreaRt>>,
     /// Entities that trigger areas (the player; later vehicles/NPCs).
     pub area_listeners: RefCell<Vec<EntityId>>,
+    /// The game-rules entity, once created.
+    pub rules: RefCell<Option<EntityId>>,
     /// Classes the actor system owns (lower-case name -> is local player).
     pub actor_classes: RefCell<HashMap<String, bool>>,
     /// Lower-cased class name -> script path (`.ent` registry).
@@ -595,6 +601,7 @@ impl ScriptHost {
             areas: RefCell::new(Vec::new()),
             area_listeners: RefCell::new(Vec::new()),
             actor_classes: RefCell::new(HashMap::new()),
+            rules: RefCell::new(None),
             class_scripts: HashMap::new(),
         };
         host.install_script_binds()?;
@@ -605,6 +612,9 @@ impl ScriptHost {
         super::gamerules::install(&host.lua, &host.ctx)?;
         super::binds_sound::install(&host.lua, &host.ctx)?;
         host.load_class_registry();
+        for (class, script) in ACTOR_CLASSES {
+            host.class_scripts.insert(class.to_ascii_lowercase(), (class.to_string(), Some(script.to_string())));
+        }
         Ok(host)
     }
 
@@ -842,7 +852,37 @@ impl ScriptHost {
         if let Some(inst) = self.ctx.instance(id) {
             self.lua.globals().set("g_gameRules", inst)?;
         }
+        *self.rules.borrow_mut() = Some(id);
         Ok(id)
+    }
+
+    /// Single-player start after the level's entities are spawned
+    /// (`cry::events::START_GAME_SEQUENCE`): `OnLevelLoaded`, `OnStartLevel`,
+    /// `OnStartGame` to every entity, then the local client connects (the
+    /// rules script creates the player through `Actor.CreateActor`) and enters
+    /// the game. Returns the local player's id.
+    ///
+    /// Not sent: the initial `OnPropertyChange` and `OnReset` phases. Their
+    /// presence at game start is inferred only, and the scripts already reset
+    /// themselves from `OnInit`; to verify against the running game.
+    pub fn start_game(&mut self) -> Result<Option<EntityId>> {
+        let ids: Vec<EntityId> = self.ctx.instances.borrow().keys().copied().collect();
+        for ev in ["OnLevelLoaded", "OnStartLevel", "OnStartGame"] {
+            for &id in &ids {
+                self.event(id, ev, ())?;
+            }
+        }
+        let Some(rules) = *self.rules.borrow() else { return Ok(None) };
+        const LOCAL_CHANNEL: i64 = 1;
+        self.event(rules, "OnClientConnect", LOCAL_CHANNEL)?;
+        let player = self.ctx.actors.borrow().iter().find(|(_, a)| a.is_player).map(|(id, _)| *id);
+        if let Some(p) = player {
+            if let Some(inst) = self.ctx.instance(p) {
+                self.event(rules, "OnClientEnteredGame", (LOCAL_CHANNEL, inst, false))?;
+            }
+            self.add_area_listener(p);
+        }
+        Ok(player)
     }
 
     pub fn spawn_scripted(&mut self, class: &str, script: &str, name: &str, pos: [f32; 3]) -> Result<EntityId> {
@@ -1118,6 +1158,40 @@ impl ScriptHost {
             })?,
         )?;
 
+        // Actor.CreateActor(channelId, { name, class, position, rotation, scale })
+        let c = self.ctx.clone();
+        let scripts_a = Rc::new(self.class_scripts_snapshot());
+        let actor_t: Table = lua.globals().get("Actor")?;
+        actor_t.raw_set(
+            "CreateActor",
+            lua.create_function(move |lua, (channel, params): (Value, Table)| {
+                let class: String = params.get::<Option<String>>("class")?.unwrap_or_else(|| "Player".into());
+                let name: String = params.get::<Option<String>>("name")?.unwrap_or_default();
+                let is_player = num(&channel).map(|ch| ch > 0.0).unwrap_or(false);
+                let mut data = EntityData::new(0, name, class.clone());
+                if let Some(p) = vec3_from(&params.get::<Value>("position")?) {
+                    data.pos = p;
+                }
+                if let Some(a) = vec3_from(&params.get::<Value>("rotation")?) {
+                    data.rot = super::world::quat_from_angles(a);
+                }
+                if let Some(sc) = vec3_from(&params.get::<Value>("scale")?) {
+                    data.scale = sc;
+                }
+                let id = c.world.borrow_mut().insert(data);
+                let Some(cls) = Self::class_table_with(lua, &c, &scripts_a, &class)? else {
+                    return Ok(Value::Nil);
+                };
+                let inst = Self::init_instance_with(lua, &c, cls, id, &class, None, None, Some(is_player))?;
+                if is_player {
+                    // Post-init publishes the local client actor.
+                    lua.globals().set("g_localActor", inst.clone())?;
+                    lua.globals().set("g_localActorId", id_value(id))?;
+                }
+                Ok(Value::Table(inst))
+            })?,
+        )?;
+
         // System.SpawnEntity{ class=, name=, position=, orientation=, properties=, ... }
         let c = self.ctx.clone();
         let scripts = Rc::new(self.class_scripts_snapshot());
@@ -1155,8 +1229,13 @@ impl ScriptHost {
         // The registry is filled after binds are installed; read it lazily
         // from the VFS instead so SpawnEntity sees every class.
         let reg = crate::entity::EntityRegistry::load(&self.ctx.vfs);
-        reg.iter()
+        let mut m: HashMap<String, (String, Option<String>)> = reg
+            .iter()
             .filter_map(|c| c.script.as_ref().map(|s| (c.name.to_ascii_lowercase(), (c.name.clone(), Some(s.clone())))))
-            .collect()
+            .collect();
+        for (class, script) in ACTOR_CLASSES {
+            m.insert(class.to_ascii_lowercase(), (class.to_string(), Some(script.to_string())));
+        }
+        m
     }
 }

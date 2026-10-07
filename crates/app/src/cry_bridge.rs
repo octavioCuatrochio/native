@@ -86,8 +86,16 @@ pub fn build_host(game_dir: &str, spawn: [f32; 3]) -> Option<CryHost> {
     for le in &ents {
         let _ = host.spawn_level_entity(le);
     }
-    let player = host.spawn_actor("Player", "scripts/entities/actor/player.lua", "Dev", spawn, true).ok()?;
-    host.add_area_listener(player);
+    // Original flow: start events, then the rules script creates the local
+    // player on client connect. The controller then owns its position.
+    let player = match host.start_game() {
+        Ok(Some(p)) => p,
+        _ => {
+            eprintln!("[cry] the rules script created no player");
+            return None;
+        }
+    };
+    host.ctx.world.borrow_mut().set_pos(player, spawn);
     println!(
         "[cry] booted: {} entities, {} areas, {} script errors, {} missing binds",
         host.ctx.instances.borrow().len(),

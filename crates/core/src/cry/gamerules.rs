@@ -3,7 +3,7 @@
 //! and objectives. Damage-pipeline methods (`ServerHit`, `ServerExplosion`,
 //! ...) stay counted stubs until combat is ported.
 
-use super::host::{id_value, value_to_id, Ctx};
+use super::host::{value_to_id, Ctx};
 use super::world::EntityId;
 use mlua::{Function, Lua, Result, Table, Value, Variadic};
 use std::collections::HashMap;
@@ -167,8 +167,17 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
     let c = ctx.clone();
     t.raw_set(
         "GetFirstSpawnLocation",
-        lua.create_function(move |_, _: Variadic<Value>| {
-            Ok(c.game_rules.borrow().spawn_locations.first().map(|(e, _)| id_value(*e)).unwrap_or(Value::Nil))
+        // UL change (see the rules script): returns `(pos, angles)` of the
+        // first spawn location, or nil.
+        lua.create_function(move |lua, _: Variadic<Value>| {
+            let first = c.game_rules.borrow().spawn_locations.first().map(|(e, _)| *e);
+            let Some(e) = first else { return Ok(mlua::MultiValue::new()) };
+            let w = c.world.borrow();
+            let (pos, rot) = (w.world_pos(e), w.get(e).map(|d| d.rot).unwrap_or([0.0, 0.0, 0.0, 1.0]));
+            drop(w);
+            let p = super::host::vec3_table(lua, pos)?;
+            let a = super::host::vec3_table(lua, super::world::angles_from_quat(rot))?;
+            Ok(mlua::MultiValue::from_vec(vec![Value::Table(p), Value::Table(a)]))
         })?,
     )?;
 

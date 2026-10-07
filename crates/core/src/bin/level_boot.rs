@@ -70,16 +70,19 @@ fn main() {
     // The player actor at the tutorial start point, walking east at run speed
     // so area volumes along the way fire enter/leave events.
     let start = [3246.8f32, 3256.2, 217.1];
-    let player = host
-        .spawn_actor("Player", "scripts/entities/actor/player.lua", "Dev", start, true)
-        .expect("spawn player");
-    host.add_area_listener(player);
+    // Original flow: level loaded / start events, then the local client
+    // connects and the rules script creates the player (Actor.CreateActor).
+    let player = host.start_game().expect("start game").expect("rules script created no player");
+    host.ctx.world.borrow_mut().set_pos(player, start);
+    if let Some(e) = host.ctx.world.borrow().get(player) {
+        println!("[player] created by rules script: name {:?} class {}", e.name, e.class);
+    }
     println!("[player] id {player} instance={}", host.ctx.instance(player).is_some());
     if let Some(a) = host.ctx.actors.borrow().get(&player) {
         println!("[player] actor after init: {a:?}");
     }
     if let Ok(v) = host.lua.load(r#"
-        local p = System.GetEntityByName("Dev")
+        local p = System.GetEntityByName("Dude")
         local d = p and p.Properties and p.Properties.Damage
         return tostring(d and d.health) .. " class.Damage=" .. tostring(Player.Properties.Damage and Player.Properties.Damage.health)
     "#).eval::<String>() {

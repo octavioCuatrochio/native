@@ -74,8 +74,30 @@ pub const FRAMES_PER_SECOND: f32 = 60.0;
 pub const DANGER_EVAL_PERIOD: f32 = 0.25;
 /// Roaming-horde retry delay on spawn failure, `0x40a00000 = 5.0 s`.
 pub const HORDE_RETRY_DELAY: f32 = 5.0;
-/// Ambient grid refresh period, `DAT_0172b114 = 20.0 s`.
+/// Ambient grid refresh period, `DAT_0172b114 = 20.0 s`. The same `.data`
+/// scalar is the shipped default for the `zm_deactivationDist` cvar
+/// (`FUN_0134c920:248`), which is where its value was confirmed.
 pub const AMBIENT_GRID_PERIOD: f32 = 20.0;
+/// Ambient grid side (`FUN_01348680:417` `0x15 = 21`): a 21×21 map of nodes.
+pub const AMBIENT_GRID_DIM: i32 = 21;
+/// Default ambient grid node spacing in metres (`DAT_019091bc`; `FUN_0134e5f0`
+/// sets 200 for the main map and 100 for `FUN_0141d520()==2`). The grid is a
+/// set of nodes, each owning the `cell/2`-radius square around it.
+pub const AMBIENT_GRID_CELL_SIZE: f32 = 200.0;
+/// Region-density caps indexed by a cell's type, from `RTS(0x12040001..06)`
+/// (`FUN_0133a410:21-32` loads `DAT_01df...` caps): Agricultural 50,
+/// Commercial 100, Industrial 75, Park 35, Residential 100, Wilderness 20.
+pub const AMBIENT_DENSITY_CAPS: [u32; 6] = [50, 100, 75, 35, 100, 20];
+/// The cell density field must exceed this before the target is recomputed
+/// (`FUN_01348680:379` `0xe < density`, i.e. `density >= 15`).
+pub const AMBIENT_DENSITY_TRIGGER: u32 = 15;
+/// Cell square metres per zombie (`_DAT_0184410c`); the recovered code divides
+/// the cell area by it (`FUN_0133eb70:172`). Inferred as `20² = 400` from its
+/// other use as a squared proximity threshold (`FUN_01480790:153`).
+pub const AMBIENT_AREA_PER_ZOMBIE: f32 = 400.0;
+/// Per-cell placement attempts before giving up (`FUN_0133eb70:187`
+/// `uStack_1b0 < 0xa`).
+pub const AMBIENT_CELL_ATTEMPTS: u32 = 10;
 /// Hard cap on simultaneously active ambush points (guards runaway spawning).
 pub const DANGER_SPAWN_BATCH: u32 = 6;
 
@@ -206,6 +228,13 @@ pub struct ZombieTuning {
     pub density_interior_cap: f32,
     /// Outdoor density used when no region density is supplied (Park = 35).
     pub density_outdoor: f32,
+
+    // --- Ambient grid ---
+    /// Density-fill divisor for the ambient cells:
+    /// `round(RTS(0x12000004)·60·DAT_0171e200)` (`FUN_01348680:370`). The 4th
+    /// global of `Zombies` is `BaseFOV = 80` and `DAT_0171e200 = 0.05`
+    /// (the `sys_max_step` default), giving 240.
+    pub ambient_cell_interval: f32,
 }
 
 impl Default for ZombieTuning {
@@ -251,6 +280,8 @@ impl Default for ZombieTuning {
             density_interior: 3.0,
             density_interior_cap: 5.0,
             density_outdoor: 35.0,
+
+            ambient_cell_interval: 240.0,
         }
     }
 }
@@ -743,6 +774,19 @@ pub trait WorldView {
     fn infestations(&self) -> &[InfestationView] {
         &[]
     }
+    /// Region-density type (0..=5) of an ambient grid node, from the level's
+    /// 21×21 density map (`RefreshAmbientGrid` @ `0x01342020`, table
+    /// `DAT_1908fec + level*0x1b9`). 0 Agricultural, 1 Commercial, 2
+    /// Industrial, 3 Park, 4 Residential, 5 Wilderness. `None` leaves the
+    /// cell at the Wilderness fallback. Defaults to `None`.
+    fn ambient_cell_type(&self, _cell_x: i32, _cell_y: i32) -> Option<u8> {
+        None
+    }
+    /// Terrain height at a horizontal position. `None` falls back to the
+    /// player's Z. Defaults to `None`.
+    fn ground_height(&self, _x: f32, _y: f32) -> Option<f32> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,11 +902,27 @@ struct ZoneState {
     state: u8,
 }
 
+/// One ambient grid node (`param_1[0x137a + x*21 + y]`). The original packs
+/// four fields into one `u32` (`FUN_01348680:375-388`): bits 0..2 region type,
+/// bits 3..11 live count, bits 12..20 target, bits 21..30 density age.
+#[derive(Clone, Copy, Debug, Default)]
+struct AmbientCell {
+    /// Region-density type 0..=5 (`AMBIENT_DENSITY_CAPS` index).
+    kind: u8,
+    /// Zombies currently assigned to the node.
+    count: u16,
+    /// Population the density pass wants the node to hold.
+    target: u16,
+    /// Age in refresh ticks; the target is recomputed when it reaches 15.
+    density: u16,
+}
+
 /// Persistent per-director state.
 #[derive(Clone, Debug)]
 struct DirectorState {
     grid_timer: f32,
-    ambient_accum: f32,
+    grid: Vec<AmbientCell>,
+    grid_ready: bool,
     ambush_chance: f32,
     ambush: Vec<AmbushSlot>,
     zones: Vec<ZoneState>,
@@ -887,6 +947,10 @@ pub struct SpawnDirector {
     pub points: Vec<AmbushPoint>,
     /// Author-placed danger zones.
     pub zones: Vec<DangerZoneDef>,
+    /// Ambient grid node spacing in metres (`DAT_019091bc`).
+    pub grid_cell_size: f32,
+    /// Ambient grid world origin X/Y (`DAT_01df2e80/84`).
+    pub grid_origin: [f32; 2],
     rng: GameRng,
     state: DirectorState,
 }
@@ -908,10 +972,13 @@ impl SpawnDirector {
             table,
             points,
             zones,
+            grid_cell_size: AMBIENT_GRID_CELL_SIZE,
+            grid_origin: [0.0, 0.0],
             rng: GameRng::new(seed),
             state: DirectorState {
                 grid_timer: 0.0,
-                ambient_accum: 0.0,
+                grid: vec![AmbientCell::default(); (AMBIENT_GRID_DIM * AMBIENT_GRID_DIM) as usize],
+                grid_ready: false,
                 ambush_chance: tuning.amb_base_spawn_chance,
                 ambush: vec![AmbushSlot { timer: tuning.amb_spawn_timer, active: false }; n],
                 zones: vec![ZoneState::default(); z],
@@ -970,9 +1037,17 @@ impl SpawnDirector {
         out
     }
 
-    /// Ambient density: `Zombies.AmbientRespawnRate` spawns per minute around
-    /// the player, filled within [`AMBIENT_RADIUS`] and refreshed on the
-    /// `DAT_0172b114 = 20 s` grid tick (`FUN_01348680:365-476`).
+    /// Ambient grid (`FUN_01348680:365-476`).
+    ///
+    /// A 21×21 map of density nodes around the player is aged every
+    /// [`AMBIENT_GRID_PERIOD`] (or every frame while no zombie is alive — the
+    /// original's `param_1[0x82e] == 0` test). Each refresh ages every node's
+    /// density field; once it reaches [`AMBIENT_DENSITY_TRIGGER`] the node's
+    /// target is recomputed from its region cap
+    /// (`max(1, (cap - target)·density / interval)`) and the age resets. Nodes
+    /// within [`AMBIENT_RADIUS`] of the player are then topped up toward their
+    /// target, sampling nav-valid points inside the node's square, up to
+    /// [`AMBIENT_CELL_ATTEMPTS`] tries, never past [`MAX_ZOMBIES`].
     fn step_ambient(
         &mut self,
         dt: f32,
@@ -980,43 +1055,160 @@ impl SpawnDirector {
         view: &dyn WorldView,
         out: &mut Vec<SpawnEvent>,
     ) {
-        self.state.grid_timer += dt;
-        let grid_tick = self.state.grid_timer >= AMBIENT_GRID_PERIOD;
-        if grid_tick {
-            self.state.grid_timer -= AMBIENT_GRID_PERIOD;
+        // Lazily seed each node's region type from the level density map
+        // (`RefreshAmbientGrid` @ 0x01342020). Targets start at zero and are
+        // grown by the density field below.
+        if !self.state.grid_ready {
+            for cy in 0..AMBIENT_GRID_DIM {
+                for cx in 0..AMBIENT_GRID_DIM {
+                    let kind = view.ambient_cell_type(cx, cy).unwrap_or(5).min(5);
+                    let idx = Self::grid_index(cx, cy);
+                    self.state.grid[idx].kind = kind;
+                }
+            }
+            self.state.grid_ready = true;
         }
 
-        // Per-frame budget: rate per minute → per second.
-        let rate = self.tuning.ambient_respawn_rate.max(0.0);
-        self.state.ambient_accum += rate * dt / FRAMES_PER_SECOND;
-
-        // Target density = the rate, measured within the ambient radius.
-        let near: usize = view
-            .zombies()
-            .iter()
-            .filter(|z| horiz_dist2(z.pos, player) <= AMBIENT_RADIUS * AMBIENT_RADIUS)
-            .count();
-        let target = rate as usize;
-        if near >= target {
-            // Saturated: hold the accumulator at one so a slot frees promptly.
-            self.state.ambient_accum = self.state.ambient_accum.min(1.0);
+        self.state.grid_timer += dt;
+        // Refresh on the 20 s tick, or immediately while the world holds no
+        // zombies (`FUN_01348680:365` reads the manager's zombie count at
+        // offset 0x20b8).
+        if self.state.grid_timer <= AMBIENT_GRID_PERIOD && !view.zombies().is_empty() {
             return;
         }
+        self.state.grid_timer = 0.0;
 
-        let mut budget = self.state.ambient_accum.floor() as usize;
-        if budget == 0 && grid_tick {
-            budget = 1;
-        }
-        self.state.ambient_accum = (self.state.ambient_accum - budget as f32).max(0.0);
-        let room = target.saturating_sub(near);
-        budget = budget.min(room);
-        for _ in 0..budget {
-            if !self.spawn_ok(view) {
-                break;
+        // Density pass: age every node and recompute depleted targets.
+        let interval = self.tuning.ambient_cell_interval.max(1.0) as u32;
+        for cell in self.state.grid.iter_mut() {
+            cell.density = cell.density.saturating_add(1);
+            if cell.density >= AMBIENT_DENSITY_TRIGGER as u16 {
+                let cap = AMBIENT_DENSITY_CAPS[cell.kind as usize];
+                if (cell.target as u32) < cap {
+                    let add = ((cap - cell.target as u32) * cell.density as u32) / interval;
+                    cell.target = add.max(1).min(u16::MAX as u32) as u16;
+                }
+                cell.density = 0;
             }
-            let Some(pos) = self.pick_ring_position(player, view) else { break };
-            out.push(SpawnEvent::Spawn(self.make_spawn("Ambient", CLUSTER_DENSITY, pos, 0.0, 0)));
         }
+
+        // Spawn pass: rebuild occupancy from the world, then top up the nodes
+        // covering the player's ±150 m box (`FUN_01348680:397-474`).
+        let mut occupancy = [0u16; (AMBIENT_GRID_DIM * AMBIENT_GRID_DIM) as usize];
+        for z in view.zombies() {
+            if z.cluster != CLUSTER_DENSITY {
+                continue;
+            }
+            if let Some(idx) = self.cell_index(z.pos) {
+                occupancy[idx] = occupancy[idx].saturating_add(1);
+            }
+        }
+        for (idx, cell) in self.state.grid.iter_mut().enumerate() {
+            cell.count = occupancy[idx];
+        }
+
+        let inv = 1.0 / self.grid_cell_size.max(1.0);
+        let min_x = (((player[0] - AMBIENT_RADIUS) - self.grid_origin[0]) * inv + 0.5).floor() as i32;
+        let max_x = (((player[0] + AMBIENT_RADIUS) - self.grid_origin[0]) * inv + 0.5).floor() as i32;
+        let min_y = (((player[1] - AMBIENT_RADIUS) - self.grid_origin[1]) * inv + 0.5).floor() as i32;
+        let max_y = (((player[1] + AMBIENT_RADIUS) - self.grid_origin[1]) * inv + 0.5).floor() as i32;
+
+        let mut total = view.zombies().len();
+        for cx in min_x.max(0)..=max_x.min(AMBIENT_GRID_DIM - 1) {
+            for cy in min_y.max(0)..=max_y.min(AMBIENT_GRID_DIM - 1) {
+                let idx = Self::grid_index(cx, cy);
+                let (count, target) = (self.state.grid[idx].count, self.state.grid[idx].target);
+                if count >= target || total >= MAX_ZOMBIES {
+                    continue;
+                }
+                let spawned =
+                    self.fill_ambient_cell(cx, cy, player, count, target, total, view, out);
+                total += spawned as usize;
+            }
+        }
+    }
+
+    /// Node index for grid coordinates: the original stores the map as
+    /// `param_1[0x137a + x*21 + y]` (`FUN_01348680:423`).
+    #[inline]
+    fn grid_index(cx: i32, cy: i32) -> usize {
+        (cx * AMBIENT_GRID_DIM + cy) as usize
+    }
+
+    /// Grid node owning a world position, or `None` when outside the map.
+    fn cell_index(&self, pos: [f32; 3]) -> Option<usize> {
+        let inv = 1.0 / self.grid_cell_size.max(1.0);
+        let cx = ((pos[0] - self.grid_origin[0]) * inv + 0.5).floor() as i32;
+        let cy = ((pos[1] - self.grid_origin[1]) * inv + 0.5).floor() as i32;
+        if (0..AMBIENT_GRID_DIM).contains(&cx) && (0..AMBIENT_GRID_DIM).contains(&cy) {
+            Some(Self::grid_index(cx, cy))
+        } else {
+            None
+        }
+    }
+
+    /// Fill one ambient node toward `target`: sample points in the node's
+    /// square clipped to the player's ±150 m box, reject non-navmesh points,
+    /// and stop after [`AMBIENT_CELL_ATTEMPTS`] tries or when [`MAX_ZOMBIES`]
+    /// is reached. Mirrors `FUN_0133eb70`'s per-cell loop; returns the number
+    /// emitted.
+    fn fill_ambient_cell(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        player: [f32; 3],
+        count: u16,
+        target: u16,
+        total: usize,
+        view: &dyn WorldView,
+        out: &mut Vec<SpawnEvent>,
+    ) -> u16 {
+        let node_x = cx as f32 * self.grid_cell_size + self.grid_origin[0];
+        let node_y = cy as f32 * self.grid_cell_size + self.grid_origin[1];
+        let half = self.grid_cell_size * 0.5;
+        let x0 = (node_x - half).max(player[0] - AMBIENT_RADIUS);
+        let x1 = (node_x + half).min(player[0] + AMBIENT_RADIUS);
+        let y0 = (node_y - half).max(player[1] - AMBIENT_RADIUS);
+        let y1 = (node_y + half).min(player[1] + AMBIENT_RADIUS);
+        if x1 <= x0 || y1 <= y0 {
+            return 0;
+        }
+        let area = (x1 - x0) * (y1 - y0);
+        let budget = (area / AMBIENT_AREA_PER_ZOMBIE).max(0.0) as u16;
+        let mut remaining = target.saturating_sub(count).min(budget);
+        let mut spawned = 0u16;
+        let mut attempts = 0u32;
+        while remaining > 0
+            && attempts < AMBIENT_CELL_ATTEMPTS
+            && total + (spawned as usize) < MAX_ZOMBIES
+        {
+            attempts += 1;
+            let x = x0 + self.rng.next_unit() * (x1 - x0);
+            let y = y0 + self.rng.next_unit() * (y1 - y0);
+            let z = view.ground_height(x, y).unwrap_or(player[2]);
+            let p = [x, y, z];
+            // The recovered loop samples the cell box but rejects anything
+            // outside the 150 m circle around the player (`FUN_0133eb70:246`).
+            if horiz_dist2(p, player) > AMBIENT_RADIUS * AMBIENT_RADIUS {
+                continue;
+            }
+            if !view.nav_valid(p) {
+                continue;
+            }
+            out.push(SpawnEvent::Spawn(self.make_spawn(
+                "Ambient",
+                CLUSTER_DENSITY,
+                p,
+                0.0,
+                0,
+            )));
+            spawned += 1;
+            remaining -= 1;
+        }
+        let idx = Self::grid_index(cx, cy);
+        let cell = &mut self.state.grid[idx];
+        cell.count = cell.count.saturating_add(spawned);
+        spawned
     }
 
     /// Ambush cadence and near/interior spawns (`FUN_01348680:534-636`).
@@ -1300,21 +1492,6 @@ impl SpawnDirector {
         }
     }
 
-    /// Random point on the ambient ring `[50, AMBIENT_RADIUS]` around the
-    /// player, navmesh-validated.
-    fn pick_ring_position(&mut self, player: [f32; 3], view: &dyn WorldView) -> Option<[f32; 3]> {
-        let inner = AMBUSH_MIN_DIST_SQ.sqrt();
-        for _ in 0..8 {
-            let ang = self.rng.next_unit() * std::f32::consts::TAU;
-            let r = inner + self.rng.next_unit() * (AMBIENT_RADIUS - inner);
-            let p = [player[0] + ang.cos() * r, player[1] + ang.sin() * r, player[2]];
-            if view.nav_valid(p) {
-                return Some(p);
-            }
-        }
-        None
-    }
-
     fn pick_horde_position(&mut self, player: [f32; 3], view: &dyn WorldView) -> Option<[f32; 3]> {
         let inner = (AMBIENT_RADIUS).min(self.tuning.horde_max_range);
         for _ in 0..8 {
@@ -1390,11 +1567,19 @@ mod tests {
         player: [f32; 3],
         zombies: Vec<ZombieView>,
         inside: bool,
+        ambient_type: Option<u8>,
+        nav: bool,
     }
 
     impl TestWorld {
         fn new(player: [f32; 3]) -> TestWorld {
-            TestWorld { player, zombies: Vec::new(), inside: false }
+            TestWorld {
+                player,
+                zombies: Vec::new(),
+                inside: false,
+                ambient_type: None,
+                nav: true,
+            }
         }
     }
 
@@ -1407,6 +1592,12 @@ mod tests {
         }
         fn player_inside(&self) -> bool {
             self.inside
+        }
+        fn ambient_cell_type(&self, _cell_x: i32, _cell_y: i32) -> Option<u8> {
+            self.ambient_type
+        }
+        fn nav_valid(&self, _p: [f32; 3]) -> bool {
+            self.nav
         }
     }
 
@@ -1453,29 +1644,96 @@ mod tests {
     }
 
     #[test]
-    fn ambient_spawns_build_to_rate_and_respect_cap() {
-        let player = [3246.8, 3256.2, 217.1];
+    fn ambient_grid_fills_cells_from_density_map() {
+        let player = [0.0, 0.0, 0.0];
         let mut tuning = ZombieTuning::default();
-        tuning.horde_max_ambient = 0.0; // isolate the ambient spawner
+        tuning.horde_max_ambient = 0.0; // isolate the ambient grid
         let mut d = SpawnDirector::new(tuning, table(), Vec::new(), Vec::new(), 7);
         let mut w = TestWorld::new(player);
-        let mut spawns = 0;
+        w.ambient_type = Some(4); // Residential, cap 100
+        let mut spawns = 0usize;
+        let mut outside = 0usize;
         for _ in 0..(60 * 60) {
             let e = d.update(1.0 / 60.0, &w);
             for ev in &e {
-                if matches!(ev, SpawnEvent::Spawn(_)) {
+                if let SpawnEvent::Spawn(c) = ev {
                     spawns += 1;
+                    assert_eq!(c.cluster, CLUSTER_DENSITY);
+                    if horiz_dist2(c.pos, player) > AMBIENT_RADIUS * AMBIENT_RADIUS {
+                        outside += 1;
+                    }
                 }
             }
             apply(&mut d, &mut w, &e);
         }
-        assert!(spawns >= 1, "expected ambient spawns, got {spawns}");
-        // Target density is AmbientRespawnRate (15) within the 150 m radius.
-        assert!(
-            w.zombies.len() <= ZombieTuning::default().ambient_respawn_rate as usize,
-            "ambient cap exceeded: {}",
-            w.zombies.len()
-        );
+        assert!(spawns >= 4, "expected ambient grid spawns, got {spawns}");
+        assert_eq!(outside, 0, "ambient spawned outside the 150 m radius");
+        assert!(w.zombies.len() <= MAX_ZOMBIES);
+        // The density pass raised at least one node target above zero.
+        assert!(d.state.grid.iter().any(|c| c.target > 0));
+    }
+
+    #[test]
+    fn ambient_density_ages_before_spawning() {
+        let player = [0.0, 0.0, 0.0];
+        let mut tuning = ZombieTuning::default();
+        tuning.horde_max_ambient = 0.0;
+        let mut d = SpawnDirector::new(tuning, table(), Vec::new(), Vec::new(), 3);
+        let mut w = TestWorld::new(player);
+        w.ambient_type = Some(4);
+        // A non-ambient zombie keeps the world non-empty so the grid only
+        // ticks on the 20 s period rather than every frame.
+        w.zombies.push(ZombieView {
+            id: 1,
+            kind: ZombieKind::Grunt,
+            pos: [1.0, 1.0, 0.0],
+            live: false,
+            cluster: 0,
+        });
+
+        let mut early = 0usize;
+        for _ in 0..(60 * 60) {
+            let e = d.update(1.0 / 60.0, &w);
+            early += e.iter().filter(|x| matches!(x, SpawnEvent::Spawn(_))).count();
+            apply(&mut d, &mut w, &e);
+        }
+        assert_eq!(early, 0, "grid spawned before the density reached 15");
+
+        let mut late = 0usize;
+        for _ in 0..(300 * 60) {
+            let e = d.update(1.0 / 60.0, &w);
+            late += e.iter().filter(|x| matches!(x, SpawnEvent::Spawn(_))).count();
+            apply(&mut d, &mut w, &e);
+        }
+        assert!(late >= 1, "grid never spawned after the density trigger");
+    }
+
+    #[test]
+    fn ambient_grid_respects_logical_cap() {
+        let player = [0.0, 0.0, 0.0];
+        let mut tuning = ZombieTuning::default();
+        tuning.horde_max_ambient = 0.0;
+        let mut d = SpawnDirector::new(tuning, table(), Vec::new(), Vec::new(), 5);
+        let mut w = TestWorld::new(player);
+        for i in 0..MAX_ZOMBIES as u32 {
+            w.zombies.push(ZombieView {
+                id: i + 1,
+                kind: ZombieKind::Grunt,
+                pos: [0.0, 0.0, 0.0],
+                live: false,
+                cluster: CLUSTER_DENSITY,
+            });
+        }
+        // A node that wants more zombies, against a full world.
+        d.state.grid[SpawnDirector::grid_index(0, 0)].target = 10;
+        let mut spawns = 0usize;
+        for _ in 0..(60 * 60) {
+            let e = d.update(1.0 / 60.0, &w);
+            spawns += e.iter().filter(|x| matches!(x, SpawnEvent::Spawn(_))).count();
+            apply(&mut d, &mut w, &e);
+        }
+        assert_eq!(spawns, 0, "spawned past the 256 logical cap");
+        assert!(w.zombies.len() <= MAX_ZOMBIES);
     }
 
     #[test]
@@ -1622,15 +1880,25 @@ mod tests {
         let mut d = SpawnDirector::new(tuning, table, points, zones, 0xC0FFEE);
         let mut w = TestWorld::new(player);
         let mut timeline = Vec::new();
+        let mut ambient = 0usize;
+        let mut ambient_outside = 0usize;
         for frame in 0..(60 * 60) {
             let t = frame as f32 / 60.0;
             let events = d.update(1.0 / 60.0, &w);
             for e in &events {
                 match e {
-                    SpawnEvent::Spawn(c) => timeline.push(format!(
-                        "t={t:5.1}s SPAWN cluster={} {:?} at ({:.1},{:.1},{:.1}) flags=0x{:x}",
-                        c.cluster, c.kind, c.pos[0], c.pos[1], c.pos[2], c.flags
-                    )),
+                    SpawnEvent::Spawn(c) => {
+                        if c.cluster == CLUSTER_DENSITY {
+                            ambient += 1;
+                            if horiz_dist2(c.pos, player) > AMBIENT_RADIUS * AMBIENT_RADIUS {
+                                ambient_outside += 1;
+                            }
+                        }
+                        timeline.push(format!(
+                            "t={t:5.1}s SPAWN cluster={} {:?} at ({:.1},{:.1},{:.1}) flags=0x{:x}",
+                            c.cluster, c.kind, c.pos[0], c.pos[1], c.pos[2], c.flags
+                        ))
+                    }
                     SpawnEvent::Despawn(c) => {
                         timeline.push(format!("t={t:5.1}s DESPAWN id={} {:?}", c.id, c.reason))
                     }
@@ -1643,12 +1911,16 @@ mod tests {
             eprintln!("{line}");
         }
         eprintln!(
-            "--- {} events, {} zombies alive, {} ambush points ---",
+            "--- {} events, {} zombies alive, {} ambush points, {} ambient-grid spawns ({} outside 150 m) ---",
             timeline.len(),
             w.zombies.len(),
-            d.points.len()
+            d.points.len(),
+            ambient,
+            ambient_outside
         );
         assert!(w.zombies.len() <= MAX_ZOMBIES);
+        assert_eq!(ambient_outside, 0, "ambient grid spawned outside 150 m");
+        assert!(ambient >= 1, "expected ambient grid spawns at player start");
         assert!(d.points.is_empty() || timeline.iter().any(|l| l.contains("SPAWN")));
     }
 }

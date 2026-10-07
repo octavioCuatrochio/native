@@ -461,6 +461,284 @@ pub fn build_ground_albedo(
     Some((out_size, out_size, out))
 }
 
+// ---------------------------------------------------------------------------
+// World-space ground layers (GPU tiling)
+// ---------------------------------------------------------------------------
+//
+// [`build_ground_albedo`] cannot represent a tiled detail texture: at its 1 m
+// bake step a 4 m repeat samples the source image every 256 texels, so the
+// point-sampled result aliases into a fixed 4-texel checkerboard (measured).
+// The shipping `Terrain.Layer` shader instead tiles each layer in world space
+// and lets the GPU filter it with mipmaps. The types below recover exactly the
+// per-surface mapping the renderer needs to do that on screen:
+//
+//   * [`resolve_ground_layers`] collapses the level palette to the distinct
+//     coloured ground images and an id -> layer-index table;
+//   * [`build_terrain_layer_map`] bakes a cheap *categorical* per-texel map
+//     (top-2 layer indices + blend weight) with no colour sampling, so it
+//     cannot alias;
+//   * [`decode_layer_array`] / [`generate_layer_mips`] build the 2D texture
+//     array the shader samples at `world_xy * tile`, giving correct
+//     minification filtering.
+
+/// Sentinel layer index meaning "this surface has no ground layer".
+pub const SURFACE_LAYER_NONE: u8 = 255;
+
+/// Coloured, world-space-tiled ground layers for a level's surface palette.
+///
+/// `paths` are distinct `textures/ground/*_diffuse.dds` images (the renderer
+/// uploads them as a 2D texture array, one array slice per path); `tiles` holds
+/// each layer's repeat per world metre; `index_by_id` maps a `SurfaceTypeID` to
+/// its `paths` slice, or [`SURFACE_LAYER_NONE`] for unknown/undefined ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundLayerSet {
+    pub paths: Vec<String>,
+    pub tiles: Vec<[f32; 2]>,
+    pub index_by_id: [u8; 256],
+}
+
+impl GroundLayerSet {
+    /// Number of distinct ground images.
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+    /// Layer index for a surface id, or [`SURFACE_LAYER_NONE`].
+    pub fn layer_of(&self, id: u8) -> u8 {
+        self.index_by_id[id as usize]
+    }
+}
+
+/// Build the set of world-tiled ground layers the palette references.
+///
+/// Each `<SurfaceType>`'s material name is mapped through [`texture_hint`] to a
+/// coloured ground image; identical images share one array slice. The default
+/// tiling is `1 / GROUND_UV_METERS` (one repeat per 4 m), matching the values
+/// the engine's generic ground textures were authored at. Never panics.
+pub fn resolve_ground_layers(types: &[SurfaceType]) -> GroundLayerSet {
+    let mut paths: Vec<String> = Vec::new();
+    let mut tiles: Vec<[f32; 2]> = Vec::new();
+    let mut index_by_id = [SURFACE_LAYER_NONE; 256];
+    for t in types {
+        if t.id > 255 {
+            continue;
+        }
+        let name = if t.material.is_empty() { &t.name } else { &t.material };
+        let path = texture_hint(name).to_string();
+        let idx = match paths.iter().position(|p| *p == path) {
+            Some(i) => i,
+            None => {
+                paths.push(path);
+                tiles.push([1.0 / GROUND_UV_METERS, 1.0 / GROUND_UV_METERS]);
+                paths.len() - 1
+            }
+        };
+        index_by_id[t.id as usize] = idx as u8;
+    }
+    GroundLayerSet { paths, tiles, index_by_id }
+}
+
+/// Bake the per-texel ground-layer map the terrain shader indexes into.
+///
+/// One output texel per terrain sample: `R` = dominant layer, `G` = second
+/// layer, `B` = weight of the second layer (0..255), `A` = 255. The dominant
+/// pair is chosen by voting over a `(2*radius+1)²` sample neighbourhood, which
+/// smooths the categorical surface data into continuous blend weights at layer
+/// boundaries (the shipping engine's per-pixel layer blending). No colour is
+/// sampled, so there is no aliasing.
+///
+/// Returns `(samples, samples, rgba)` or `None` for degenerate terrain.
+pub fn build_terrain_layer_map(
+    ter: &terrain::Terrain,
+    set: &GroundLayerSet,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let s = ter.samples;
+    if s == 0 || ter.surfaces.len() < s.checked_mul(s)? || set.paths.is_empty() {
+        return None;
+    }
+    if set.paths.len() > 255 {
+        return None;
+    }
+    let radius: isize = 2;
+    let mut out = vec![0u8; s * s * 4];
+    // Votes per layer for the current texel (bounded: the level palette never
+    // exceeds a few dozen distinct ground images).
+    let mut counts = vec![0u32; set.paths.len()];
+    for j in 0..s {
+        for i in 0..s {
+            for c in counts.iter_mut() {
+                *c = 0;
+            }
+            for dj in -radius..=radius {
+                let jj = (j as isize + dj).clamp(0, s as isize - 1) as usize;
+                for di in -radius..=radius {
+                    let ii = (i as isize + di).clamp(0, s as isize - 1) as usize;
+                    let id = ter.surfaces[jj * s + ii];
+                    if id == terrain::SURFACE_UNDEFINED {
+                        continue;
+                    }
+                    let li = set.layer_of(id);
+                    if li != SURFACE_LAYER_NONE {
+                        counts[li as usize] += 1;
+                    }
+                }
+            }
+            let (mut a, mut b) = (0u8, 0u8);
+            let (mut ca, mut cb) = (0u32, 0u32);
+            for (li, &c) in counts.iter().enumerate() {
+                if c > ca {
+                    b = a;
+                    cb = ca;
+                    a = li as u8;
+                    ca = c;
+                } else if c > cb {
+                    b = li as u8;
+                    cb = c;
+                }
+            }
+            let o = (j * s + i) * 4;
+            if ca == 0 {
+                out[o + 3] = 255;
+                continue;
+            }
+            let w = cb as f32 / (ca + cb) as f32;
+            out[o] = a;
+            out[o + 1] = b;
+            out[o + 2] = (w * 255.0 + 0.5) as u8;
+            out[o + 3] = 255;
+        }
+    }
+    Some((s as u32, s as u32, out))
+}
+
+/// Bilinearly resample a decoded RGBA image into `dst` (`size * size * 4`).
+fn resample_rgba(img: &asset::DdsImageRgba, size: usize, dst: &mut [u8]) {
+    let (iw, ih) = (img.width as usize, img.height as usize);
+    if iw == 0 || ih == 0 || dst.len() < size * size * 4 {
+        return;
+    }
+    let sx = iw as f32 / size as f32;
+    let sy = ih as f32 / size as f32;
+    for y in 0..size {
+        let fy = ((y as f32 + 0.5) * sy - 0.5).max(0.0);
+        let y0 = (fy.floor() as usize).min(ih - 1);
+        let y1 = (y0 + 1).min(ih - 1);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..size {
+            let fx = ((x as f32 + 0.5) * sx - 0.5).max(0.0);
+            let x0 = (fx.floor() as usize).min(iw - 1);
+            let x1 = (x0 + 1).min(iw - 1);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            let p = |xx: usize, yy: usize| {
+                let o = (yy * iw + xx) * 4;
+                [
+                    img.rgba[o] as f32,
+                    img.rgba[o + 1] as f32,
+                    img.rgba[o + 2] as f32,
+                    img.rgba[o + 3] as f32,
+                ]
+            };
+            let (a, b, c, d) = (p(x0, y0), p(x1, y0), p(x0, y1), p(x1, y1));
+            let o = (y * size + x) * 4;
+            for ch in 0..4 {
+                let top = a[ch] * (1.0 - tx) + b[ch] * tx;
+                let bot = c[ch] * (1.0 - tx) + d[ch] * tx;
+                dst[o + ch] = (top * (1.0 - ty) + bot * ty).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// Decode `set.paths` and resample each into a square `size x size` slice.
+///
+/// Returns layer-major RGBA8 data (`paths.len() * size * size * 4` bytes, mip 0
+/// only) for upload as a 2D texture array, or `None` if any image cannot be
+/// read/decoded (so the caller can fall back rather than show a hole).
+pub fn decode_layer_array(
+    vfs: &crypak::Vfs,
+    set: &GroundLayerSet,
+    size: u32,
+) -> Option<Vec<u8>> {
+    let n = size as usize;
+    if n == 0 || set.paths.is_empty() {
+        return None;
+    }
+    let mut out = vec![0u8; set.paths.len().checked_mul(n * n * 4)?];
+    for (li, path) in set.paths.iter().enumerate() {
+        let img = vfs.read(path).and_then(|b| asset::decode_dds_rgba(&b))?;
+        let o = li * n * n * 4;
+        resample_rgba(&img, n, &mut out[o..o + n * n * 4]);
+    }
+    Some(out)
+}
+
+/// Append a full box-filtered mip chain to each layer's slice.
+///
+/// Input is layer-major mip-0 data from [`decode_layer_array`]. Output stays
+/// layer-major (all mip levels of layer 0, then layer 1, ...) as
+/// `TextureDataOrder::LayerMajor` expects, and the returned level count matches
+/// `size` (e.g. 512 -> 10). `None` for malformed dimensions.
+pub fn generate_layer_mips(data: &[u8], size: u32, layers: usize) -> Option<(Vec<u8>, u32)> {
+    if size == 0 || layers == 0 {
+        return None;
+    }
+    let n = size as usize;
+    if data.len() < layers.checked_mul(n * n * 4)? {
+        return None;
+    }
+    let mut levels = 0u32;
+    let mut sz = size;
+    while sz > 1 {
+        levels += 1;
+        sz /= 2;
+    }
+    levels += 1; // include mip 0
+    let mut out = Vec::with_capacity(data.len() * 4 / 3);
+    for li in 0..layers {
+        let base = li * n * n * 4;
+        let mut cur: Vec<u8> = data[base..base + n * n * 4].to_vec();
+        let mut cur_size = n;
+        out.extend_from_slice(&cur);
+        while cur_size > 1 {
+            let ns = (cur_size / 2).max(1);
+            let next = box_downsample_rgba(&cur, cur_size, ns);
+            out.extend_from_slice(&next);
+            cur = next;
+            cur_size = ns;
+        }
+    }
+    Some((out, levels))
+}
+
+/// One 2x2 box-filter downsample of a square RGBA8 image.
+fn box_downsample_rgba(src: &[u8], size: usize, out_size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; out_size * out_size * 4];
+    for y in 0..out_size {
+        for x in 0..out_size {
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for dy in 0..2 {
+                let sy = (y * 2 + dy).min(size - 1);
+                for dx in 0..2 {
+                    let sx = (x * 2 + dx).min(size - 1);
+                    let o = (sy * size + sx) * 4;
+                    for c in 0..4 {
+                        acc[c] += src[o + c] as u32;
+                    }
+                    n += 1;
+                }
+            }
+            let o = (y * out_size + x) * 4;
+            for c in 0..4 {
+                out[o + c] = (acc[c] / n).min(255) as u8;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +1017,109 @@ mod tests {
             uniq.insert([p[0], p[1], p[2], p[3]]);
         }
         assert!(uniq.len() > 1, "expected real-texture variation, got {}", uniq.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // world-space ground layers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_ground_layers_dedups_and_maps_ids() {
+        let types = parse_surface_types(SAMPLE.as_bytes());
+        let set = resolve_ground_layers(&types);
+        // grass (id0/id4), rock (id2), asphalt (id6), dirt (id11): 4 distinct.
+        assert_eq!(set.len(), 4, "paths {:?}", set.paths);
+        assert_eq!(set.layer_of(0), set.layer_of(4));
+        assert_ne!(set.layer_of(0), set.layer_of(2));
+        assert_ne!(set.layer_of(2), set.layer_of(6));
+        assert_ne!(set.layer_of(6), set.layer_of(11));
+        // Unknown ids get the "no layer" sentinel.
+        assert_eq!(set.layer_of(200), SURFACE_LAYER_NONE);
+        assert_eq!(set.layer_of(terrain::SURFACE_UNDEFINED), SURFACE_LAYER_NONE);
+        // Every layer tiles at one repeat per 4 m by default.
+        for t in &set.tiles {
+            assert!((t[0] - 0.25).abs() < 1e-6 && (t[1] - 0.25).abs() < 1e-6);
+        }
+        assert!(set.paths.iter().all(|p| p.starts_with("textures/ground/")));
+    }
+
+    #[test]
+    fn layer_map_blends_two_neighbouring_layers() {
+        let types = parse_surface_types(SAMPLE.as_bytes());
+        let set = resolve_ground_layers(&types);
+        let ter = tiny_terrain(); // 4x4, top half id4 grass, bottom half id6 asphalt
+        let (w, h, map) = build_terrain_layer_map(&ter, &set).expect("layer map");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(map.len(), 4 * 4 * 4);
+
+        let grass = set.layer_of(4);
+        let asphalt = set.layer_of(6);
+        let mut saw_grass = false;
+        let mut saw_asphalt = false;
+        let mut saw_blend = false;
+        for px in map.chunks(4) {
+            let (a, b, wb) = (px[0], px[1], px[2]);
+            assert_eq!(px[3], 255);
+            assert!(a == grass || a == asphalt || b == grass || b == asphalt);
+            saw_grass |= a == grass || b == grass;
+            saw_asphalt |= a == asphalt || b == asphalt;
+            if wb > 0 && wb < 255 {
+                saw_blend = true;
+            }
+        }
+        // Both surfaces appear, and the 5x5 vote smooths the row boundary into
+        // at least one fractional (blended) weight.
+        assert!(saw_grass && saw_asphalt, "both layers should be present");
+        assert!(saw_blend, "expected a blended boundary texel");
+    }
+
+    #[test]
+    fn generate_layer_mips_builds_box_chain() {
+        // Two 4x4 layers -> 3 levels (4,2,1) each = (16+4+1)*4 bytes per layer.
+        let mut data = vec![0u8; 2 * 4 * 4 * 4];
+        // Layer 0 constant 100, layer 1 constant 200.
+        for i in 0..16 {
+            data[i * 4] = 100;
+            data[(16 + i) * 4] = 200;
+        }
+        let (out, levels) = generate_layer_mips(&data, 4, 2).expect("mips");
+        assert_eq!(levels, 3);
+        assert_eq!(out.len(), 2 * (16 + 4 + 1) * 4);
+        // Layer 0's smallest mip averages to the same constant.
+        let mip2 = &out[0..]; // first 16*4 is mip0; then 4*4, then 1*4
+        assert_eq!(mip2[0], 100);
+        // Layer 1 starts after layer 0's full chain.
+        assert_eq!(out[(16 + 4 + 1) * 4], 200);
+    }
+
+    #[test]
+    fn decode_layer_array_needs_readable_images() {
+        let types = parse_surface_types(SAMPLE.as_bytes());
+        let set = resolve_ground_layers(&types);
+        // Empty VFS: every path is missing, so decoding must fail cleanly.
+        let vfs = crate::crypak::Vfs::new();
+        assert!(decode_layer_array(&vfs, &set, 8).is_none());
+        assert!(decode_layer_array(&vfs, &set, 0).is_none());
+    }
+
+    #[test]
+    fn layer_map_is_total_for_degenerate_input() {
+        let set = resolve_ground_layers(&parse_surface_types(SAMPLE.as_bytes()));
+        let mut ter = tiny_terrain();
+        ter.samples = 0;
+        assert!(build_terrain_layer_map(&ter, &set).is_none());
+        // Empty layer set: no layers to map.
+        let empty = GroundLayerSet { paths: Vec::new(), tiles: Vec::new(), index_by_id: [SURFACE_LAYER_NONE; 256] };
+        assert!(build_terrain_layer_map(&tiny_terrain(), &empty).is_none());
+    }
+
+    #[test]
+    fn layer_map_decodes_real_palette_if_present() {
+        let level = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted-game/level/leveldata.xml");
+        let Ok(bytes) = std::fs::read(level) else { return };
+        let types = parse_surface_types(&bytes);
+        let set = resolve_ground_layers(&types);
+        assert!(!set.is_empty());
+        assert!(set.len() <= 32, "palette needs {} layers", set.len());
     }
 }

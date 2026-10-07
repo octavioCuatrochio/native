@@ -10,11 +10,17 @@ mod ai_bridge;
 mod light_bridge;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
+use bevy::image::{CompressedImageFormats, ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor, ImageType};
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+    TextureViewDescriptor, TextureViewDimension,
+};
 use bevy::material::AlphaMode;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin};
+use bevy::shader::{Shader, ShaderRef};
+use std::sync::OnceLock;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use sod_core::crypak::Vfs;
 use sod_core::sm_runtime::{SmCommand, SmDriveMode, SmEnv, SmInstance};
@@ -84,6 +90,133 @@ struct World {
     ground_tex: Option<Vec<u8>>,
     /// Baked per-surface ground albedo (width, height, RGBA8), spanning the terrain.
     ground_albedo: Option<(u32, u32, Vec<u8>)>,
+    /// Per-texel ground-layer map: R=layer, G=second layer, B=weight, A=255.
+    ground_layer_map: Option<(u32, u32, Vec<u8>)>,
+    /// Decoded world-tiled ground texture array (or `None` when unavailable).
+    ground_layers: Option<GroundLayerArray>,
+}
+
+/// A decoded 2D texture array of the level's coloured ground images, uploaded
+/// once and sampled in world space by the terrain material.
+struct GroundLayerArray {
+    size: u32,
+    layers: u32,
+    levels: u32,
+    /// Layer-major RGBA8 with the full box-filtered mip chain.
+    data: Vec<u8>,
+    /// Per-layer repeats per world metre (xy); only the first `layers` used.
+    tiles: [[f32; 2]; MAX_TERRAIN_LAYERS],
+}
+
+/// Maximum ground layers the terrain shader can blend (matches the WGSL array).
+const MAX_TERRAIN_LAYERS: usize = 32;
+
+/// Uniform block for [`TerrainMaterialExt`]: terrain extent in `params.xy` and
+/// each ground layer's world-space tiling (repeats per metre) in `tiles`.
+#[derive(Clone, Default, ShaderType, Reflect, Debug)]
+struct TerrainUniform {
+    params: Vec4,
+    tiles: [Vec4; MAX_TERRAIN_LAYERS],
+}
+
+/// Extension bindings for the terrain material: a 2D array of the coloured
+/// ground images, a per-texel layer/weight map, and the per-layer tiling.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct TerrainMaterialExt {
+    #[uniform(100)]
+    terrain: TerrainUniform,
+    #[texture(101, dimension = "2d_array")]
+    #[sampler(102)]
+    layers: Handle<Image>,
+    #[texture(103)]
+    #[sampler(104)]
+    layer_map: Handle<Image>,
+}
+
+/// The terrain material: standard PBR lighting with a CryEngine-style layered
+/// ground albedo. The extension shader replaces the base color with a blend of
+/// two world-space-tiled ground layers (weights from `layer_map`), so the GPU
+/// filters the detail with mipmaps and no CPU bake aliasing occurs.
+type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainMaterialExt>;
+
+/// Handle of the runtime-compiled terrain extension shader (set in `main`).
+static TERRAIN_SHADER: OnceLock<Handle<Shader>> = OnceLock::new();
+
+/// WGSL for the terrain material extension. It extends `StandardMaterial`: the
+/// base color is replaced by a blend of the two dominant ground layers at the
+/// fragment, each tiled in world space at its authored rate and filtered by the
+/// texture array's own mip chain.
+const TERRAIN_MATERIAL_WGSL: &str = r#"
+#import bevy_pbr::{
+    pbr_fragment::pbr_input_from_standard_material,
+    pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
+    forward_io::{VertexOutput, FragmentOutput},
+}
+
+struct TerrainUniform {
+    params: vec4<f32>,
+    tiles: array<vec4<f32>, 32>,
+}
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(100)
+var<uniform> terrain: TerrainUniform;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(101)
+var layer_texture: texture_2d_array<f32>;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(102)
+var layer_sampler: sampler;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(103)
+var layer_map: texture_2d<f32>;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(104)
+var layer_map_sampler: sampler;
+
+@fragment
+fn fragment(
+    in: VertexOutput,
+    @builtin(front_facing) is_front: bool,
+) -> FragmentOutput {
+    var pbr_input = pbr_input_from_standard_material(in, is_front);
+
+    // Mesh UVs span the terrain 0..1; uv * extent recovers the authored terrain
+    // (x, y) at any LOD, so the ground tiles continuously in world space.
+    let world_xy = in.uv * terrain.params.xy;
+
+    let map = textureSample(layer_map, layer_map_sampler, in.uv);
+    let ia = i32(clamp(map.r * 255.0 + 0.5, 0.0, 31.0));
+    let ib = i32(clamp(map.g * 255.0 + 0.5, 0.0, 31.0));
+    let wb = clamp(map.b, 0.0, 1.0);
+
+    let ca = textureSample(layer_texture, layer_sampler, world_xy * terrain.tiles[ia].xy, ia);
+    let cb = textureSample(layer_texture, layer_sampler, world_xy * terrain.tiles[ib].xy, ib);
+    let base_color = ca.rgb * (1.0 - wb) + cb.rgb * wb;
+
+    pbr_input.material.base_color = vec4<f32>(base_color, 1.0);
+
+    var out: FragmentOutput;
+    out.color = apply_pbr_lighting(pbr_input);
+    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    return out;
+}
+"#;
+
+/// Add the terrain extension shader to `app`'s shader assets before any
+/// `TerrainMaterial` is specialized.
+fn install_terrain_shader(app: &mut App) {
+    let shader = Shader::from_wgsl(TERRAIN_MATERIAL_WGSL, "sod_terrain_material.wgsl");
+    let handle = app.world_mut().resource_mut::<Assets<Shader>>().add(shader);
+    let _ = TERRAIN_SHADER.set(handle);
+}
+
+impl MaterialExtension for TerrainMaterialExt {
+    fn fragment_shader() -> ShaderRef {
+        match TERRAIN_SHADER.get() {
+            Some(h) => ShaderRef::Handle(h.clone()),
+            None => ShaderRef::Default,
+        }
+    }
 }
 
 /// Level lighting from the mission's time of day, at its authored start time.
@@ -826,74 +959,8 @@ fn coarse_height(t: &terrain::Terrain, si: usize, sj: usize, far: usize) -> f32 
     top * (1.0 - ty) + bot * ty
 }
 
-/// Composite the authored terrain-layer detail maps over a coloured ground bake.
-///
-/// The `terrainmaterials/*_diffuse.dds` returned by
-/// [`sod_core::surfaces::resolve_surface_textures`] are neutral (~127 grey)
-/// detail maps. Each is sampled in world space at its authored `TexMod` tiling
-/// (repeats per metre), rescaled to unit mean and blended in, restoring the
-/// per-layer high-frequency detail the `Terrain.Layer` shader would provide
-/// without shifting the baked colour.
-fn bake_layer_detail(
-    vfs: &Vfs,
-    ter: &Terrain,
-    layers: &[sod_core::surfaces::SurfaceTexture],
-    rgba: &mut [u8],
-    w: u32,
-    h: u32,
-) {
-    let detail_blend = std::env::var("SOD_LAYER_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25f32);
-    if detail_blend <= 0.0 || w == 0 || h == 0 || rgba.len() < (w as usize) * (h as usize) * 4 {
-        return;
-    }
-    let mut by_id: [Option<&sod_core::surfaces::SurfaceTexture>; 256] = std::array::from_fn(|_| None);
-    for l in layers {
-        if l.id <= 255 {
-            by_id[l.id as usize] = Some(l);
-        }
-    }
-    // Decode each layer's detail map once, indexed by surface id.
-    let mut img_by_id: [Option<sod_core::asset::DdsImageRgba>; 256] = std::array::from_fn(|_| None);
-    for id in 0..256usize {
-        if let Some(l) = by_id[id] {
-            if let Some(p) = l.diffuse.as_deref() {
-                img_by_id[id] = vfs.read(p).and_then(|b| sod_core::asset::decode_dds_rgba(&b));
-            }
-        }
-    }
-    let span_x = ter.samples as f32 * ter.spacing;
-    let span_y = ter.samples as f32 * ter.spacing;
-    let (x0, y0) = (ter.world_min[0], ter.world_min[1]);
-    for oy in 0..h as usize {
-        let wy = y0 + (oy as f32 + 0.5) / h as f32 * span_y;
-        for ox in 0..w as usize {
-            let wx = x0 + (ox as f32 + 0.5) / w as f32 * span_x;
-            let id = ter.surface_at(wx, wy) as usize;
-            let (Some(layer), Some(img)) = (by_id[id], img_by_id[id].as_ref()) else { continue };
-            let d = sample_detail(img, wx * layer.tile_u, wy * layer.tile_v);
-            let o = (oy * w as usize + ox) * 4;
-            for c in 0..3 {
-                let base = rgba[o + c] as f32 / 255.0;
-                let detail = d[c] as f32 / 127.5; // unit-mean neutral detail
-                let v = base * (1.0 - detail_blend + detail_blend * detail);
-                rgba[o + c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-        }
-    }
-}
-
-/// Nearest, wrapping RGB sample of a decoded image (tiled detail sampling).
-fn sample_detail(img: &sod_core::asset::DdsImageRgba, u: f32, v: f32) -> [u8; 3] {
-    let (iw, ih) = (img.width as usize, img.height as usize);
-    if iw == 0 || ih == 0 || img.rgba.len() < iw * ih * 4 {
-        return [128, 128, 128];
-    }
-    let tx = ((u.rem_euclid(1.0) * iw as f32) as usize).min(iw - 1);
-    let ty = ((v.rem_euclid(1.0) * ih as f32) as usize).min(ih - 1);
-    let o = (ty * iw + tx) * 4;
-    [img.rgba[o], img.rgba[o + 1], img.rgba[o + 2]]
-}
-
+/// Load a level, resolve its terrain/objects, build the render world and run
+/// the Bevy app (`play` = third-person survivor, otherwise an orbit overview).
 fn run_world(game: &str, vfs: Vfs, play: bool) {
     let level_pak_path = Path::new(game).join("Game/levels/Class3/level.pak");
     let level_pak = sod_core::Pak::open(&level_pak_path).expect("open level.pak");
@@ -911,21 +978,44 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     let surface_types = read("leveldata.xml").map(|b| surfaces::parse_surface_types(&b)).unwrap_or_default();
     println!("[world] surface types: {}", surface_types.len());
     let ground_tex = vfs.read("textures/ground/grass_dirt_mix01_diffuse.dds");
-    // Real terrain layers: `leveldata.xml` SurfaceType -> DetailMaterial ->
-    // `terrain/terrainmaterials/*.mtl`, with the authored `TexMod` tiling
-    // (surfaces.rs `resolve_surface_textures`). Those `*_diffuse.dds` are
-    // neutral detail maps, so they are composited over a coloured per-surface
-    // bake rather than used as albedo directly. The bake runs at 1 m/texel.
-    let terrain_layers = surfaces::resolve_surface_textures(&vfs, &surface_types);
-    let resolved = terrain_layers.iter().filter(|l| l.diffuse.is_some()).count();
-    println!("[world] terrain layers: {resolved}/{} resolved", terrain_layers.len());
-    let ground_albedo = surfaces::build_ground_albedo(&vfs, &ter, &surface_types, 4096)
-        .map(|(w, h, mut rgba)| {
-            bake_layer_detail(&vfs, &ter, &terrain_layers, &mut rgba, w, h);
-            (w, h, rgba)
-        });
+    // Ground layers are sampled in world space on the GPU (surfaces.rs
+    // `resolve_ground_layers` + `build_terrain_layer_map` + `decode_layer_array`).
+    // Baking a 4 m-tiled detail image into a 1 m world albedo undersampled the
+    // source 256x and produced a fixed 4-texel checkerboard, so instead the
+    // renderer tiles the coloured ground images and lets the GPU filter them
+    // with mipmaps. The per-texel layer/weight map is categorical and alias-free.
+    let layer_set = surfaces::resolve_ground_layers(&surface_types);
+    let ground_layer_map = surfaces::build_terrain_layer_map(&ter, &layer_set);
+    let ground_layers = if layer_set.len() > MAX_TERRAIN_LAYERS {
+        println!("[world] ground layers: {} > {MAX_TERRAIN_LAYERS}, using fallback", layer_set.len());
+        None
+    } else {
+        ground_layer_map.as_ref().and_then(|_| {
+            let size = 512u32;
+            let data = surfaces::decode_layer_array(&vfs, &layer_set, size)?;
+            let (data, levels) = surfaces::generate_layer_mips(&data, size, layer_set.len())?;
+            let mut tiles = [[1.0 / 4.0, 1.0 / 4.0]; MAX_TERRAIN_LAYERS];
+            for (i, t) in layer_set.tiles.iter().take(MAX_TERRAIN_LAYERS).enumerate() {
+                tiles[i] = *t;
+            }
+            Some(GroundLayerArray { size, layers: layer_set.len() as u32, levels, data, tiles })
+        })
+    };
+    match (&ground_layer_map, &ground_layers) {
+        (Some((w, h, _)), Some(a)) => println!(
+            "[world] terrain layers: {} into {w}x{h} map ({}-layer {size}px array, {levels} mips)",
+            layer_set.len(), a.layers, size = a.size, levels = a.levels
+        ),
+        _ => println!("[world] terrain layers: {} (GPU array unavailable, fallback)", layer_set.len()),
+    }
+    // Kept as a native fallback only; never aliases when the layer array exists.
+    let ground_albedo = if ground_layers.is_none() {
+        surfaces::build_ground_albedo(&vfs, &ter, &surface_types, 2048)
+    } else {
+        None
+    };
     if let Some((w, _h, _)) = &ground_albedo {
-        println!("[world] ground albedo {w}px");
+        println!("[world] fallback ground albedo {w}px");
     }
 
     // --- locate the Mt. Tanner tutorial zone -------------------------------
@@ -1305,8 +1395,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         // timed screenshots draw the world instead of an empty sky.
         .set(bevy::render::RenderPlugin { synchronous_pipeline_compilation: true, ..default() }))
     .add_plugins(light_bridge::LightBridgePlugin)
+    .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.85)))
-    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo })
+    .insert_resource(World { terrain: ter, terrain_verts: tverts, terrain_colors: tcolors, terrain_indices: tindex, placements: with_models, models, slots, tex_bytes, brushes, vegetation, ground_tex, ground_albedo, ground_layer_map, ground_layers })
     .insert_resource(ShotPlan { path: std::env::var("SOD_SHOT").ok().map(PathBuf::from), frame: 0, keys: Vec::new() })
     .insert_resource(MenuFont(vfs.read("fonts/veramono.ttf").unwrap_or_default()))
     .insert_resource(TextureCacheRes(cache::TextureCache::new("target/texture-cache")))
@@ -1360,6 +1451,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if let Some(ps) = player_setup {
         app.insert_resource(ps);
     }
+    install_terrain_shader(&mut app);
     app.run();
 }
 
@@ -1367,6 +1459,7 @@ fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut fonts: ResMut<Assets<Font>>,
     menu_font: Option<Res<MenuFont>>,
@@ -1396,38 +1489,103 @@ fn setup_world(
         })
         .map(|i| images.add(i));
 
-    // Terrain
+    // Terrain. UVs are the terrain plane normalised to 0..1 (world / extent):
+    // the layered material tiles ground images in world space from those UVs,
+    // and the baked/fallback albedo also spans the whole terrain.
     let tnormals = mesh::generate_normals(&world.terrain_verts, &world.terrain_indices);
     let mut tmesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     tmesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(world.terrain_verts.clone()));
     tmesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(tnormals));
     tmesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, VertexAttributeValues::Float32x4(world.terrain_colors.clone()));
     let extent = (world.terrain.samples as f32 * world.terrain.spacing).max(1.0);
-    let mut terrain_mat = StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 1.0, cull_mode: None, ..default() };
-    if let Some((w, h, rgba)) = &world.ground_albedo {
-        // One texture spanning the whole terrain: UV is world / extent.
-        let tuvs: Vec<[f32; 2]> = world.terrain_verts.iter().map(|p| [p[0] / extent, p[1] / extent]).collect();
-        tmesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(tuvs));
-        let img = Image::new(
-            Extent3d { width: (*w).max(1), height: (*h).max(1), depth_or_array_layers: 1 },
+    let plane_uv = world.ground_layers.is_some() || world.ground_albedo.is_some();
+    let uv_scale = if plane_uv { 1.0 / extent } else { 1.0 / 8.0 };
+    let tuvs: Vec<[f32; 2]> = world.terrain_verts.iter().map(|p| [p[0] * uv_scale, p[1] * uv_scale]).collect();
+    tmesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(tuvs));
+    tmesh.insert_indices(Indices::U32(world.terrain_indices.clone()));
+    let terrain_mesh = meshes.add(tmesh);
+
+    // World-space layered terrain material (the fix): the two dominant ground
+    // layers are tinted/tiled at the fragment from the alias-free layer map and
+    // filtered by the texture array's mip chain.
+    let mut terrain_ext: Option<Handle<TerrainMaterial>> = None;
+    if let (Some(layers), Some((mw, mh, map))) = (&world.ground_layers, &world.ground_layer_map) {
+        let mut array_img = Image::new_uninit(
+            Extent3d { width: layers.size.max(1), height: layers.size.max(1), depth_or_array_layers: layers.layers.max(1) },
             TextureDimension::D2,
-            rgba.clone(),
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
-        terrain_mat.base_color_texture = Some(images.add(img));
-    } else {
-        // Fallback: tile a single ground texture every 8 m.
-        let tuvs: Vec<[f32; 2]> = world.terrain_verts.iter().map(|p| [p[0] / 8.0, p[1] / 8.0]).collect();
-        tmesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(tuvs));
-        if let Some(bytes) = &world.ground_tex {
+        array_img.data = Some(layers.data.clone());
+        array_img.texture_descriptor.mip_level_count = layers.levels.max(1);
+        array_img.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..default()
+        });
+        array_img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            address_mode_w: ImageAddressMode::Repeat,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: 4,
+            ..default()
+        });
+
+        let map_img = Image::new(
+            Extent3d { width: (*mw).max(1), height: (*mh).max(1), depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            map.clone(),
+            // Raw indices/weights: must NOT be sRGB-decoded.
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::default(),
+        );
+        // Nearest keeps the layer indices categorical; the blend weight was
+        // smoothed on the CPU over an 8 m neighbourhood.
+        let map_img = {
+            let mut m = map_img;
+            m.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+            m
+        };
+
+        let mut tiles = [Vec4::ZERO; MAX_TERRAIN_LAYERS];
+        for i in 0..MAX_TERRAIN_LAYERS {
+            let t = layers.tiles[i];
+            tiles[i] = Vec4::new(t[0], t[1], 0.0, 0.0);
+        }
+        terrain_ext = Some(terrain_materials.add(ExtendedMaterial {
+            base: StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 1.0, cull_mode: None, ..default() },
+            extension: TerrainMaterialExt {
+                terrain: TerrainUniform { params: Vec4::new(extent, extent, 0.0, 0.0), tiles },
+                layers: images.add(array_img),
+                layer_map: images.add(map_img),
+            },
+        }));
+    }
+
+    // Fallback material when the layer array is unavailable: baked albedo if
+    // present, otherwise a single ground texture.
+    let terrain_std: Option<Handle<StandardMaterial>> = if terrain_ext.is_none() {
+        let mut mat = StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 1.0, cull_mode: None, ..default() };
+        if let Some((w, h, rgba)) = &world.ground_albedo {
+            let img = Image::new(
+                Extent3d { width: (*w).max(1), height: (*h).max(1), depth_or_array_layers: 1 },
+                TextureDimension::D2,
+                rgba.clone(),
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            );
+            mat.base_color_texture = Some(images.add(img));
+        } else if let Some(bytes) = &world.ground_tex {
             if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, "ground_grass_dirt", bytes, true) {
-                terrain_mat.base_color_texture = Some(h);
+                mat.base_color_texture = Some(h);
             }
         }
-    }
-    tmesh.insert_indices(Indices::U32(world.terrain_indices.clone()));
-    let terrain_mat = materials.add(terrain_mat);
+        Some(materials.add(mat))
+    } else {
+        None
+    };
 
     // Prebuild model meshes + materials. One material per palette slot, and one
     // mesh per submesh, so complex multi-material models texture correctly.
@@ -1508,7 +1666,11 @@ fn setup_world(
 
     // World root: terrain + props.
     commands.spawn((base, Visibility::default())).with_children(|root| {
-        root.spawn((Mesh3d(meshes.add(tmesh)), MeshMaterial3d(terrain_mat), Transform::default()));
+        if let Some(ext) = &terrain_ext {
+            root.spawn((Mesh3d(terrain_mesh.clone()), MeshMaterial3d(ext.clone()), Transform::default()));
+        } else {
+            root.spawn((Mesh3d(terrain_mesh.clone()), MeshMaterial3d(terrain_std.clone().unwrap()), Transform::default()));
+            }
         let mut spawned = 0;
         for p in &world.placements {
             let Some(path) = &p.model else { continue };

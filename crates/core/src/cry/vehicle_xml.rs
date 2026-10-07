@@ -269,6 +269,45 @@ impl ArcadeWheeled {
         (v0 - t * k).to_radians().clamp(0.0, std::f32::consts::FRAC_PI_2)
     }
 
+    /// Steering rate in **degrees/second** for a normalised speed
+    /// `t = |speed| / vMaxSteerMax` (clamped to `0..1`).
+    ///
+    /// Ported from `CVehicleMovementArcadeWheeled::GetSteerSpeed` at
+    /// `0x01673170`: the return value is the product of two linear
+    /// interpolations `interp(scaleMin, scale, t) * interp(speed, speedMin, t)`
+    /// (forward), selected by the reverse flag. The `[+0x50c]` "force full
+    /// rate" override returns the constant at `0x0172b138` (1000 deg/s).
+    pub fn steer_rate_deg(&self, speed: f32, reverse: bool) -> f32 {
+        let vmax = if reverse {
+            self.rv_max_steer_max
+        } else {
+            self.v_max_steer_max
+        };
+        let t = if vmax > 0.0 {
+            (speed.abs() / vmax).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (sp, sp_min, sc, sc_min) = if reverse {
+            (
+                self.reverse_steer_speed,
+                self.reverse_steer_speed_min,
+                self.reverse_steer_speed_scale,
+                self.reverse_steer_speed_scale_min,
+            )
+        } else {
+            (
+                self.steer_speed,
+                self.steer_speed_min,
+                self.steer_speed_scale,
+                self.steer_speed_scale_min,
+            )
+        };
+        let scale = sc_min + (sc - sc_min) * t;
+        let rate = sp + (sp_min - sp) * t;
+        scale * rate
+    }
+
     /// Engine acceleration multiplier from `<WheelSpin>`: `accelMultiplier1` at
     /// rest easing to `accelMultiplier2` at top speed.
     pub fn accel_multiplier(&self, speed: f32) -> f32 {
@@ -360,6 +399,37 @@ impl Default for VehiclePhysics {
     }
 }
 
+/// One `<DamageBehavior>` on a component (`Scripts/Entities/Vehicles/*.xml`).
+///
+/// The shipped hatchback uses `class="ClipMask"` (dented body mask),
+/// `class="Effect"` (spawn/damage FX), `class="DetachPart"` (knock the part
+/// off) and `class="Group"` / `class="SpawnDebris"` on the `Hull`. Each fires
+/// once the component's damage ratio (`1 - health/damageMax`) reaches
+/// `damage_ratio_min`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DamageBehavior {
+    /// `class` attribute: `Group`, `SpawnDebris`, `ClipMask`, `Effect`,
+    /// `DetachPart`, `SeatStatus`, ...
+    pub class: String,
+    /// `damageRatioMin` — ratio at/above which the behavior triggers.
+    pub damage_ratio_min: f32,
+    /// `<Group name=...>` inside a `Group` behavior.
+    pub group: String,
+    /// `activateMask` of a `ClipMask` behavior.
+    pub activate_mask: String,
+    /// `<Effect effect=...>` name of an `Effect` behavior.
+    pub effect: String,
+    /// `<DetachPart part=...>` name of a `DetachPart` behavior.
+    pub part: String,
+}
+
+impl DamageBehavior {
+    /// True once `ratio` (`0..1`) has reached this behavior's trigger point.
+    pub fn fires_at(&self, ratio: f32) -> bool {
+        ratio >= self.damage_ratio_min
+    }
+}
+
 /// One damageable `<Component>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DamageComponent {
@@ -369,6 +439,19 @@ pub struct DamageComponent {
     /// Fraction of damage passed to the hull.
     pub hull_affection: f32,
     pub use_bounds_from_parts: bool,
+    /// Per-component `<DamageMultipliers>` (`damageType -> multiplier`). When a
+    /// type is absent here the top-level `<Damages><DamageMultipliers>` value
+    /// applies, exactly as `CVehicleComponent` does in the engine.
+    pub multipliers: BTreeMap<String, f32>,
+    /// `<DamageBehaviors>` in document order.
+    pub behaviors: Vec<DamageBehavior>,
+}
+
+impl DamageComponent {
+    /// Multiplier declared on the component itself for `damage_type`.
+    pub fn multiplier(&self, damage_type: &str) -> Option<f32> {
+        self.multipliers.get(&damage_type.to_ascii_lowercase()).copied()
+    }
 }
 
 /// `<Damages>` block plus the always-present `Hull` component.
@@ -568,6 +651,8 @@ impl VehicleSetup {
             damage_max: 20000.0,
             hull_affection: 1.0,
             use_bounds_from_parts: true,
+            multipliers: BTreeMap::new(),
+            behaviors: Vec::new(),
         });
         let wheel = |name: &str, axle: u8, driving: bool| Wheel {
             name: name.into(),
@@ -675,6 +760,7 @@ pub fn parse_vehicle_xml(xml: &[u8]) -> VehicleSetup {
     let mut setup = VehicleSetup::default();
     let mut stack: Vec<String> = Vec::new();
     let mut cur_component: Option<usize> = None;
+    let mut cur_behavior: Option<usize> = None;
     let mut cur_part_name: Option<String> = None;
     let mut cur_mass_box_mass: Option<f32> = None;
     let mut in_top_helpers = false;
@@ -728,8 +814,18 @@ pub fn parse_vehicle_xml(xml: &[u8]) -> VehicleSetup {
                     "damagemultiplier" => {
                         let ty = attr(&a, "damagetype").unwrap_or("").to_ascii_lowercase();
                         let mult = f32_of(attr(&a, "multiplier"));
-                        if !ty.is_empty() && cur_component.is_none() {
-                            setup.damage.multipliers.insert(ty, mult);
+                        if !ty.is_empty() {
+                            // A multiplier nested in a `<Component>` is
+                            // component-local; the top-level `<Damages>` one is
+                            // the per-damage-type default.
+                            match cur_component.and_then(|i| setup.damage.components.get_mut(i)) {
+                                Some(c) => {
+                                    c.multipliers.insert(ty, mult);
+                                }
+                                None => {
+                                    setup.damage.multipliers.insert(ty, mult);
+                                }
+                            }
                         }
                     }
                     "component" => {
@@ -738,10 +834,59 @@ pub fn parse_vehicle_xml(xml: &[u8]) -> VehicleSetup {
                             damage_max: f32_of(attr(&a, "damagemax")),
                             hull_affection: f32_of(attr(&a, "hullaffection")),
                             use_bounds_from_parts: bool_of(attr(&a, "useboundsfromparts")),
+                            multipliers: BTreeMap::new(),
+                            behaviors: Vec::new(),
                         };
                         setup.damage.components.push(c);
-                        if !is_empty {
-                            cur_component = Some(setup.damage.components.len() - 1);
+                        // A self-closing `<Component/>` owns no children, so no
+                        // `<DamageMultipliers>` / `<DamageBehaviors>` follow.
+                        cur_component = if is_empty {
+                            None
+                        } else {
+                            Some(setup.damage.components.len() - 1)
+                        };
+                    }
+                    "damagebehavior" => {
+                        if let Some(ci) = cur_component {
+                            if let Some(comp) = setup.damage.components.get_mut(ci) {
+                                comp.behaviors.push(DamageBehavior {
+                                    class: attr(&a, "class").unwrap_or("").to_string(),
+                                    damage_ratio_min: f32_of(attr(&a, "damageratiomin")),
+                                    activate_mask: attr(&a, "activatemask").unwrap_or("").to_string(),
+                                    ..DamageBehavior::default()
+                                });
+                                if !is_empty {
+                                    cur_behavior = Some(comp.behaviors.len() - 1);
+                                }
+                            }
+                        }
+                    }
+                    "group" => {
+                        // `<Group name="Destroy"/>` inside a `Group` behavior.
+                        if let (Some(ci), Some(bi)) = (cur_component, cur_behavior) {
+                            if let Some(b) =
+                                setup.damage.components.get_mut(ci).and_then(|c| c.behaviors.get_mut(bi))
+                            {
+                                b.group = attr(&a, "name").unwrap_or("").to_string();
+                            }
+                        }
+                    }
+                    "effect" => {
+                        if let (Some(ci), Some(bi)) = (cur_component, cur_behavior) {
+                            if let Some(b) =
+                                setup.damage.components.get_mut(ci).and_then(|c| c.behaviors.get_mut(bi))
+                            {
+                                b.effect = attr(&a, "effect").unwrap_or("").to_string();
+                            }
+                        }
+                    }
+                    "detachpart" => {
+                        if let (Some(ci), Some(bi)) = (cur_component, cur_behavior) {
+                            if let Some(b) =
+                                setup.damage.components.get_mut(ci).and_then(|c| c.behaviors.get_mut(bi))
+                            {
+                                b.part = attr(&a, "part").unwrap_or("").to_string();
+                            }
                         }
                     }
                     "part" => {
@@ -881,7 +1026,11 @@ pub fn parse_vehicle_xml(xml: &[u8]) -> VehicleSetup {
                 let name = local_name_raw(e.name().as_ref());
                 stack.pop();
                 match name.as_str() {
-                    "component" => cur_component = None,
+                    "component" => {
+                        cur_component = None;
+                        cur_behavior = None;
+                    }
+                    "damagebehavior" => cur_behavior = None,
                     "part" => {
                         cur_part_name = None;
                         cur_mass_box_mass = None;
@@ -908,15 +1057,25 @@ fn apply_arcade(a: &[(String, String)], m: &mut ArcadeWheeled) {
     m.v_max_steer_max = f32_of(attr(a, "vmaxsteermax"));
     m.steer_speed_min = f32_of(attr(a, "steerspeedmin"));
     m.steer_speed = f32_of(attr(a, "steerspeed"));
-    m.steer_speed_scale_min = f32_of(attr(a, "steerspeedscalemin"));
-    m.steer_speed_scale = f32_of(attr(a, "steerspeedscale"));
+    // The engine ctor defaults the scales to 1.0; keep that when the XML omits
+    // them instead of clobbering with 0.
+    if let Some(v) = attr(a, "steerspeedscalemin") {
+        m.steer_speed_scale_min = f32_of(Some(v));
+    }
+    if let Some(v) = attr(a, "steerspeedscale") {
+        m.steer_speed_scale = f32_of(Some(v));
+    }
     m.v0_steer_max = f32_of(attr(a, "v0steermax"));
     m.kv_steer_max = f32_of(attr(a, "kvsteermax"));
     m.rv_max_steer_max = f32_of(attr(a, "rvmaxsteermax"));
     m.reverse_steer_speed_min = f32_of(attr(a, "reversesteerspeedmin"));
     m.reverse_steer_speed = f32_of(attr(a, "reversesteerspeed"));
-    m.reverse_steer_speed_scale_min = f32_of(attr(a, "reversesteerspeedscalemin"));
-    m.reverse_steer_speed_scale = f32_of(attr(a, "reversesteerspeedscale"));
+    if let Some(v) = attr(a, "reversesteerspeedscalemin") {
+        m.reverse_steer_speed_scale_min = f32_of(Some(v));
+    }
+    if let Some(v) = attr(a, "reversesteerspeedscale") {
+        m.reverse_steer_speed_scale = f32_of(Some(v));
+    }
     m.rv0_steer_max = f32_of(attr(a, "rv0steermax"));
     m.rkv_steer_max = f32_of(attr(a, "rkvsteermax"));
     m.steer_relaxation = f32_of(attr(a, "steerrelaxation"));
@@ -1035,8 +1194,28 @@ mod tests {
    <DamageMultipliers>
     <DamageMultiplier damageType="bullet" multiplier="10"/>
    </DamageMultipliers>
+   <DamageBehaviors>
+    <DamageBehavior class="Group" damageRatioMin="1">
+     <Group name="Destroy"/>
+    </DamageBehavior>
+    <DamageBehavior class="SpawnDebris"/>
+   </DamageBehaviors>
   </Component>
   <Component name="fuel_tank" damageMax="250" useBoundsFromParts="1" hullAffection="1"/>
+  <Component name="hood" damageMax="1000" useBoundsFromParts="1" hullAffection="0">
+   <DamageMultipliers>
+    <DamageMultiplier damageType="bullet" multiplier="0.15"/>
+   </DamageMultipliers>
+   <DamageBehaviors>
+    <DamageBehavior class="ClipMask" damageRatioMin="0.5" activateMask="hoodDented"/>
+    <DamageBehavior class="Effect" damageRatioMin="0.75">
+     <Effect effect="BumperDamage" disableAfterExplosion="1"/>
+    </DamageBehavior>
+    <DamageBehavior class="DetachPart" damageRatioMin="1">
+     <DetachPart part="bumper_front"/>
+    </DamageBehavior>
+   </DamageBehaviors>
+  </Component>
  </Components>
  <Parts>
   <Part name="body" class="Animated" mass="5000">
@@ -1067,7 +1246,11 @@ mod tests {
  </Seats>
  <MovementParams>
   <ArcadeWheeled gravity="-9.8" gravityInAir="-9.0" vMaxSteerMax="18" steerSpeedMin="100" steerSpeed="80"
-     v0SteerMax="60" kvSteerMax="50" rvMaxSteerMax="16" rv0SteerMax="30" rkvSteerMax="-60"
+     steerSpeedScaleMin="1.0" steerSpeedScale="1.0"
+     v0SteerMax="60" kvSteerMax="50" rvMaxSteerMax="16"
+     reverseSteerSpeedMin="100" reverseSteerSpeed="80"
+     reverseSteerSpeedScaleMin="1.0" reverseSteerSpeedScale="1.0"
+     rv0SteerMax="30" rkvSteerMax="-60"
      steerRelaxation="200" rpmRelaxSpeed="1" rpmInterpSpeed="2.5" rpmGearShiftSpeed="2">
    <Handling>
     <Power acceleration="14" decceleration="1" topSpeed="24.59" reverseSpeed="16"/>
@@ -1099,8 +1282,12 @@ mod tests {
         assert_eq!(s.damage.hull_damage_max(), Some(20000.0));
         assert!((s.damage.multiplier("bullet") - 0.125).abs() < 1e-6);
         assert!((s.damage.multiplier("melee") - 1.0).abs() < 1e-6);
-        assert_eq!(s.damage.components.len(), 2);
+        assert_eq!(s.damage.components.len(), 3);
         assert!((s.damage.coll_damage_threshold - 10.0).abs() < 1e-6);
+        // Per-component multipliers override the top-level defaults.
+        assert_eq!(s.damage.components[0].multiplier("bullet"), Some(10.0));
+        assert_eq!(s.damage.components[2].multiplier("bullet"), Some(0.15));
+        assert_eq!(s.damage.components[1].multiplier("bullet"), None);
 
         let m = &s.movement;
         assert!((m.power.acceleration - 14.0).abs() < 1e-6);
@@ -1125,6 +1312,44 @@ mod tests {
         assert!((s.track_width().unwrap() - 1.8).abs() < 1e-3);
 
         assert!((s.helpers["wheelFrontLeft"][1] - 1.94513).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parses_damage_behaviors() {
+        let s = parse_vehicle_xml(HATCHBACK.as_bytes());
+        let hull = &s.damage.components[0];
+        assert_eq!(hull.behaviors.len(), 2);
+        assert_eq!(hull.behaviors[0].class, "Group");
+        assert!((hull.behaviors[0].damage_ratio_min - 1.0).abs() < 1e-6);
+        assert_eq!(hull.behaviors[0].group, "Destroy");
+        assert_eq!(hull.behaviors[1].class, "SpawnDebris");
+        assert_eq!(hull.behaviors[1].damage_ratio_min, 0.0);
+
+        let hood = &s.damage.components[2];
+        assert_eq!(hood.behaviors.len(), 3);
+        assert_eq!(hood.behaviors[0].class, "ClipMask");
+        assert_eq!(hood.behaviors[0].activate_mask, "hoodDented");
+        assert!((hood.behaviors[0].damage_ratio_min - 0.5).abs() < 1e-6);
+        assert_eq!(hood.behaviors[1].class, "Effect");
+        assert_eq!(hood.behaviors[1].effect, "BumperDamage");
+        assert_eq!(hood.behaviors[2].class, "DetachPart");
+        assert_eq!(hood.behaviors[2].part, "bumper_front");
+        assert!(hood.behaviors[0].fires_at(0.5));
+        assert!(!hood.behaviors[0].fires_at(0.49));
+    }
+
+    /// The recovered `GetSteerSpeed` (`0x01673170`) is the product of the
+    /// speed and scale interpolations, with the reverse pair selected by gear.
+    #[test]
+    fn steer_rate_matches_recovered_curve() {
+        let m = &parse_vehicle_xml(HATCHBACK.as_bytes()).movement;
+        // Forward: scale 1.0, so rate = interp(80, 100, t) deg/s.
+        assert!((m.steer_rate_deg(0.0, false) - 80.0).abs() < 1e-4);
+        assert!((m.steer_rate_deg(18.0, false) - 100.0).abs() < 1e-4);
+        assert!((m.steer_rate_deg(9.0, false) - 90.0).abs() < 1e-4);
+        // Reverse uses the `reverseSteerSpeed*` pair and `rvMaxSteerMax`.
+        assert!((m.steer_rate_deg(0.0, true) - 80.0).abs() < 1e-4);
+        assert!((m.steer_rate_deg(16.0, true) - 100.0).abs() < 1e-4);
     }
 
     #[test]

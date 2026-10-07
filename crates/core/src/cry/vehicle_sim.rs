@@ -306,12 +306,35 @@ impl VehicleHealth {
         }
     }
 
-    /// Apply `amount` of `damage_type` to the hull (scaled by the XML
-    /// top-level multiplier for that type).
+    /// Effective multiplier for `damage_type` on component `idx`: the
+    /// component's own `<DamageMultipliers>` overrides the top-level
+    /// `<Damages><DamageMultipliers>` default (the same precedence
+    /// `CVehicleComponent` uses when it looks its multiplier up by type).
+    fn component_mult(setup: &VehicleSetup, idx: usize, damage_type: &str) -> f32 {
+        setup
+            .damage
+            .components
+            .get(idx)
+            .and_then(|c| c.multiplier(damage_type))
+            .unwrap_or_else(|| setup.damage.multiplier(damage_type))
+    }
+
+    /// Apply `amount` of `damage_type` to the hull. Routes through the `Hull`
+    /// component when one is declared so its per-component multipliers apply.
     pub fn apply_hull(&mut self, setup: &VehicleSetup, damage_type: &str, amount: f32) {
-        let dmg = amount.max(0.0) * setup.damage.multiplier(damage_type);
-        self.hull -= dmg;
-        self.check();
+        match setup
+            .damage
+            .components
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("hull"))
+        {
+            Some(i) => self.apply_component(setup, i, damage_type, amount),
+            None => {
+                let dmg = amount.max(0.0) * setup.damage.multiplier(damage_type);
+                self.hull = (self.hull - dmg).max(0.0);
+                self.check();
+            }
+        }
     }
 
     /// Apply damage to component `idx`; the component's `hullAffection`
@@ -327,19 +350,49 @@ impl VehicleHealth {
         let Some(comp) = setup.damage.components.get(idx) else {
             return;
         };
-        let dmg = amount.max(0.0) * setup.damage.multiplier(damage_type);
+        let dmg = amount.max(0.0) * Self::component_mult(setup, idx, damage_type);
         if let Some(h) = self.components.get_mut(idx) {
-            *h -= dmg;
+            *h = (*h - dmg).max(0.0);
         }
-        if comp.name.eq_ignore_ascii_case("hull") || comp.hull_affection > 0.0 {
-            let affect = if comp.name.eq_ignore_ascii_case("hull") {
-                1.0
-            } else {
-                comp.hull_affection
-            };
-            self.hull -= dmg * affect;
+        if comp.name.eq_ignore_ascii_case("hull") {
+            self.hull = (self.hull - dmg).max(0.0);
+        } else if comp.hull_affection > 0.0 {
+            self.hull = (self.hull - dmg * comp.hull_affection).max(0.0);
         }
         self.check();
+    }
+
+    /// Damage ratio of component `idx`, `0..=1` (`1 - health / damageMax`).
+    pub fn component_ratio(&self, setup: &VehicleSetup, idx: usize) -> f32 {
+        let Some(comp) = setup.damage.components.get(idx) else {
+            return 0.0;
+        };
+        let Some(&hp) = self.components.get(idx) else {
+            return 0.0;
+        };
+        if comp.damage_max > 0.0 {
+            (1.0 - hp / comp.damage_max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `<DamageBehavior>`s on component `idx` whose `damageRatioMin` has been
+    /// reached, in document order. The caller drives the corresponding
+    /// effect/mask/detach/group action.
+    pub fn fired_behaviors<'a>(
+        &'a self,
+        setup: &'a VehicleSetup,
+        idx: usize,
+    ) -> impl Iterator<Item = &'a crate::cry::vehicle_xml::DamageBehavior> + 'a {
+        let ratio = self.component_ratio(setup, idx);
+        setup
+            .damage
+            .components
+            .get(idx)
+            .map(move |c| c.behaviors.iter().filter(move |b| b.fires_at(ratio)))
+            .into_iter()
+            .flatten()
     }
 
     fn check(&mut self) {
@@ -735,9 +788,10 @@ impl VehicleBody {
     }
 }
 
-/// Steering rate in degrees/second: the XML `steerSpeed` (forward) or
-/// `reverseSteerSpeed`, scaled by the `steerSpeedScale*` speed blend, and the
-/// `steerRelaxation` rate when the wheel returns to centre.
+/// Steering rate in degrees/second: the recovered
+/// `CVehicleMovementArcadeWheeled::GetSteerSpeed` (`0x01673170`, see
+/// [`crate::cry::vehicle_xml::ArcadeWheeled::steer_rate_deg`]) for the input
+/// direction, and the `steerRelaxation` rate when the wheel returns to centre.
 fn steer_rate_deg(
     m: &crate::cry::vehicle_xml::ArcadeWheeled,
     vlong: f32,
@@ -746,18 +800,7 @@ fn steer_rate_deg(
     if steer_in.abs() < 1e-3 {
         return m.steer_relaxation;
     }
-    let vmax = m.v_max_steer_max.max(1.0);
-    let t = (vlong.abs() / vmax).clamp(0.0, 1.0);
-    let base = if vlong >= 0.0 {
-        let scale = m.steer_speed_scale_min
-            + (m.steer_speed_scale - m.steer_speed_scale_min) * t;
-        m.steer_speed * if scale > 0.0 { scale } else { 1.0 }
-    } else {
-        let scale = m.reverse_steer_speed_scale_min
-            + (m.reverse_steer_speed_scale - m.reverse_steer_speed_scale_min) * t;
-        m.reverse_steer_speed * if scale > 0.0 { scale } else { 1.0 }
-    };
-    base
+    m.steer_rate_deg(vlong, vlong < 0.0)
 }
 
 /// Build the four suspension wheels from the `<SubPartWheel>` set and the
@@ -1086,6 +1129,47 @@ mod tests {
         let mut h = VehicleHealth::new(&s);
         h.apply_component(&s, 0, "collision", 500.0);
         assert!((h.hull - 19500.0).abs() < 1e-3, "hull={}", h.hull);
+    }
+
+    /// The shipped hatchback declares bullet x10 on the `Hull` component while
+    /// the top-level default is 0.125; the component value wins.
+    #[test]
+    fn component_multiplier_overrides_global() {
+        let mut s = hatch();
+        s.damage.multipliers.insert("bullet".into(), 0.125);
+        s.damage.components[0].multipliers.insert("bullet".into(), 10.0);
+        let mut h = VehicleHealth::new(&s);
+        h.apply_hull(&s, "bullet", 100.0);
+        assert!((h.hull - 19000.0).abs() < 1e-3, "hull={}", h.hull);
+        // A component without a per-type entry falls back to the default.
+        let mut h2 = VehicleHealth::new(&s);
+        h2.apply_hull(&s, "collision", 100.0);
+        assert!((h2.hull - 19900.0).abs() < 1e-3, "hull={}", h2.hull);
+    }
+
+    #[test]
+    fn damage_behaviors_fire_at_damage_ratio() {
+        use crate::cry::vehicle_xml::DamageBehavior;
+        let mut s = hatch();
+        s.damage.components[0].behaviors.push(DamageBehavior {
+            class: "ClipMask".into(),
+            damage_ratio_min: 0.5,
+            activate_mask: "hoodDented".into(),
+            ..DamageBehavior::default()
+        });
+        s.damage.components[0].behaviors.push(DamageBehavior {
+            class: "DetachPart".into(),
+            damage_ratio_min: 1.0,
+            part: "hood".into(),
+            ..DamageBehavior::default()
+        });
+        let mut h = VehicleHealth::new(&s);
+        assert_eq!(h.fired_behaviors(&s, 0).count(), 0);
+        h.apply_component(&s, 0, "collision", 10000.0); // ratio 0.5
+        assert_eq!(h.fired_behaviors(&s, 0).count(), 1);
+        h.apply_component(&s, 0, "collision", 10000.0); // ratio 1.0, destroyed
+        assert_eq!(h.fired_behaviors(&s, 0).count(), 2);
+        assert!(h.destroyed);
     }
 
     #[test]

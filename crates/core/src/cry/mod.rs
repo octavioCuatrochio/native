@@ -21,6 +21,7 @@ pub mod cvars;
 pub mod events;
 pub mod gamerules;
 pub mod host;
+pub mod items;
 pub mod mission;
 pub mod navmesh;
 pub mod phys_proxy;

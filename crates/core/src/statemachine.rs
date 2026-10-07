@@ -222,6 +222,9 @@ pub struct SmTransition {
     pub blend_in: f32,
     /// Second `f32` blend parameter.
     pub blend_out: f32,
+    /// Candidate flags byte (`j_44` `+0xb`); `SmTick` copies `flags != 0` into
+    /// the instance's `+0x19` latch when the candidate is selected.
+    pub flags: u8,
     /// Which of the block's two condition lists produced this edge.
     pub list: SmTransitionList,
 }
@@ -512,6 +515,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
             read_f32(bytes, o + 4, be)?,
             read_u16(bytes, o + 8, be)?,
             read_u16(bytes, o + 0xa, be)?,
+            bytes.get(o + 0xb).copied().unwrap_or(0),
         ));
     }
 
@@ -557,7 +561,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
                     break;
                 };
                 for _ in 0..nc {
-                    let Some(&(blend_in, blend_out, target, weight)) = j44.get(j) else {
+                    let Some(&(blend_in, blend_out, target, weight, flags)) = j44.get(j) else {
                         break;
                     };
                     transitions.push(SmTransition {
@@ -568,6 +572,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
                         weight,
                         blend_in,
                         blend_out,
+                        flags,
                         list: SmTransitionList::Primary,
                     });
                     j += 1;
@@ -580,7 +585,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
                     break;
                 };
                 for _ in 0..nc {
-                    let Some(&(blend_in, blend_out, target, weight)) = j44.get(j2) else {
+                    let Some(&(blend_in, blend_out, target, weight, flags)) = j44.get(j2) else {
                         break;
                     };
                     transitions.push(SmTransition {
@@ -591,6 +596,7 @@ fn parse_full(bytes: &[u8], be: bool) -> Option<StateMachine> {
                         weight,
                         blend_in,
                         blend_out,
+                        flags,
                         list: SmTransitionList::Secondary,
                     });
                     j2 += 1;

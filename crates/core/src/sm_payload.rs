@@ -133,7 +133,13 @@ pub struct SmActionRecord {
     pub flags: u8,
     pub known_type: bool,
     pub desc: Option<SmActionDesc>,
+    /// Static operand consumed from the `action_data` blob.
     pub data: Vec<u8>,
+    /// Static operand consumed from the `block_strings` code stream
+    /// (`block.code_offset`, aligned to `desc.code_align`, `desc.code_size`
+    /// bytes). This is the per-action bytecode segment; see
+    /// [`crate::sm_runtime`] for how it is surfaced as action commands.
+    pub code: Vec<u8>,
 }
 
 /// One entry of a state's condition table.
@@ -278,6 +284,7 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
     let filters_sec = section(sm, "filters").map(|s| (s.offset as usize, s.size as usize));
     let filter_data = section(sm, "filter_data").map(|s| (s.offset as usize, s.size as usize));
     let act_ids = section(sm, "action_ids").map(|s| (s.offset as usize, s.size as usize));
+    let block_strings = section(sm, "block_strings").map(|s| (s.offset as usize, s.size as usize));
 
     // Coverage bitmaps for the shared/opaque payload sections.
     let mut b_trig_data = Bits::new(trig_data.map(|x| x.1).unwrap_or(0));
@@ -287,6 +294,7 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
     let mut b_trig_types = Bits::new(trig_types.map(|x| x.1).unwrap_or(0));
     let mut b_ent_types = Bits::new(ent_types.map(|x| x.1).unwrap_or(0));
     let mut b_trn_types = Bits::new(trn_types.map(|x| x.1).unwrap_or(0));
+    let mut b_block_strings = Bits::new(block_strings.map(|x| x.1).unwrap_or(0));
 
     for (si, st) in sm.states.iter().enumerate() {
         let mut running_output: u32 = 0;
@@ -409,11 +417,21 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
                 }
             }
 
-            // ---- actions (`action_ids` + `action_data`)
+            // ---- actions (`action_ids` + `action_data` + `block_strings`)
+            //
+            // Each `action_ids` entry names a descriptor whose `data_size` bytes
+            // are consumed from the `action_data` blob and whose `code_size`
+            // bytes are consumed from the `block_strings` blob (the per-block
+            // bytecode). Both cursors advance in action order; the code cursor
+            // is bounded by `block.code_offset + block.code_length`. This is
+            // what `FUN_01693930` 0x1693930 does when it runs a state's actions.
             if let (Some(&(ab, alen)), Some(&(db, dlen))) = (act_ids.as_ref(), act_data.as_ref()) {
                 let base = block.action_base as usize;
                 let count = block.action_count as usize;
                 let mut cursor = db as usize + block.action_data_offset as usize;
+                let (csb, _cslen) = block_strings.unwrap_or((0, 0));
+                let mut code_cursor = csb + block.code_offset as usize;
+                let code_end = code_cursor + block.code_length as usize;
                 for i in 0..count {
                     let rec = ab + (base + i) * 4;
                     if rec + 4 > ab + alen * 4 {
@@ -442,6 +460,24 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
                     if known {
                         cursor += size as usize;
                     }
+                    let mut code_span = None;
+                    let code = match desc {
+                        Some(d) => {
+                            let start = align_up(code_cursor, d.code_align);
+                            let end = start + d.code_size as usize;
+                            code_cursor = start + d.code_size as usize;
+                            if end <= code_end {
+                                code_span = Some((start - csb, d.code_size as usize));
+                                bytes.get(start..end).unwrap_or(&[]).to_vec()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        None => Vec::new(),
+                    };
+                    if let Some((off, len)) = code_span {
+                        b_block_strings.mark(off, len);
+                    }
                     actions.push(SmActionRecord {
                         state: si as u32,
                         block: block_idx,
@@ -452,6 +488,7 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
                         known_type: known,
                         desc,
                         data,
+                        code,
                     });
                 }
             }
@@ -466,7 +503,7 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
     // (state, block) occurrence. Field order: `u32 dataOffset`, `u16 dataSize`,
     // `u8 filterType`, `u8 reserved`.
     if let (Some(&(fo, _fs)), Some(&(db, dlen))) = (filters_sec.as_ref(), filter_data.as_ref()) {
-        for (si, st) in sm.states.iter().enumerate() {
+        for (_si, st) in sm.states.iter().enumerate() {
             for &bi in &st.blocks {
                 let Some(block) = blocks.get(bi as usize) else { continue };
                 let base = block.filter_base as usize;
@@ -548,7 +585,7 @@ pub fn decode(bytes: &[u8], sm: &StateMachine) -> SmPayloads {
         let Some(s) = section(sm, name) else { continue };
         let total = s.size as u64;
         let decoded = match name {
-            "block_strings" => 0,
+            "block_strings" => b_block_strings.count() as u64,
             "trigger_data" => b_ent_data.count() as u64,
             "trigger_types" => b_ent_types.count() as u64,
             "filter_data" => b_filter_data.count() as u64,
@@ -761,6 +798,49 @@ mod tests {
         }
         for w in crate::sm_tables::ACTION_DESCS.windows(2) {
             assert!(w[0].id < w[1].id);
+        }
+    }
+
+    /// `block_strings` is the concatenation of per-action code operands: each
+    /// action consumes `descriptor.code_size` bytes (aligned to
+    /// `descriptor.code_align`) in action order, and the cursor must land
+    /// exactly on `block.code_offset + block.code_length`.
+    #[test]
+    fn block_strings_is_action_code_stream() {
+        let mut parsed_any = false;
+        for actor in all_actors() {
+            let Some(bytes) = real_sm(actor, "win") else { continue };
+            parsed_any = true;
+            let sm = parse_sm(&bytes).expect("parses");
+            let p = &sm.payloads;
+            if p.actions.is_empty() {
+                continue;
+            }
+            // Group action records by (state, block); each group walks the
+            // block's code stream from offset 0.
+            let mut seen = std::collections::HashSet::new();
+            let mut exact = 0usize;
+            for a in &p.actions {
+                if !seen.insert((a.state, a.block)) {
+                    continue;
+                }
+                let Some(blk) = sm.blocks.get(a.block as usize) else { continue };
+                let group: Vec<&SmActionRecord> =
+                    p.actions.iter().filter(|x| x.state == a.state && x.block == a.block).collect();
+                let mut cur = 0usize;
+                let mut valid = true;
+                for g in &group {
+                    let Some(d) = g.desc else { valid = false; break };
+                    cur = align_up(cur, d.code_align) + d.code_size as usize;
+                }
+                if valid && cur == blk.code_length as usize {
+                    exact += 1;
+                }
+            }
+            assert!(exact > 0, "{actor}: no block code stream matched");
+        }
+        if !parsed_any {
+            return;
         }
     }
 

@@ -16,8 +16,10 @@ use crate::ag_cost::{CandidateMotion, DesiredMotion};
 use crate::ag_runtime::{Graph, GraphInstance, InputValues};
 use crate::anim_alias::{BlendType, Resolved, ResolvedKind};
 
-/// Below this horizontal speed (m/s) the Dir4 keys read `Idle`. INFERRED.
-pub const DIR4_IDLE_SPEED: f32 = 0.1;
+/// Below this horizontal speed (m/s) the Dir4 keys read `Idle`: the input setter
+/// compares sqrt(LX²+LY²) with the float at `0x17877c4` (= 0.5) at `0x876225`, then
+/// writes `"Idle"` (`0x1771cf0`) to RequestedMoveDir4LH and zeroes LX/LY/LH.
+pub const DIR4_IDLE_SPEED: f32 = 0.5;
 
 /// Graph-template `name`s that play a one-shot transition rather than a loop:
 /// the engine holds the state until the clip finishes before walking the next

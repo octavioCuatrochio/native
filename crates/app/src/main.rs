@@ -1781,6 +1781,8 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .insert_resource(CamLagRes(sod_core::camera::CameraLag::new()))
     .insert_resource(HudRes(hud::HudState::new()))
     .add_systems(Startup, setup_world);
+    app.init_resource::<MoveScript>();
+    app.add_systems(PreUpdate, run_move_script.after(bevy::input::InputSystems));
     // Per-frame sector LOD re-selection (CTerrainNode::SetLOD/CheckVis each frame):
     // rebuild only nodes whose stitching changed and stream the merged mesh back.
     // Skipped for the A/B uniform / near-far controls and if the quadtree failed to decode.
@@ -2848,44 +2850,87 @@ fn build_fragment_anim(
     load_resolved_anim(ctx, &mut player.caf_cache, &res, playback_speed, one_shot)
 }
 
-/// `SOD_MOVES=1`: replay the retail capture's input script
-/// (`tools/game_probe.py` scenario `moves`) so our build and the real game get
-/// identical input. Returns (forward, strafe, aim, sprint, mouse counts/s) for
-/// the time since the first call; exits the app when the script ends.
-fn scripted_moves(start: bool) -> Option<(f32, f32, bool, bool, f32)> {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    static T0: OnceLock<std::time::Instant> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("SOD_MOVES").is_ok()) {
-        return None;
-    }
-    let t0 = if start { *T0.get_or_init(std::time::Instant::now) } else { *T0.get()? };
-    let t = t0.elapsed().as_secs_f32();
-    static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-    // (seconds, forward, strafe, aim, sprint, mouse counts/s) — same order and
-    // durations as scenario_moves().
-    let mut seq: Vec<(f32, f32, f32, bool, bool, f32)> = vec![(2.0, 0.0, 0.0, false, false, 0.0)];
-    for aim in [false, true] {
-        for (f, st) in [(1.0, 0.0), (-1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-            seq.push((3.0, f, st, aim, false, 0.0));
-            seq.push((1.5, 0.0, 0.0, false, false, 0.0));
-        }
-    }
-    seq.extend([(1.5, 0.0, 0.0, true, false, 0.0), (1.0, 0.0, 0.0, false, false, 0.0),
-        (3.0, 1.0, 0.0, false, true, 0.0), (2.0, 0.0, 0.0, false, false, 0.0),
-        (4.0, 1.0, 0.0, false, false, 300.0), (2.0, 0.0, 0.0, false, false, 0.0)]);
-    let mut acc = 0.0;
-    for (i, (d, f, st, aim, sp, m)) in seq.into_iter().enumerate() {
-        acc += d;
-        if t < acc {
-            if start && LAST.swap(i, std::sync::atomic::Ordering::Relaxed) != i {
-                eprintln!("[moves] phase {i} t={t:.3}");
+/// `SOD_MOVES=1|2`: replay the retail probe's input script (`tools/game_probe.py`
+/// scenarios `moves` / `moves2`) by pressing the same keys in Bevy's input, so
+/// our build and the real game get identical input. Phases are logged as
+/// `[moves] phase N <name>`; the app exits when the script ends.
+#[derive(Resource, Default)]
+struct MoveScript { t: f32, started: bool, phase: usize, held: Vec<String>, mouse_cps: f32 }
+
+type Phase = (&'static str, &'static [&'static str], &'static [&'static str], f32, f32);
+
+fn move_script_phases(which: &str) -> Vec<Phase> {
+    let mut v: Vec<Phase> = vec![("idle", &[], &[], 2.0, 0.0)];
+    if which == "2" {
+        v.extend_from_slice(&[
+            ("run_start", &["w"], &[], 3.0, 0.0), ("run_stop", &[], &[], 2.5, 0.0),
+            ("sprint_start", &["leftshift", "w"], &[], 3.0, 0.0), ("sprint_stop", &[], &[], 2.5, 0.0),
+            ("sprint_a", &["leftshift", "a"], &[], 3.0, 0.0), ("idle", &[], &[], 2.0, 0.0),
+            ("sprint_turn", &["leftshift", "w"], &[], 4.0, 300.0), ("idle", &[], &[], 2.0, 0.0),
+            ("jump_stand", &[], &["space"], 2.5, 0.0),
+            ("run_pre", &["w"], &[], 1.5, 0.0), ("jump_run", &["w"], &["space"], 2.0, 0.0), ("idle", &[], &[], 2.0, 0.0),
+            ("sprint_pre", &["leftshift", "w"], &[], 1.5, 0.0), ("jump_sprint", &["leftshift", "w"], &["space"], 2.0, 0.0), ("idle", &[], &[], 2.0, 0.0),
+            ("crouch_w", &["c", "w"], &[], 3.0, 0.0), ("idle", &[], &[], 2.0, 0.0),
+        ]);
+    } else {
+        for aim in [false, true] {
+            for (n, k) in [("w", "w"), ("s", "s"), ("a", "a"), ("d", "d")] {
+                let name: &'static str = Box::leak(format!("{}_{n}", if aim { "aim" } else { "walk" }).into_boxed_str());
+                let keys: &'static [&'static str] = if aim { Box::leak(vec!["rmb", k].into_boxed_slice()) } else { Box::leak(vec![k].into_boxed_slice()) };
+                v.push((name, keys, &[], 3.0, 0.0));
+                v.push(("idle", &[], &[], 1.5, 0.0));
             }
-            return Some((f, st, aim, sp, m));
         }
+        v.extend_from_slice(&[("aim_hold", &["rmb"], &[], 1.5, 0.0), ("idle", &[], &[], 1.0, 0.0),
+            ("run_w", &["leftshift", "w"], &[], 3.0, 0.0), ("idle", &[], &[], 2.0, 0.0),
+            ("walk_turn", &["w"], &[], 4.0, 300.0), ("idle", &[], &[], 2.0, 0.0)]);
     }
-    eprintln!("[moves] script done");
-    std::process::exit(0);
+    v
+}
+
+fn script_key(name: &str) -> Option<KeyCode> {
+    Some(match name {
+        "w" => KeyCode::KeyW, "a" => KeyCode::KeyA, "s" => KeyCode::KeyS, "d" => KeyCode::KeyD,
+        "leftshift" => KeyCode::ShiftLeft, "space" => KeyCode::Space, "c" => KeyCode::KeyC,
+        _ => return None,
+    })
+}
+
+fn run_move_script(
+    time: Res<Time>,
+    menu: Option<Res<MenuRes>>,
+    player: Option<Res<Player>>,
+    mut ms: ResMut<MoveScript>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut buttons: ResMut<ButtonInput<MouseButton>>,
+) {
+    let Ok(which) = std::env::var("SOD_MOVES") else { return };
+    if !ms.started {
+        if player.is_none() || menu.map_or(false, |m| m.active) { return; }
+        ms.started = true;
+        ms.phase = usize::MAX;
+    }
+    ms.t += time.delta_secs();
+    let phases = move_script_phases(&which);
+    let mut acc = 0.0;
+    let idx = phases.iter().position(|p| { acc += p.3; ms.t < acc });
+    let Some(i) = idx else { eprintln!("[moves] script done"); std::process::exit(0) };
+    let (name, holds, taps, _, mouse) = phases[i];
+    if i != ms.phase {
+        for k in ms.held.drain(..).collect::<Vec<_>>() {
+            if k == "rmb" { buttons.release(MouseButton::Right); } else if let Some(c) = script_key(&k) { keys.release(c); }
+        }
+        for k in holds.iter().chain(taps.iter()) {
+            if *k == "rmb" { buttons.press(MouseButton::Right); } else if let Some(c) = script_key(k) { keys.press(c); }
+        }
+        ms.held = holds.iter().map(|s| s.to_string()).collect();
+        ms.phase = i;
+        ms.mouse_cps = mouse;
+        eprintln!("[moves] phase {i} {name} t={:.3}", ms.t);
+    } else {
+        // Taps are released one frame after they were pressed.
+        for k in taps.iter() { if let Some(c) = script_key(k) { if !holds.contains(k) { keys.release(c); } } }
+    }
 }
 
 fn move_player(
@@ -2913,12 +2958,12 @@ fn move_player(
     let fwd: f32 = if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) { 1.0 }
         else if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) { -1.0 } else { 0.0 };
     let strafe: f32 = if keys.pressed(KeyCode::KeyD) { 1.0 } else if keys.pressed(KeyCode::KeyA) { -1.0 } else { 0.0 };
-    let script = scripted_moves(true);
-    let (fwd, strafe) = script.map_or((fwd, strafe), |s| (s.0, s.1));
-    let crouch = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) || keys.pressed(KeyCode::KeyC);
+
+    // C = `cover` (sneak) in SoD's prototypeactionmap.xml; LCtrl is `roll`, not crouch.
+    let crouch = keys.pressed(KeyCode::KeyC);
     // Right mouse = aim: body faces the camera, moves at the aim stance speed.
-    let aiming = script.map_or(mouse.pressed(MouseButton::Right), |s| s.2);
-    let sprint = !aiming && script.map_or(keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight), |s| s.3);
+    let aiming = mouse.pressed(MouseButton::Right);
+    let sprint = !aiming && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight));
     // Demo-only auto-walk for screenshots; deliberately NOT named SOD_WALK so a
     // stray env var can't make the player walk without input.
     let auto = std::env::var("SOD_AUTOWALK").is_ok();
@@ -3337,6 +3382,7 @@ fn follow_camera(
     motion: Res<AccumulatedMouseMotion>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    move_script: Option<Res<MoveScript>>,
     menu: Res<MenuRes>,
     player: Option<Res<Player>>,
     cam_state: Option<ResMut<CameraStateRes>>,
@@ -3354,9 +3400,9 @@ fn follow_camera(
     let invert = std::env::var("SOD_INVERT").map(|v| v != "0").unwrap_or(true);
     let sgn = if invert { -1.0 } else { 1.0 };
     let (mut dx, mut dy) = (motion.delta.x * sens * sgn, motion.delta.y * sens * sgn);
-    if let Some(s) = scripted_moves(false) {
+    if let Some(ms) = move_script.as_ref().filter(|m| m.started) {
         // Same raw counts the retail probe injected (counts/s * frame time).
-        dx = s.4 * time.delta_secs() * sens * sgn;
+        dx = ms.mouse_cps * time.delta_secs() * sens * sgn;
         dy = 0.0;
     }
     if menu.active {
@@ -3667,6 +3713,7 @@ fn animate_followers(time: Res<Time>, mut meshes: ResMut<Assets<Mesh>>, mut q: Q
 /// under `SOD_LEGACY_WEAPONS`.
 fn player_attack(
     keys: Res<ButtonInput<KeyCode>>,
+    mouse_btn: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
     menu: Res<MenuRes>,
     player: Option<Res<Player>>,
@@ -3694,7 +3741,7 @@ fn player_attack(
         .unwrap_or((0.0, 0.0));
     auto_cd = (auto_cd - dt).max(0.0);
     auto_fire_cd = (auto_fire_cd - dt).max(0.0);
-    let melee_now = keys.just_pressed(KeyCode::Space) || (auto && auto_cd <= 0.0);
+    let melee_now = mouse_btn.just_pressed(MouseButton::Left) || (auto && auto_cd <= 0.0);
     let fire_now = keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && auto_fire_cd <= 0.0);
 
     let mut out = ai_bridge::PlayerAttackRequest {

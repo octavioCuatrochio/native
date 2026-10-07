@@ -991,6 +991,7 @@ fn content_tick(
     mut searchq: ResMut<SearchSpawnQueue>,
     combat: Res<CombatStats>,
     keys: Res<ButtonInput<KeyCode>>,
+    mouse_btn: Res<ButtonInput<MouseButton>>,
 ) {
     if !bridge.ready || menu.active {
         return;
@@ -1036,7 +1037,7 @@ fn content_tick(
     // Mission-spawned zombies are host actors outside the B4 director's runtime,
     // so the player's attacks are resolved against them here through the same
     // `process_actor_damage` pipeline (real deaths, same as B4).
-    mission_zed_combat(&mut bridge, cry.as_deref_mut(), ppos, player.yaw, dt, &keys);
+    mission_zed_combat(&mut bridge, cry.as_deref_mut(), ppos, player.yaw, dt, &keys, &mouse_btn);
 
     // `KillActor`: a mission-spawned actor that died, or a real B4-pipeline
     // kill since the objective activated.
@@ -1389,6 +1390,7 @@ fn mission_zed_combat(
     yaw: f32,
     dt: f32,
     keys: &ButtonInput<KeyCode>,
+    mouse_btn: &ButtonInput<MouseButton>,
 ) {
     let Some(cry) = cry else { return };
     if bridge.mission_zeds.is_empty() {
@@ -1398,7 +1400,7 @@ fn mission_zed_combat(
     let auto_gun = std::env::var("SOD_AUTOGUN").is_ok();
     bridge.zed_melee_cd = (bridge.zed_melee_cd - dt).max(0.0);
     bridge.zed_gun_cd = (bridge.zed_gun_cd - dt).max(0.0);
-    let melee = keys.just_pressed(KeyCode::Space) || (auto && bridge.zed_melee_cd <= 0.0);
+    let melee = mouse_btn.just_pressed(MouseButton::Left) || (auto && bridge.zed_melee_cd <= 0.0);
     let gun = keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && bridge.zed_gun_cd <= 0.0);
     if !melee && !gun {
         return;

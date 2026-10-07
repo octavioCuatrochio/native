@@ -365,11 +365,13 @@ pub fn get_stance_speed(actor_scale: f32, stance_slot_speed: f32, vtable_scale: 
 /// * `drive < 0.69`                 → [`STANCE_WALK`]
 /// * otherwise                      → [`STANCE_STAND`] (run)
 ///
-/// `crouch` forces [`STANCE_CREEP`] and `sprint` forces [`STANCE_SPRINT`],
+/// `crouch` (sneak) forces [`STANCE_WALK`] and `sprint` forces [`STANCE_SPRINT`],
 /// matching the controller's explicit gait overrides. Total for any input.
 pub fn gait_stance(drive: f32, crouch: bool, sprint: bool, t: &MovementTuning) -> u8 {
     if crouch {
-        return STANCE_CREEP;
+        // Sneak (`cover`, C) moves at stance[1].walkSpeed (1.66): retail
+        // measured 1.65 m/s steady (notes/telemetry/moves_breakdown2.csv crouch_w).
+        return STANCE_WALK;
     }
     if sprint {
         return STANCE_SPRINT;
@@ -1576,12 +1578,12 @@ mod tests {
         let dt = 1.0 / 60.0;
 
         let mut s = MoveState::new([0.0, 0.0, 0.0]);
-        s.vel = [t.creep, 0.0, 0.0];
+        s.vel = [t.walk, 0.0, 0.0];
         let mut i = input(1.0, 0.0, dt);
         i.crouch = true;
         update_normal(&mut s, &i, &t, &g, &[]);
-        assert!(approx(s.pos[0], t.creep * dt));
-        assert_eq!(s.stance_index, STANCE_CREEP);
+        assert!(approx(s.pos[0], t.walk * dt));
+        assert_eq!(s.stance_index, STANCE_WALK);
 
         let mut s = MoveState::new([0.0, 0.0, 0.0]);
         s.vel = [t.sprint, 0.0, 0.0];
@@ -1651,7 +1653,7 @@ mod tests {
         assert_eq!(gait_stance(0.5, false, false, &t), STANCE_WALK);
         assert_eq!(gait_stance(0.69, false, false, &t), STANCE_STAND); // boundary
         assert_eq!(gait_stance(1.0, false, false, &t), STANCE_STAND);
-        assert_eq!(gait_stance(0.5, true, false, &t), STANCE_CREEP);
+        assert_eq!(gait_stance(0.5, true, false, &t), STANCE_WALK);
         assert_eq!(gait_stance(0.5, false, true, &t), STANCE_SPRINT);
         // Total for non-finite input.
         assert_eq!(gait_stance(f32::NAN, false, false, &t), STANCE_STAND);

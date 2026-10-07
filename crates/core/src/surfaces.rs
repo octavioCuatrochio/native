@@ -373,12 +373,15 @@ fn sample_ground_texture(
 /// Bake a single RGBA8 ground-albedo texture for the whole terrain.
 ///
 /// Each output texel maps to a world `(x, y)`, reads [`terrain::Terrain::surface_at`],
-/// resolves that surface's authored terrain-layer diffuse (via
-/// [`resolve_surface_textures`], falling back to [`texture_hint`]), decodes the
-/// texture (memoised, and capped at [`MAX_GROUND_TEXTURES`]) and samples it with
-/// tiled UVs using the material's own `TexMod` repeat (repeats per metre).
-/// When a texture cannot be read/decoded the surface's [`color_for`] colour is
-/// written instead.
+/// picks a **coloured** ground texture for that surface via [`texture_hint`],
+/// decodes it (memoised, and capped at [`MAX_GROUND_TEXTURES`]) and samples it
+/// at a fixed 4 m repeat. When a texture cannot be read/decoded the surface's
+/// [`color_for`] colour is written instead.
+///
+/// This is a native fallback for the current single-texture renderer. The
+/// shipping game instead blends the `Terrain.Layer` materials returned by
+/// [`resolve_surface_textures`] at their authored `TexMod` tiling; a renderer
+/// that tiles per-layer in world space should use those instead of this bake.
 ///
 /// Returns `(out_size, out_size, rgba)` with `out_size²·4` bytes, or `None` for
 /// an empty/degenerate terrain or an out-of-range `out_size`. Never panics.

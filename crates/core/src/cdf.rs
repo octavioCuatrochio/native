@@ -270,6 +270,58 @@ fn resolve_slots(
     }
 }
 
+/// Drop the triangles a material's part-selection mask hides.
+///
+/// The character shaders (`UL_Character`, `UL_Test_Skin`) include
+/// `UL_PartSelection.cfi`, which `clip`s a fragment whose per-vertex colour tag
+/// intersects the material's `VertColorMask`. This is how the game hides the
+/// parts of the `skin` under-layer that the outer garments already cover: the
+/// `med_sleeve_vNN` skin material selects the torso/upper-arm/pelvis geometry
+/// (`VertColorMaskX=64`) and keeps only the bare hands, forearms and neck. A
+/// triangle is removed when **all** of its vertices are hidden, so the mask cut
+/// follows the authored boundary. Materials with a zero mask (the garments,
+/// head, hats) are left untouched.
+fn apply_part_selection(model: &mut mesh::DecodedModel, slots: &[MaterialSlot]) {
+    for m in &mut model.meshes {
+        if m.colors.len() != m.positions.len() || m.colors.is_empty() {
+            continue;
+        }
+        let colors = m.colors.clone();
+        let keep = |idx: &[u32], slot: &MaterialSlot| -> Vec<u32> {
+            let mut out = Vec::with_capacity(idx.len());
+            for tri in idx.chunks_exact(3) {
+                let all_hidden = tri.iter().all(|&v| {
+                    colors
+                        .get(v as usize)
+                        .map(|c| slot.hides_vertex(*c))
+                        .unwrap_or(false)
+                });
+                if !all_hidden {
+                    out.extend_from_slice(tri);
+                }
+            }
+            out
+        };
+        if m.submeshes.is_empty() {
+            if let Some(slot) = slots.first() {
+                if slot.vert_color_mask != [0, 0, 0, 0] {
+                    let idx = std::mem::take(&mut m.indices);
+                    m.indices = keep(&idx, slot);
+                }
+            }
+            continue;
+        }
+        for sm in &mut m.submeshes {
+            let Some(slot) = slots.get(sm.material as usize) else { continue };
+            if slot.vert_color_mask == [0, 0, 0, 0] {
+                continue;
+            }
+            let idx = std::mem::take(&mut sm.indices);
+            sm.indices = keep(&idx, slot);
+        }
+    }
+}
+
 /// Decode the base model plus **every** resolvable attachment of an already
 /// parsed `cdf`.
 ///
@@ -294,13 +346,14 @@ fn assemble(vfs: &Vfs, cdf: &Cdf) -> Option<(skin::Skeleton, Vec<CharacterPart>)
     let skeleton = skin::parse_skeleton(&base)?;
 
     let mut parts = Vec::new();
-    if let Some(model) = mesh::decode_model_with(&base, false) {
+    if let Some(mut model) = mesh::decode_model_with(&base, false) {
         let slots = resolve_slots(
             vfs,
             &cdf.model,
             cdf.model_material.as_deref(),
             model.material_name.as_deref(),
         );
+        apply_part_selection(&mut model, &slots);
         parts.push(CharacterPart {
             name: String::new(),
             path: cdf.model.clone(),
@@ -314,13 +367,14 @@ fn assemble(vfs: &Vfs, cdf: &Cdf) -> Option<(skin::Skeleton, Vec<CharacterPart>)
 
     for att in &cdf.attachments {
         let Some(ab) = vfs.read(&att.binding) else { continue };
-        let Some(model) = mesh::decode_model_with(&ab, false) else { continue };
+        let Some(mut model) = mesh::decode_model_with(&ab, false) else { continue };
         let slots = resolve_slots(
             vfs,
             &att.binding,
             att.material.as_deref(),
             model.material_name.as_deref(),
         );
+        apply_part_selection(&mut model, &slots);
         parts.push(CharacterPart {
             name: att.name.clone(),
             path: att.binding.clone(),
@@ -376,8 +430,9 @@ pub fn assemble_explicit(
     let mut out = Vec::new();
     for p in parts {
         let Some(ab) = vfs.read(p.binding) else { continue };
-        let Some(model) = mesh::decode_model_with(&ab, false) else { continue };
+        let Some(mut model) = mesh::decode_model_with(&ab, false) else { continue };
         let slots = resolve_slots(vfs, p.binding, None, model.material_name.as_deref());
+        apply_part_selection(&mut model, &slots);
         out.push(CharacterPart {
             name: p.name.to_string(),
             path: p.binding.to_string(),
@@ -711,6 +766,20 @@ mod tests {
         let bi = parts.iter().position(|p| p.name.eq_ignore_ascii_case("body")).unwrap();
         let si = parts.iter().position(|p| p.name.eq_ignore_ascii_case("skin")).unwrap();
         assert!(bi < si, "body layer stays ahead of the skin under-layer");
+    }
+
+    #[test]
+    fn part_selection_drops_all_hidden_triangles() {
+        let mut m = mesh::DecodedMesh::default();
+        m.positions = vec![[0.0; 3]; 4];
+        // Vertices 0..=2 carry the selected bit (64); vertex 3 is bare skin.
+        m.colors = vec![[64, 0, 0, 255], [64, 0, 0, 255], [64, 0, 0, 255], [0, 0, 0, 255]];
+        m.submeshes = vec![mesh::Submesh { material: 0, indices: vec![0, 1, 2, 1, 2, 3] }];
+        let mut model = mesh::DecodedModel { meshes: vec![m], ..Default::default() };
+        let slot = MaterialSlot { vert_color_mask: [64, 0, 0, 0], ..Default::default() };
+        apply_part_selection(&mut model, &[slot]);
+        // The all-hidden triangle is gone; the one touching bare skin survives.
+        assert_eq!(model.meshes[0].submeshes[0].indices, vec![1, 2, 3]);
     }
 
     /// The ambient zombie is not a self-contained `.cdf`: its `body/noshirt02`

@@ -56,6 +56,10 @@ pub struct DecodedMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    /// Per-vertex colour bytes (DataStream type 3), in stream order. Character
+    /// meshes repurpose these as the `UL_PartSelection` tag that a material's
+    /// `VertColorMask` drops; empty when the stream is absent.
+    pub colors: Vec<[u8; 4]>,
     pub indices: Vec<u32>,
     /// Per-material index ranges (material = palette slot).
     pub submeshes: Vec<Submesh>,
@@ -264,6 +268,20 @@ fn decode_uvs(s: &DataStream) -> Option<Vec<[f32; 2]>> {
     Some(out)
 }
 
+/// Decode the `Colors` stream (type 3, 4 B/vertex) verbatim. Character shaders
+/// use these bytes as the part-selection tag (`UL_PartSelection.cfi`).
+fn decode_colors(s: &DataStream) -> Option<Vec<[u8; 4]>> {
+    if s.ty != 3 || s.bpe < 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.num);
+    for i in 0..s.num {
+        let o = i * s.bpe;
+        out.push([*s.body.get(o)?, *s.body.get(o + 1)?, *s.body.get(o + 2)?, *s.body.get(o + 3)?]);
+    }
+    Some(out)
+}
+
 fn decode_indices(s: &DataStream) -> Option<Vec<u32>> {
     if s.ty != 5 || s.bpe != 2 {
         return None;
@@ -464,6 +482,7 @@ pub fn decode_model_full(
         };
         let normals = read_stream(&cf, file, &by_id, ref_at(1)).and_then(|s| decode_normals(&s));
         let uvs = read_stream(&cf, file, &by_id, ref_at(2)).and_then(|s| decode_uvs(&s));
+        let colors = read_stream(&cf, file, &by_id, ref_at(3)).and_then(|s| decode_colors(&s));
         let Some(mut indices) =
             read_stream(&cf, file, &by_id, ref_at(5)).and_then(|s| decode_indices(&s))
         else {
@@ -528,10 +547,16 @@ pub fn decode_model_full(
             _ => generate_normals(&positions, &indices),
         };
 
+        let colors = match colors {
+            Some(c) if c.len() == positions.len() => c,
+            _ => Vec::new(),
+        };
+
         model.meshes.push(DecodedMesh {
             positions,
             normals,
             uvs: uvs.unwrap_or_default(),
+            colors,
             indices,
             submeshes,
         });

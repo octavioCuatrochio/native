@@ -25,6 +25,16 @@ pub struct MaterialSlot {
     /// Per-texture `TexMod` tiling (map lowercased, tile U, tile V). Terrain
     /// layer materials author their ground tiling here.
     pub texture_tiles: Vec<(String, f32, f32)>,
+    /// Character part-selection mask (`PublicParams` `VertColorMaskX/Y/Z/W`).
+    ///
+    /// CryEngine's character shaders (`UL_Character`, `UL_Test_Skin`) include
+    /// `UL_PartSelection.cfi`: the per-vertex colour bytes are a 32-bit "which
+    /// part am I" tag, and this 4-byte material mask selects the parts to drop
+    /// (`clip(-Color.r)`). `[0,0,0,0]` = nothing selected, so no vertex is
+    /// dropped by the mask. Non-zero for clothing/skin variants (e.g. the
+    /// `med_sleeve_vNN` skins use `X=64` to hide the torso/upper-arm geometry
+    /// that the outer garments already cover).
+    pub vert_color_mask: [u8; 4],
 }
 
 impl MaterialSlot {
@@ -47,6 +57,36 @@ impl MaterialSlot {
     /// A `NoDraw` material (physics proxy / editor helper): never rendered.
     pub fn is_nodraw(&self) -> bool {
         self.shader.eq_ignore_ascii_case("nodraw")
+    }
+
+    /// Whether the part-selection mask drops the vertex carrying colour bytes
+    /// `c` (BGRA/RGBA stream order, component 0 first).
+    ///
+    /// Mirrors `UL_PartSelection.cfi`: high bit of component 0 marks a "gore"
+    /// item that is hidden unless the mask selects it; a normal item is hidden
+    /// when the mask selects it. A zero mask never drops anything.
+    pub fn hides_vertex(&self, c: [u8; 4]) -> bool {
+        let m = self.vert_color_mask;
+        if m == [0, 0, 0, 0] {
+            return false;
+        }
+        let gore = c[0] >= 128;
+        let cc = if gore {
+            [c[0].wrapping_sub(128), c[1], c[2], c[3]]
+        } else {
+            c
+        };
+        let mut selected = false;
+        for i in 0..4 {
+            if m[i] & cc[i] != 0 {
+                selected = true;
+            }
+        }
+        if gore {
+            !selected
+        } else {
+            selected
+        }
     }
 }
 
@@ -203,6 +243,33 @@ impl MtlState {
                     self.last_tex_map = Some(map_l);
                 }
             }
+            "publicparams" => {
+                // Character part-selection mask. `PublicParams` sits inside the
+                // `<Material>` it belongs to, so a child material's params target
+                // `last_slot` while a root container's (no SubMaterials) target
+                // the root slot.
+                let set_mask = |s: &mut MaterialSlot| {
+                    for (i, key) in ["vertcolormaskx", "vertcolormasky", "vertcolormaskz", "vertcolormaskw"]
+                        .iter()
+                        .enumerate()
+                    {
+                        if let Some(v) = get(key) {
+                            if let Ok(b) = v.trim().parse::<u16>() {
+                                s.vert_color_mask[i] = b.min(255) as u8;
+                            }
+                        }
+                    }
+                };
+                if self.depth >= 2 {
+                    if let Some(i) = self.last_slot {
+                        if let Some(s) = self.slots.get_mut(i) {
+                            set_mask(s);
+                        }
+                    }
+                } else if let Some(rs) = self.root_slot.as_mut() {
+                    set_mask(rs);
+                }
+            }
             "texmod" => {
                 let Some(map) = self.last_tex_map.clone() else { return };
                 let tu = get("tileu").and_then(|v| v.trim().parse::<f32>().ok());
@@ -314,6 +381,48 @@ mod tests {
         assert!(slots[1].alpha_test.is_none());
         assert!(slots[1].is_nodraw() == false);
         assert!(slots[2].is_nodraw());
+    }
+
+    #[test]
+    fn captures_vert_color_part_mask() {
+        let slots = parse(
+            br#"<Material>
+                 <SubMaterials>
+                   <Material Name="skinShader" Shader="UL_Test_Skin">
+                     <PublicParams VertColorMaskX="64" VertColorMaskY="0" VertColorMaskZ="0" VertColorMaskW="0"/>
+                   </Material>
+                   <Material Name="shirtShader" Shader="UL_Character"/>
+                 </SubMaterials>
+               </Material>"#,
+        );
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].vert_color_mask, [64, 0, 0, 0]);
+        assert_eq!(slots[1].vert_color_mask, [0, 0, 0, 0]);
+        // Normal item carrying the selected bit is hidden; one without it kept.
+        assert!(slots[0].hides_vertex([64, 0, 0, 255]));
+        assert!(!slots[0].hides_vertex([0, 0, 0, 255]));
+        // A zero mask never hides, even a high-bit (gore) tag.
+        assert!(!slots[1].hides_vertex([64, 0, 0, 255]));
+        assert!(!slots[1].hides_vertex([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn gore_tag_hidden_unless_selected_by_mask() {
+        let slots = parse(
+            br#"<Material>
+                 <SubMaterials>
+                   <Material Name="s" Shader="UL_Test_Skin">
+                     <PublicParams VertColorMaskX="64"/>
+                   </Material>
+                 </SubMaterials>
+               </Material>"#,
+        );
+        let s = &slots[0];
+        // R>=128 is a gore item: hidden unless the mask selects it.
+        assert!(s.hides_vertex([128, 0, 0, 255]));
+        assert!(s.hides_vertex([130, 0, 0, 255]));
+        // (R-128)==64 selects it -> visible.
+        assert!(!s.hides_vertex([192, 0, 0, 255]));
     }
 
     #[test]

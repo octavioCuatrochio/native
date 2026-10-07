@@ -88,7 +88,7 @@ pub enum ContentEffect {
     HintEnable { id: String, enabled: bool },
     MusicBucket(String),
     StatBool { id: String, value: bool },
-    ZombieSpawn { spawn_actor: i32, count: u32, freak: Option<String>, pos: [f32; 3] },
+    ZombieSpawn { mission: String, spawn_actor: i32, count: u32, freak: Option<String>, pos: [f32; 3] },
     EventLog { title: String, display: String },
     /// Any output the runtime does not model yet (actor AI, rewards, …).
     Output { name: String, attrs: Vec<(String, String)> },
@@ -147,6 +147,22 @@ enum Pending {
     Abort(String),
 }
 
+/// An action whose outputs are held for `remaining` seconds
+/// (`Action OutputDelayTime` / `ActionFlags="DelayOutputs"`). The original
+/// schedules the output block on the action's timer (`ExecuteTimeStandard` /
+/// `OutputDelayTime`, `CmMission.cpp`), so e.g. `ta10Buddies`' `Attack` hint
+/// arms 5 s after the objective activates.
+#[derive(Clone, Debug)]
+struct DelayedOutput {
+    remaining: f32,
+    mission: String,
+    outputs: Vec<Element>,
+}
+
+/// Seconds after a failure before a `SetupFlags="RestoreMissionOnFail"`
+/// mission is created again (the original restarts it with the player).
+const RESTORE_DELAY: f32 = 2.0;
+
 /// Owner of loaded mission data and the currently running missions.
 pub struct ContentManager {
     data: MissionData,
@@ -156,6 +172,10 @@ pub struct ContentManager {
     story: HashMap<String, bool>,
     effects: Vec<ContentEffect>,
     pending: Vec<Pending>,
+    /// Outputs held back by `OutputDelayTime`.
+    delayed: Vec<DelayedOutput>,
+    /// Missions waiting to be restored after a failure.
+    restore: Vec<(f32, String)>,
 }
 
 impl ContentManager {
@@ -168,6 +188,8 @@ impl ContentManager {
             story: HashMap::new(),
             effects: Vec::new(),
             pending: Vec::new(),
+            delayed: Vec::new(),
+            restore: Vec::new(),
         }
     }
 
@@ -258,6 +280,7 @@ impl ContentManager {
                 mission: &am.mission,
                 effects: &mut self.effects,
                 pending: &mut self.pending,
+                delayed: &mut self.delayed,
                 story: &mut self.story,
                 world: &NONE_WORLD,
                 complete: false,
@@ -293,6 +316,7 @@ impl ContentManager {
                 mission: &am.mission,
                 effects: &mut self.effects,
                 pending: &mut self.pending,
+                delayed: &mut self.delayed,
                 story: &mut self.story,
                 world: &NONE_WORLD,
                 complete: false,
@@ -303,6 +327,7 @@ impl ContentManager {
             &mut self.active[idx],
             &mut self.effects,
             &mut self.pending,
+            &mut self.delayed,
             &mut self.story,
         );
         true
@@ -318,12 +343,17 @@ impl ContentManager {
             return false;
         };
         let mut am = self.active.remove(idx);
+        // `SetupFlags="RestoreMissionOnFail"`: the mission is put back when the
+        // player recovers instead of staying failed (`Class3:01355380`); the
+        // app calls [`ContentManager::on_player_down`] to fail it.
+        let restorable = am.mission.has_setup_flag("RestoreMissionOnFail");
         let actions = am.mission.event("Aborted").to_vec();
         {
             let mut ctx = ApplyCtx {
                 mission: &am.mission,
                 effects: &mut self.effects,
                 pending: &mut self.pending,
+                delayed: &mut self.delayed,
                 story: &mut self.story,
                 world: &NONE_WORLD,
                 complete: false,
@@ -331,14 +361,35 @@ impl ContentManager {
             ctx.run(&actions);
         }
         am.state = MissionRun::Aborted;
-        self.aborted.push(label.to_string());
+        if restorable {
+            self.restore.push((RESTORE_DELAY, label.to_string()));
+            println!("[content] mission {label} failed, restore scheduled");
+        } else {
+            self.aborted.push(label.to_string());
+        }
         self.effects.push(ContentEffect::MissionAborted(label.to_string()));
         true
+    }
+
+    /// Fail every active mission when the controlled player goes down. Missions
+    /// carrying `SetupFlags="RestoreMissionOnFail"` are re-created after a short
+    /// delay; the rest stay aborted. Returns the number of missions failed.
+    pub fn on_player_down(&mut self) -> usize {
+        let labels: Vec<String> = self.active.iter().map(|m| m.mission.label.clone()).collect();
+        let mut n = 0;
+        for l in labels {
+            if self.abort_mission(&l) {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Advance every running mission one frame.
     pub fn tick(&mut self, dt: f32, world: &dyn MissionWorld) {
         self.process_pending();
+        self.fire_restores(dt);
+        self.fire_delayed(dt, world);
         for i in 0..self.active.len() {
             if self.active[i].state != MissionRun::Active {
                 continue;
@@ -354,6 +405,7 @@ impl ContentManager {
                     &mut self.active[i],
                     &mut self.effects,
                     &mut self.pending,
+                    &mut self.delayed,
                     &mut self.story,
                 );
             }
@@ -364,6 +416,7 @@ impl ContentManager {
                     world,
                     &mut self.effects,
                     &mut self.pending,
+                    &mut self.delayed,
                     &mut self.story,
                 );
             }
@@ -381,6 +434,72 @@ impl ContentManager {
         }
         self.active.retain(|m| m.state == MissionRun::Active);
         self.process_pending();
+    }
+
+    /// Apply outputs whose `OutputDelayTime` elapsed. Position-dependent
+    /// outputs (spawns, markers) resolve against the live world now.
+    fn fire_delayed(&mut self, dt: f32, world: &dyn MissionWorld) {
+        if self.delayed.is_empty() {
+            return;
+        }
+        for d in self.delayed.iter_mut() {
+            d.remaining -= dt;
+        }
+        let due: Vec<DelayedOutput> = {
+            let mut kept = Vec::new();
+            let mut due = Vec::new();
+            for d in std::mem::take(&mut self.delayed) {
+                if d.remaining <= 0.0 {
+                    due.push(d);
+                } else {
+                    kept.push(d);
+                }
+            }
+            self.delayed = kept;
+            due.sort_by(|a, b| a.remaining.partial_cmp(&b.remaining).unwrap_or(std::cmp::Ordering::Equal));
+            due
+        };
+        for d in due {
+            let Some(mission) = self.data.mission(&d.mission).cloned() else { continue };
+            log::debug!("[content] delayed outputs fire for {}", d.mission);
+            let mut ctx = ApplyCtx {
+                mission: &mission,
+                effects: &mut self.effects,
+                pending: &mut self.pending,
+                delayed: &mut self.delayed,
+                story: &mut self.story,
+                world,
+                complete: false,
+            };
+            ctx.apply_outputs(&d.outputs);
+        }
+    }
+
+    /// Re-create missions whose `RestoreMissionOnFail` timer elapsed.
+    fn fire_restores(&mut self, dt: f32) {
+        if self.restore.is_empty() {
+            return;
+        }
+        for r in self.restore.iter_mut() {
+            r.0 -= dt;
+        }
+        let due: Vec<String> = {
+            let mut kept = Vec::new();
+            let mut due = Vec::new();
+            for r in std::mem::take(&mut self.restore) {
+                if r.0 <= 0.0 {
+                    due.push(r.1);
+                } else {
+                    kept.push(r);
+                }
+            }
+            self.restore = kept;
+            due
+        };
+        for label in due {
+            println!("[content] restoring mission {label}");
+            self.create_mission(&label);
+        }
     }
 
     fn process_pending(&mut self) {
@@ -420,6 +539,7 @@ struct ApplyCtx<'a> {
     mission: &'a Mission,
     effects: &'a mut Vec<ContentEffect>,
     pending: &'a mut Vec<Pending>,
+    delayed: &'a mut Vec<DelayedOutput>,
     story: &'a mut HashMap<String, bool>,
     world: &'a dyn MissionWorld,
     complete: bool,
@@ -436,9 +556,25 @@ impl<'a> ApplyCtx<'a> {
             if !self.eval_inputs(a) {
                 continue;
             }
-            for out in &a.outputs {
-                self.apply_output(out);
+            // `OutputDelayTime` (the `DelayOutputs` action flag) holds the whole
+            // output block until the timer elapses; the original applies it from
+            // the action's scheduled tick.
+            if a.output_delay > 0.0 && !a.outputs.is_empty() {
+                self.delayed.push(DelayedOutput {
+                    remaining: a.output_delay,
+                    mission: self.mission.label.clone(),
+                    outputs: a.outputs.clone(),
+                });
+                continue;
             }
+            self.apply_outputs(&a.outputs);
+        }
+    }
+
+    /// Apply a block of `<Outputs>` elements (also used by delayed outputs).
+    fn apply_outputs(&mut self, outputs: &[Element]) {
+        for out in outputs {
+            self.apply_output(out);
         }
     }
 
@@ -524,7 +660,13 @@ impl<'a> ApplyCtx<'a> {
                 let freak = el.attr("FreakHash").filter(|s| !s.is_empty()).map(str::to_string);
                 let pos = resolve_actor(self.world, self.mission, spawn_actor as usize)
                     .unwrap_or([0.0; 3]);
-                self.effects.push(ContentEffect::ZombieSpawn { spawn_actor, count, freak, pos });
+                self.effects.push(ContentEffect::ZombieSpawn {
+                    mission: self.mission.label.clone(),
+                    spawn_actor,
+                    count,
+                    freak,
+                    pos,
+                });
             }
             "EventLog" => {
                 let title = el
@@ -571,11 +713,12 @@ fn am_choose_objective(
     am: &mut ActiveMission,
     effects: &mut Vec<ContentEffect>,
     pending: &mut Vec<Pending>,
+    delayed: &mut Vec<DelayedOutput>,
     story: &mut HashMap<String, bool>,
 ) {
     loop {
         if am.bucket_index >= am.mission.objective_buckets.len() {
-            am_finish(am, effects, pending, story);
+            am_finish(am, effects, pending, delayed, story);
             return;
         }
         let bucket = &am.mission.objective_buckets[am.bucket_index];
@@ -602,6 +745,7 @@ fn am_choose_objective(
                 mission: &am.mission,
                 effects,
                 pending,
+                delayed,
                 story,
                 world: &NONE_WORLD,
                 complete: false,
@@ -617,6 +761,7 @@ fn am_finish(
     am: &mut ActiveMission,
     effects: &mut Vec<ContentEffect>,
     pending: &mut Vec<Pending>,
+    delayed: &mut Vec<DelayedOutput>,
     story: &mut HashMap<String, bool>,
 ) {
     effects.push(ContentEffect::MissionCompleted(am.mission.label.clone()));
@@ -626,6 +771,7 @@ fn am_finish(
             mission: &am.mission,
             effects,
             pending,
+            delayed,
             story,
             world: &NONE_WORLD,
             complete: false,
@@ -641,6 +787,7 @@ fn am_update_objective(
     world: &dyn MissionWorld,
     effects: &mut Vec<ContentEffect>,
     pending: &mut Vec<Pending>,
+    delayed: &mut Vec<DelayedOutput>,
     story: &mut HashMap<String, bool>,
 ) {
     let completed = {
@@ -650,6 +797,7 @@ fn am_update_objective(
             mission,
             effects,
             pending,
+            delayed,
             story,
             world,
             complete: false,
@@ -705,7 +853,7 @@ fn am_update_objective(
         });
         am.bucket_index += 1;
         am.objective = None;
-        am_choose_objective(am, effects, pending, story);
+        am_choose_objective(am, effects, pending, delayed, story);
     }
 }
 
@@ -760,13 +908,11 @@ fn objective_condition_met(
             world.searched_buildings_near(pos, radius) >= max
         }
         ObjectiveType::Survey => {
-            let group = spec
-                .attrs
-                .iter()
-                .find(|(k, _)| k == "SurveyGroup")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("");
-            world.surveyed(group)
+            // The surveyed group is the `SurveyGroup` actor named by
+            // `TargetLocationOverride` (ta20Tower actor 4 = `tanner_watertower`);
+            // fall back to the `SurveyGroup` attribute for hand-authored data.
+            let group = survey_group_name(spec, mission).unwrap_or_default();
+            world.surveyed(&group)
         }
         ObjectiveType::KillActor | ObjectiveType::Assassinate => {
             let target = spec
@@ -786,6 +932,25 @@ fn objective_condition_met(
         }
         _ => false,
     }
+}
+
+/// The `SurveyGroup` actor name a `Survey` objective is bound to.
+fn survey_group_name(spec: &Objective, mission: &Mission) -> Option<String> {
+    if let Some(a) = mission.actor(spec.primary_actor_index()) {
+        if a.kind == ActorKind::SurveyGroup && !a.actor_name.is_empty() {
+            return Some(a.actor_name.clone());
+        }
+    }
+    for a in &mission.actors {
+        if a.kind == ActorKind::SurveyGroup && !a.actor_name.is_empty() {
+            return Some(a.actor_name.clone());
+        }
+    }
+    spec.attrs
+        .iter()
+        .find(|(k, _)| k == "SurveyGroup")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
 }
 
 fn lead_target(spec: &Objective) -> usize {
@@ -1107,5 +1272,97 @@ mod tests {
         cm.tick(0.1, &world);
         assert!(has_effect(&cm, |e| matches!(e, ContentEffect::ObjectiveCompleted { objective, .. } if objective == "Survive!")));
         assert!(cm.is_complete("ta10Buddies"));
+    }
+
+    /// `OutputDelayTime` holds an action's outputs until the timer elapses
+    /// (the `DelayOutputs` flag; `MISSION_XML`'s objective `Activate` re-enables
+    /// the `Attack` hint after 5 s).
+    #[test]
+    fn output_delay_holds_outputs_until_the_timer_elapses() {
+        let mut cm = manager();
+        cm.create_mission("ta10Buddies");
+        cm.clear_effects();
+        // Under 5 s: the delayed `Attack` enable has not fired.
+        for _ in 0..40 {
+            cm.tick(0.1, &TestWorld::new([0.0; 3], 3));
+        }
+        assert!(
+            !has_effect(&cm, |e| matches!(e, ContentEffect::HintEnable { id, enabled } if id == "Attack" && *enabled)),
+            "delayed output must not fire before its OutputDelayTime"
+        );
+        // Past 5 s: it fires.
+        for _ in 0..15 {
+            cm.tick(0.1, &TestWorld::new([0.0; 3], 3));
+        }
+        assert!(
+            has_effect(&cm, |e| matches!(e, ContentEffect::HintEnable { id, enabled } if id == "Attack" && *enabled)),
+            "delayed output must fire after OutputDelayTime"
+        );
+    }
+
+    /// A mission with `SetupFlags="RestoreMissionOnFail"` is re-created after
+    /// the player goes down instead of staying failed.
+    #[test]
+    fn restore_mission_on_fail_recreates_the_mission() {
+        let xml = r#"<RtsMissionData><MissionFrameworkBucket Label="Arc">
+            <MissionFramework Label="taRestore" Type="Story" ActivateType="OnAdd" SetupFlags="NpcsCastOnActivate, RestoreMissionOnFail">
+              <MissionActors><Actors><Player /></Actors></MissionActors>
+              <ObjectiveBuckets><ObjectiveBucket Label="B"><Objectives>
+                <Objective Type="Wait" ObjectiveText="Hold" WaitTime="999" />
+              </Objectives></ObjectiveBucket></ObjectiveBuckets>
+            </MissionFramework>
+          </MissionFrameworkBucket></RtsMissionData>"#;
+        let mut cm = ContentManager::new(MissionData::parse(xml.as_bytes()));
+        assert!(cm.create_mission("taRestore"));
+        assert_eq!(cm.on_player_down(), 1);
+        assert!(!cm.is_active("taRestore"));
+        assert!(has_effect(&cm, |e| matches!(e, ContentEffect::MissionAborted(l) if l == "taRestore")));
+        cm.clear_effects();
+        // Before the restore delay: still gone.
+        cm.tick(0.5, &TestWorld::new([0.0; 3], 0));
+        assert!(!cm.is_active("taRestore"));
+        // After it: re-created.
+        for _ in 0..30 {
+            cm.tick(0.1, &TestWorld::new([0.0; 3], 0));
+        }
+        assert!(cm.is_active("taRestore"), "restorable mission should be re-created");
+        assert!(has_effect(&cm, |e| matches!(e, ContentEffect::MissionCreated(l) if l == "taRestore")));
+    }
+
+    /// The `Survey` predicate reads the `SurveyGroup` actor named by
+    /// `TargetLocationOverride` (ta20Tower: `tanner_watertower`), not a raw
+    /// `SurveyGroup` attribute.
+    #[test]
+    fn survey_objective_completes_from_the_named_survey_group() {
+        struct SurveyWorld {
+            group: std::cell::RefCell<String>,
+        }
+        impl MissionWorld for SurveyWorld {
+            fn player_pos(&self) -> [f32; 3] {
+                [0.0; 3]
+            }
+            fn surveyed(&self, group: &str) -> bool {
+                *self.group.borrow() == group
+            }
+        }
+        let xml = r#"<RtsMissionData><MissionFrameworkBucket Label="Arc">
+            <MissionFramework Label="ta20Tower" Type="Story" ActivateType="OnAdd">
+              <MissionActors><Actors>
+                <SurveyGroup ActorName="tanner_watertower" />
+                <Player />
+              </Actors></MissionActors>
+              <ObjectiveBuckets><ObjectiveBucket Label="Survey"><Objectives>
+                <Objective Type="Survey" ObjectiveText="Survey the Area" TargetLocationOverride="0" MinSurveyTime="5.0" />
+              </Objectives></ObjectiveBucket></ObjectiveBuckets>
+            </MissionFramework>
+          </MissionFrameworkBucket></RtsMissionData>"#;
+        let mut cm = ContentManager::new(MissionData::parse(xml.as_bytes()));
+        cm.create_mission("ta20Tower");
+        let world = SurveyWorld { group: std::cell::RefCell::new(String::new()) };
+        cm.tick(0.1, &world);
+        assert!(!cm.is_complete("ta20Tower"), "no group surveyed yet: objective must stay up");
+        *world.group.borrow_mut() = "tanner_watertower".to_string();
+        cm.tick(0.1, &world);
+        assert!(cm.is_complete("ta20Tower"));
     }
 }

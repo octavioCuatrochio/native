@@ -92,6 +92,41 @@ struct InteractState {
     prop_models: HashMap<String, (String, String)>,
 }
 
+/// One searchable container's live state, published for the content manager.
+/// `SearchBuilding` counts a building searched once **all** of its containers
+/// are (`RTSWorldBuildingSetSearched` `0x013b6c20`).
+#[derive(Clone, Debug)]
+pub struct SearchableEntry {
+    /// CryEngine-space position (Z-up).
+    pub pos: [f32; 3],
+    /// RTS site / building group this container belongs to.
+    pub site: String,
+    pub searched: bool,
+}
+
+/// Registry of live searchables, rebuilt each frame after `interact_update`.
+#[derive(Resource, Default)]
+pub struct SearchRegistry {
+    pub entries: Vec<SearchableEntry>,
+}
+
+/// A request to place one RTS building/site's searchable container. The content
+/// bridge pushes these when a `SearchBuilding` objective activates (the original
+/// RTS generates the props from the building's markup volume); the interaction
+/// loop owns the actual `UL_Searchable` spawns and their search state.
+#[derive(Clone, Debug)]
+pub struct SearchSpawnRequest {
+    pub site: String,
+    pub prop: String,
+    pub pos: [f32; 3],
+}
+
+/// Pending searchable-spawn requests from the content manager.
+#[derive(Resource, Default)]
+pub struct SearchSpawnQueue {
+    pub requests: Vec<SearchSpawnRequest>,
+}
+
 /// Registers the interaction loop and installs the `ItemSystem` script binds.
 ///
 /// Must be added after `cry_bridge::install` (the `CryHost` non-send resource
@@ -159,11 +194,15 @@ impl Plugin for InteractPlugin {
             cooldown: 0.0,
             prop_models,
         });
+        app.init_resource::<SearchRegistry>().init_resource::<SearchSpawnQueue>();
         app.add_systems(
             Update,
             (
                 interact_spawn.after(crate::move_player),
-                interact_update.after(crate::move_player).after(interact_spawn),
+                interact_mission_spawn.after(interact_spawn),
+                interact_update
+                    .after(crate::move_player)
+                    .after(interact_mission_spawn),
                 interact_hud.after(crate::hud_update),
             ),
         );
@@ -238,77 +277,124 @@ fn interact_spawn(
     let right = [-s, co];
     for (name, site, prop, dist, side) in SPAWN_SPECS {
         let pos = [p[0] + fwd[0] * dist + right[0] * side, p[1] + fwd[1] * dist + right[1] * side, p[2]];
-        let (not_searched_path, searched_path) = state
-            .prop_models
-            .get(&prop.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| (DEFAULT_NOT_SEARCHED.to_string(), DEFAULT_SEARCHED.to_string()));
-        match items::spawn_searchable(&mut cry.host, name, pos, site, prop) {
-            Ok(id) => {
-                // Model root at the container's world transform. CryEngine Z-up
-                // maps to Bevy Y-up through `base_rot`, as the level root does.
-                let root = commands
-                    .spawn((
-                        Transform {
-                            translation: crate::base_rot() * Vec3::new(pos[0], pos[1], pos[2]),
-                            rotation: crate::base_rot(),
-                            scale: Vec3::ONE,
-                        },
-                        Visibility::default(),
-                    ))
-                    .id();
-                let mut not_searched = Vec::new();
-                let mut searched_slot = Vec::new();
-                commands.entity(root).with_children(|parent| {
-                    // NotSearched.OnBeginState: DrawSlot(0, 1), DrawSlot(1, 0).
-                    if let Some(list) = assets.0.get(&not_searched_path) {
-                        for (mesh, mat) in list {
-                            not_searched.push(
-                                parent
-                                    .spawn((
-                                        Mesh3d(mesh.clone()),
-                                        MeshMaterial3d(mat.clone()),
-                                        Transform::default(),
-                                        Visibility::Visible,
-                                    ))
-                                    .id(),
-                            );
-                        }
-                    }
-                    // Searched.OnBeginState: DrawSlot(0, 0), DrawSlot(1, 1).
-                    if let Some(list) = assets.0.get(&searched_path) {
-                        for (mesh, mat) in list {
-                            searched_slot.push(
-                                parent
-                                    .spawn((
-                                        Mesh3d(mesh.clone()),
-                                        MeshMaterial3d(mat.clone()),
-                                        Transform::default(),
-                                        Visibility::Hidden,
-                                    ))
-                                    .id(),
-                            );
-                        }
-                    }
-                });
-                if not_searched.is_empty() && searched_slot.is_empty() {
-                    eprintln!("[interact] {name}: no meshes for {not_searched_path} / {searched_path}");
-                }
-                state.containers.push(Container {
-                    id,
-                    site: site.to_string(),
-                    prop: prop.to_string(),
-                    pos,
-                    searched: false,
-                    not_searched,
-                    searched_slot,
-                });
-            }
-            Err(e) => eprintln!("[interact] spawn {name} failed: {e}"),
+        if let Some(c) = spawn_container(&mut commands, &assets, &mut cry, &state.prop_models, name, pos, site, prop) {
+            state.containers.push(c);
         }
     }
     state.spawned = true;
     println!("[interact] spawned {} searchable containers near the player", state.containers.len());
+}
+
+/// Spawn one searchable `UL_Searchable` + its two model slots and return the
+/// runtime record. Shared by the start-up placement and the content manager's
+/// `SearchBuilding` building requests.
+#[allow(clippy::too_many_arguments)]
+fn spawn_container(
+    commands: &mut Commands,
+    assets: &crate::PropAssets,
+    cry: &mut crate::cry_bridge::CryHost,
+    prop_models: &HashMap<String, (String, String)>,
+    name: &str,
+    pos: [f32; 3],
+    site: &str,
+    prop: &str,
+) -> Option<Container> {
+    let (not_searched_path, searched_path) = prop_models
+        .get(&prop.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_else(|| (DEFAULT_NOT_SEARCHED.to_string(), DEFAULT_SEARCHED.to_string()));
+    let id = match items::spawn_searchable(&mut cry.host, name, pos, site, prop) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[interact] spawn {name} failed: {e}");
+            return None;
+        }
+    };
+    // Model root at the container's world transform. CryEngine Z-up maps to
+    // Bevy Y-up through `base_rot`, as the level root does.
+    let root = commands
+        .spawn((
+            Transform {
+                translation: crate::base_rot() * Vec3::new(pos[0], pos[1], pos[2]),
+                rotation: crate::base_rot(),
+                scale: Vec3::ONE,
+            },
+            Visibility::default(),
+        ))
+        .id();
+    let mut not_searched = Vec::new();
+    let mut searched_slot = Vec::new();
+    commands.entity(root).with_children(|parent| {
+        // NotSearched.OnBeginState: DrawSlot(0, 1), DrawSlot(1, 0).
+        if let Some(list) = assets.0.get(&not_searched_path) {
+            for (mesh, mat) in list {
+                not_searched.push(
+                    parent
+                        .spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(mat.clone()),
+                            Transform::default(),
+                            Visibility::Visible,
+                        ))
+                        .id(),
+                );
+            }
+        }
+        // Searched.OnBeginState: DrawSlot(0, 0), DrawSlot(1, 1).
+        if let Some(list) = assets.0.get(&searched_path) {
+            for (mesh, mat) in list {
+                searched_slot.push(
+                    parent
+                        .spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(mat.clone()),
+                            Transform::default(),
+                            Visibility::Hidden,
+                        ))
+                        .id(),
+                );
+            }
+        }
+    });
+    if not_searched.is_empty() && searched_slot.is_empty() {
+        eprintln!("[interact] {name}: no meshes for {not_searched_path} / {searched_path}");
+    }
+    Some(Container {
+        id,
+        site: site.to_string(),
+        prop: prop.to_string(),
+        pos,
+        searched: false,
+        not_searched,
+        searched_slot,
+    })
+}
+
+/// Drain the content manager's `SearchBuilding` spawn requests: place each
+/// requested building's searchable container (RTS `props.xml` models) at the
+/// authored position and bind it to the building's site tag.
+fn interact_mission_spawn(
+    mut commands: Commands,
+    assets: Option<Res<crate::PropAssets>>,
+    cry: Option<NonSendMut<crate::cry_bridge::CryHost>>,
+    state: Option<NonSendMut<InteractState>>,
+    mut queue: ResMut<SearchSpawnQueue>,
+) {
+    let (Some(assets), Some(mut cry), Some(mut state)) = (assets, cry, state) else { return };
+    if queue.requests.is_empty() {
+        return;
+    }
+    let requests = std::mem::take(&mut queue.requests);
+    for req in requests {
+        let name = format!("ULMissionSearchab{}", state.containers.len());
+        if let Some(c) = spawn_container(&mut commands, &assets, &mut cry, &state.prop_models, &name, req.pos, &req.site, &req.prop) {
+            println!(
+                "[interact] mission searchable {name} site {} at ({:.1},{:.1},{:.1})",
+                req.site, req.pos[0], req.pos[1], req.pos[2]
+            );
+            state.containers.push(c);
+        }
+    }
 }
 
 /// The per-frame interaction loop: pick the nearest container in front of the
@@ -321,8 +407,16 @@ fn interact_update(
     player: Option<Res<crate::Player>>,
     cry: Option<NonSendMut<crate::cry_bridge::CryHost>>,
     state: Option<NonSendMut<InteractState>>,
+    mut registry: ResMut<SearchRegistry>,
 ) {
     let (Some(player), Some(cry), Some(mut state)) = (player, cry, state) else { return };
+    // Publish the live searchable table for the content manager's
+    // `SearchBuilding` predicate before any early return.
+    registry.entries = state
+        .containers
+        .iter()
+        .map(|c| SearchableEntry { pos: c.pos, site: c.site.clone(), searched: c.searched })
+        .collect();
     if state.player == 0 {
         return;
     }
@@ -346,7 +440,10 @@ fn interact_update(
     let p = player.mstate.pos;
     let fwd = [player.yaw.cos(), player.yaw.sin()];
 
-    // Nearest unsearched container within reach and roughly in front.
+    let auto = std::env::var("SOD_AUTOSEARCH").is_ok();
+    // Nearest unsearched container within reach and roughly in front. The
+    // harness does not steer the camera, so it ignores the facing test and
+    // searches whichever container is nearest.
     let mut best: Option<(usize, f32)> = None;
     for (i, c) in state.containers.iter().enumerate() {
         if c.searched {
@@ -358,7 +455,7 @@ fn interact_update(
             continue;
         }
         let dot = if dist > 1e-3 { (d[0] * fwd[0] + d[1] * fwd[1]) / dist } else { 1.0 };
-        if dot < -0.15 {
+        if !auto && dot < -0.15 {
             continue;
         }
         if best.map_or(true, |(_, bd)| dist < bd) {
@@ -366,8 +463,6 @@ fn interact_update(
         }
     }
     state.target = best.map(|(i, _)| i);
-
-    let auto = std::env::var("SOD_AUTOSEARCH").is_ok();
     let holding = keys.pressed(KeyCode::KeyE) || auto;
     // Fast search is the sprint-while-searching mechanic; the harness forces it
     // so a screenshot lands after the containers have been searched.

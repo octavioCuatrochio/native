@@ -355,6 +355,40 @@ impl Objective {
             .unwrap_or(&[])
     }
 
+    /// The actor table index this objective keys off: `TargetLocationOverride`
+    /// when set, else the first `<Location ActorLocation=…>`.
+    pub fn primary_actor_index(&self) -> usize {
+        if self.target_location_override >= 0 {
+            self.target_location_override as usize
+        } else {
+            self.locations
+                .first()
+                .map(|l| l.actor_location.max(0) as usize)
+                .unwrap_or(0)
+        }
+    }
+
+    /// `MinSurveyTime` (seconds); 0 when absent.
+    pub fn survey_min_time(&self) -> f32 {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == "MinSurveyTime")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// The `<Site SiteActorIndex=…>` entries of a `Survey` objective, in order.
+    /// Each names a `Building` actor the survey reveals
+    /// (`ParseObjectiveSurveyNode` `0x014c6770`, max 7, `MAX_SURVEY_ACTORS`).
+    pub fn survey_sites(&self) -> Vec<usize> {
+        self.children
+            .iter()
+            .filter(|c| c.name == "Site")
+            .filter_map(|c| c.attr_i32("SiteActorIndex"))
+            .map(|i| i.max(0) as usize)
+            .collect()
+    }
+
     fn from_element(e: &Element) -> Objective {
         let locations = e
             .children_named("Location")
@@ -549,6 +583,21 @@ impl Mission {
 
     pub fn actor(&self, index: usize) -> Option<&ActorSpec> {
         self.actors.get(index)
+    }
+
+    /// The comma-separated `SetupFlags` of this mission (`RestoreMissionOnFail`,
+    /// `NpcsCastOnActivate`, `DontAutoWaypointOnAdd`, …).
+    pub fn setup_flags(&self) -> Vec<String> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == "SetupFlags")
+            .map(|(_, v)| split_csv(v))
+            .unwrap_or_default()
+    }
+
+    /// Whether `SetupFlags` contains `flag`.
+    pub fn has_setup_flag(&self, flag: &str) -> bool {
+        self.setup_flags().iter().any(|f| f == flag)
     }
 
     fn from_element(e: &Element) -> Mission {

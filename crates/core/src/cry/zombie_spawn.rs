@@ -525,6 +525,22 @@ impl ZombieTable {
     }
 }
 
+/// The `ZombieTypes.xml` `EntityClass` an authored `Zombie.FreakSpawn`
+/// `FreakHash` names (`missions.xml` uses `FreakHash="Zombie.<Class>"`).
+/// `Eatter` is a Grunt appearance rather than a distinct class, so it collapses
+/// to `Grunt`; an empty hash is the ambient Grunt too.
+pub fn freak_entity_class(freak_hash: &str) -> &'static str {
+    match freak_hash.trim().trim_start_matches("Zombie.") {
+        "ArmyZombie" | "SwatZombie" => "ArmyZombie",
+        "Bloater" => "Bloater",
+        "Feral" => "Feral",
+        "Juggernaut" => "Juggernaut",
+        "Screamer" => "Screamer",
+        "FreshGrunt" | "FreshZombie" => "FreshGrunt",
+        _ => "Grunt",
+    }
+}
+
 /// Map an entity-class name to a [`ZombieKind`].
 pub fn kind_for_class(class: &str) -> ZombieKind {
     match class {
@@ -1922,5 +1938,24 @@ mod tests {
         assert_eq!(ambient_outside, 0, "ambient grid spawned outside 150 m");
         assert!(ambient >= 1, "expected ambient grid spawns at player start");
         assert!(d.points.is_empty() || timeline.iter().any(|l| l.contains("SPAWN")));
+    }
+
+    /// `Zombie.FreakSpawn FreakHash` names the freak's `ZombieTypes.xml` class
+    /// (with the `Zombie.` prefix); `Eatter` is a Grunt appearance.
+    #[test]
+    fn freak_hash_maps_to_its_entity_class() {
+        assert_eq!(freak_entity_class("Zombie.ArmyZombie"), "ArmyZombie");
+        assert_eq!(freak_entity_class("Zombie.Bloater"), "Bloater");
+        assert_eq!(freak_entity_class("Zombie.Feral"), "Feral");
+        assert_eq!(freak_entity_class("Zombie.Juggernaut"), "Juggernaut");
+        assert_eq!(freak_entity_class("Zombie.Screamer"), "Screamer");
+        assert_eq!(freak_entity_class("Zombie.Eatter"), "Grunt");
+        assert_eq!(freak_entity_class(""), "Grunt");
+        // The mapped class drives the spawn script (body + ULSM family).
+        assert_eq!(crate::cry::zombie_runtime::class_script("Feral").0, "Feral");
+        assert_eq!(
+            crate::cry::zombie_runtime::class_script(freak_entity_class("Zombie.Feral")).1,
+            "scripts/entities/ai/feral.lua"
+        );
     }
 }

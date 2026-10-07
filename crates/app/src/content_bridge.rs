@@ -29,18 +29,24 @@
 //! `crates/core/src/cry/content.rs` and `content_runtime.rs`.
 
 use bevy::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use sod_core::cry::content::{
-    parse_document, Mission, MissionData, Objective, ObjectiveType,
+    parse_document, ActorKind, Mission, MissionData, Objective, ObjectiveType,
 };
+use sod_core::cry::combat::{self as cry_combat, DamageTarget, Hit, HitMaterial};
 use sod_core::cry::content_runtime::{ContentEffect, ContentManager, MissionWorld};
 use sod_core::cry::zombie_runtime::class_script;
+use sod_core::cry::zombie_spawn::{freak_entity_class, kind_for_class};
+use sod_core::game::ZombieKind;
 use sod_core::crypak::{Pak, Vfs};
 use sod_core::tagpoints::TagPoints;
 
+use crate::ai_bridge::CombatStats;
 use crate::cry_bridge::CryHost;
+use crate::interact::{SearchRegistry, SearchSpawnQueue, SearchSpawnRequest};
 
 /// Register the bridge. Added inside `run_world`'s play branch, after the
 /// script host exists (the bridge reads the mounts through it).
@@ -52,7 +58,9 @@ impl Plugin for ContentBridgePlugin {
             .add_systems(Startup, content_init)
             .add_systems(
                 Update,
-                (content_autoplay, content_tick).chain().after(crate::move_player),
+                (content_autostart, content_autoplay, content_tick)
+                    .chain()
+                    .after(crate::move_player),
             )
             .add_systems(Update, content_hud.after(crate::hud_update));
     }
@@ -206,17 +214,51 @@ pub struct ContentBridge {
     /// Mission whose objective currently owns the HUD.
     focus: Option<String>,
 
+    /// Named survey points from the level (`EntityClass="SurveyPoint"`):
+    /// `SurveyGroupId` -> world position. The `Survey` objective's action is
+    /// performed at one of these (`LoadSurveyPoints` `0x013b07a0`).
+    survey_points: HashMap<String, [f32; 3]>,
+    /// Seconds spent surveying each group (timer) and completed groups.
+    survey_progress: HashMap<String, f32>,
+    surveyed: HashSet<String>,
+    /// `(mission, bucket)` whose `SearchBuilding` containers were requested.
+    search_requested: HashSet<String>,
+    /// Mission-spawned zombie actors for the `KillActor` predicate.
+    mission_zeds: Vec<MissionZed>,
+    /// B4 kill count when each `KillActor` objective activated; a later kill
+    /// satisfies it (the real combat pipeline, B4).
+    kill_baselines: HashMap<String, u64>,
+
     /// HUD output.
     pub objective: Option<String>,
     pub notifications: Vec<String>,
     pub banner: Option<String>,
     pub marker: Option<[f32; 3]>,
 
-    autoplay: bool,
+    /// Movement driver (`SOD_TUTORIAL_AUTOPLAY` or `SOD_TUTORIAL_AUTORUN`).
+    drive: bool,
+    /// Predicate faking — **test-only** (`SOD_TUTORIAL_AUTOPLAY`).
+    fake: bool,
     at_goal: bool,
     done: Vec<String>,
     log_timer: f32,
     game_dir: String,
+    /// Player was already downed; reset when revived.
+    player_down: bool,
+    /// The `SOD_AUTOSTART` menu dismissal has run.
+    autostarted: bool,
+    /// Melee/fire cadence for hitting mission-spawned zombies (which the B4
+    /// director does not own, so they are resolved here through the same
+    /// damage pipeline).
+    zed_melee_cd: f32,
+    zed_gun_cd: f32,
+}
+
+/// A zombie actor spawned by a mission `Zombie.Spawn`/`Zombie.FreakSpawn` output.
+#[derive(Clone, Debug)]
+struct MissionZed {
+    mission: String,
+    entity: sod_core::cry::world::EntityId,
 }
 
 impl Default for ContentBridge {
@@ -232,16 +274,53 @@ impl Default for ContentBridge {
             tags: TagPoints::default(),
             scenes: HashMap::new(),
             focus: None,
+            survey_points: HashMap::new(),
+            survey_progress: HashMap::new(),
+            surveyed: HashSet::new(),
+            search_requested: HashSet::new(),
+            mission_zeds: Vec::new(),
+            kill_baselines: HashMap::new(),
             objective: None,
             notifications: Vec::new(),
             banner: None,
             marker: None,
-            autoplay: std::env::var("SOD_TUTORIAL_AUTOPLAY").is_ok(),
+            drive: std::env::var("SOD_TUTORIAL_AUTOPLAY").is_ok()
+                || std::env::var("SOD_TUTORIAL_AUTORUN").is_ok(),
+            fake: std::env::var("SOD_TUTORIAL_AUTOPLAY").is_ok(),
             at_goal: false,
             done: Vec::new(),
             log_timer: 0.0,
             game_dir: std::env::args().nth(1).unwrap_or_default(),
+            player_down: false,
+            autostarted: false,
+            zed_melee_cd: 0.0,
+            zed_gun_cd: 0.0,
         }
+    }
+}
+
+/// Dismiss the main menu under `SOD_AUTOSTART` without requiring `SOD_SHOT`
+/// (main's own auto-start only runs while a screenshot plan is active). This
+/// lets the scripted verification run as long as it needs.
+fn content_autostart(
+    mut commands: Commands,
+    mut menu: ResMut<crate::MenuRes>,
+    ui: Query<Entity, With<crate::MenuRoot>>,
+    mut bridge: ResMut<ContentBridge>,
+) {
+    // Only the scripted tutorial harness starts the game itself; `SOD_AUTOSTART`
+    // keeps main's own (frame-60) menu dismissal so other harnesses are
+    // unaffected.
+    if bridge.autostarted || std::env::var("SOD_TUTORIAL_AUTORUN").is_err() {
+        return;
+    }
+    bridge.autostarted = true;
+    if menu.active {
+        for e in &ui {
+            commands.entity(e).despawn();
+        }
+        menu.active = false;
+        println!("[content] auto-start (content bridge)");
     }
 }
 
@@ -255,13 +334,22 @@ impl ContentBridge {
     }
 }
 
-/// [`MissionWorld`] over the live app state.
+/// [`MissionWorld`] over the live app state. Every predicate reads the real
+/// game systems (B4 combat deaths, G1 container search, the survey action); the
+/// `fake` flag is the test-only `SOD_TUTORIAL_AUTOPLAY` override.
 struct WorldView<'a> {
     player: [f32; 3],
     tags: &'a TagPoints,
-    /// Live non-player actors.
+    /// Live non-player actors' positions (already filtered to the living).
     zombies: Vec<[f32; 3]>,
-    autoplay: bool,
+    /// Live searchable containers (G1 `UL_Searchable` state).
+    searchables: &'a [crate::interact::SearchableEntry],
+    /// Survey groups whose survey action completed.
+    surveyed: &'a HashSet<String>,
+    /// `(mission, actor index)` `KillActor` predicates satisfied by a real
+    /// death in the B4 pipeline.
+    dead_actors: &'a HashSet<(String, usize)>,
+    fake: bool,
     at_goal: bool,
 }
 
@@ -273,9 +361,9 @@ impl MissionWorld for WorldView<'_> {
         self.tags.get(name)
     }
     fn zombie_count_near(&self, pos: [f32; 3], radius: f32) -> u32 {
-        // Autoplay clears the objective area so a frame where there is no
-        // combat system attached still completes ClearArea.
-        if self.autoplay && self.at_goal {
+        // Test-only: autoplay clears the objective area so a frame where there
+        // is no combat system attached still completes ClearArea.
+        if self.fake && self.at_goal {
             return 0;
         }
         let r2 = radius * radius;
@@ -284,25 +372,51 @@ impl MissionWorld for WorldView<'_> {
             .filter(|z| dist2(**z, pos) <= r2)
             .count() as u32
     }
-    fn searched_buildings_near(&self, _pos: [f32; 3], _radius: f32) -> u32 {
-        if self.autoplay && self.at_goal {
-            99
-        } else {
-            0
+    fn searched_buildings_near(&self, pos: [f32; 3], radius: f32) -> u32 {
+        if self.fake && self.at_goal {
+            return 99;
         }
+        // A building/site counts as searched only once **all** of its
+        // searchable containers are searched (`RTSWorldBuildingSetSearched`
+        // `0x013b6c20`); the objective then counts the sites whose volume is
+        // within `radius` of the target (`RTSWorldBuildingContainsPointInterior`
+        // `0x013b4bf0`).
+        let mut groups: HashMap<&str, (usize, usize, [f32; 3])> = HashMap::new();
+        for e in self.searchables {
+            let g = groups.entry(e.site.as_str()).or_insert((0, 0, [0.0; 3]));
+            g.0 += 1;
+            if e.searched {
+                g.1 += 1;
+            }
+            g.2[0] += e.pos[0];
+            g.2[1] += e.pos[1];
+            g.2[2] += e.pos[2];
+        }
+        let r2 = radius * radius;
+        groups
+            .values()
+            .filter(|(total, searched, sum)| {
+                *total > 0
+                    && *searched == *total
+                    && dist2([sum[0] / *total as f32, sum[1] / *total as f32, sum[2] / *total as f32], pos) <= r2
+            })
+            .count() as u32
     }
-    fn surveyed(&self, _group: &str) -> bool {
-        self.autoplay && self.at_goal
+    fn surveyed(&self, group: &str) -> bool {
+        (self.fake && self.at_goal) || self.surveyed.contains(group)
+    }
+    fn actor_dead(&self, mission: &str, actor_index: usize) -> bool {
+        self.dead_actors.contains(&(mission.to_string(), actor_index))
     }
     fn force_objective_complete(&self, _mission: &str, objective: &Objective) -> bool {
-        if !(self.autoplay && self.at_goal) {
+        if !(self.fake && self.at_goal) {
             return false;
         }
+        // Types whose native interaction is not modelled yet (NPC casting,
+        // gather/deliver/siege) still complete under the test-only override.
         matches!(
             objective.kind,
-            ObjectiveType::KillActor
-                | ObjectiveType::Assassinate
-                | ObjectiveType::RescueNpc
+            ObjectiveType::RescueNpc
                 | ObjectiveType::SearchProp
                 | ObjectiveType::Gather
                 | ObjectiveType::Tour
@@ -362,6 +476,9 @@ fn load_tags(vfs: &Vfs, game: &str) -> Option<TagPoints> {
 
 fn content_init(mut bridge: ResMut<ContentBridge>, cry: Option<NonSend<CryHost>>) {
     let Some(cry) = cry else { return };
+    if let Ok(dir) = std::env::var("SOD_G2C_SHOT") {
+        let _ = std::fs::create_dir_all(&dir);
+    }
     let vfs = cry.host.ctx.vfs.clone();
     let game = bridge.game_dir.clone();
 
@@ -393,6 +510,17 @@ fn content_init(mut bridge: ResMut<ContentBridge>, cry: Option<NonSend<CryHost>>
         println!("[content] enclaves.xml not found in the mounted paks");
     }
     bridge.tags = load_tags(&vfs, &game).unwrap_or_default();
+    // Several packs ship a `mission_mission0.xml` (Beltway/Breakdown DLC); parse
+    // every candidate and keep the table with the most survey points, i.e. the
+    // main Class3 level.
+    for p in vfs.paths_with_ext("mission_mission0.xml") {
+        if let Some(bytes) = vfs.read(&p) {
+            let pts = parse_survey_points(&bytes);
+            if pts.len() > bridge.survey_points.len() {
+                bridge.survey_points = pts;
+            }
+        }
+    }
     let lang = std::env::var("SOD_LANG").unwrap_or_else(|_| "english".to_string());
     bridge.loc = Localization::load(&vfs, &game, &lang);
     if let Some(scenes) = read_named(&vfs, "scenes.xml", "contentmanager") {
@@ -407,10 +535,10 @@ fn content_init(mut bridge: ResMut<ContentBridge>, cry: Option<NonSend<CryHost>>
     bridge.ready = true;
 
     println!(
-        "[content] {} missions, {} / {} tag points, {} story states, {} scene buckets (lang {})",
+        "[content] {} missions, {} tag points, {} survey points, {} story states, {} scene buckets (lang {})",
         bridge.cm.data().mission_count(),
         bridge.tags.len(),
-        bridge.tags.len(),
+        bridge.survey_points.len(),
         bridge.story.states.len(),
         bridge.scenes.len(),
         lang,
@@ -523,6 +651,36 @@ fn parse_scenes(bytes: &[u8]) -> HashMap<String, Vec<(String, String)>> {
         }
     }
     out
+}
+
+/// Parse the level's `SurveyPoint` entities into `SurveyGroupId -> position`.
+/// `LoadSurveyPoints` (`0x013b07a0`) walks every entity whose class is
+/// `SurveyPoint` and reads its `SurveyGroupId` and transform; the `Survey`
+/// objective's action runs at the matching point.
+fn parse_survey_points(bytes: &[u8]) -> HashMap<String, [f32; 3]> {
+    let mut out = HashMap::new();
+    let Some(root) = parse_document(bytes) else { return out };
+    for e in root.find_all("Entity") {
+        if e.attr("EntityClass") != Some("SurveyPoint") {
+            continue;
+        }
+        let Some(group) = e
+            .child("Properties")
+            .and_then(|p| p.attr("SurveyGroupId"))
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(pos) = e.attr("Pos").and_then(parse_vec3) else { continue };
+        out.entry(group.to_string()).or_insert(pos);
+    }
+    out
+}
+
+/// `"x,y,z"` -> `[x, y, z]` (CryEngine Z-up).
+fn parse_vec3(s: &str) -> Option<[f32; 3]> {
+    let mut it = s.split(',').map(|p| p.trim().parse::<f32>().ok());
+    Some([it.next()??, it.next()??, it.next()??])
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +820,22 @@ fn objective_target(
     } else {
         None
     };
-    resolved.or_else(|| mission_trigger(m, &bridge.tags, player))
+    resolved
+        .or_else(|| survey_target(bridge, m, o))
+        .or_else(|| mission_trigger(m, &bridge.tags, player))
+}
+
+/// The level `SurveyPoint` position of the `SurveyGroup` a `Survey` objective
+/// names (ta20Tower -> `tanner_watertower`).
+fn survey_target(bridge: &ContentBridge, m: &Mission, o: &Objective) -> Option<[f32; 3]> {
+    if o.kind != ObjectiveType::Survey {
+        return None;
+    }
+    let a = m.actor(o.primary_actor_index())?;
+    if a.kind != ActorKind::SurveyGroup {
+        return None;
+    }
+    bridge.survey_points.get(&a.actor_name).copied()
 }
 
 /// The tag point an `EnterArea` mission keys its approach trigger off (its
@@ -690,9 +863,10 @@ fn content_autoplay(
     mut bridge: ResMut<ContentBridge>,
     player: Option<ResMut<crate::Player>>,
     menu: Res<crate::MenuRes>,
+    cry: Option<NonSend<CryHost>>,
     time: Res<Time>,
 ) {
-    if !bridge.ready || !bridge.autoplay || menu.active {
+    if !bridge.ready || !bridge.drive || menu.active {
         return;
     }
     let Some(mut player) = player else { return };
@@ -720,6 +894,39 @@ fn content_autoplay(
             }
         }
     }
+    // On a `ClearArea` the scripted driver walks to each mission-spawned zombie
+    // (they are static host actors) so the player can melee them down; that is
+    // real play, not predicate faking.
+    if let Some(label) = bridge.focus.clone() {
+        let clear_area = bridge
+            .cm
+            .active_objective_ref(&label)
+            .map(|o| o.kind == ObjectiveType::ClearArea)
+            .unwrap_or(false);
+        if clear_area {
+            if let Some(cry) = cry.as_deref() {
+                let actors = cry.host.ctx.actors.borrow();
+                let world = cry.host.ctx.world.borrow();
+                let mut best: Option<([f32; 3], f32)> = None;
+                for mz in &bridge.mission_zeds {
+                    if actors.get(&mz.entity).map(|a| a.is_dead()).unwrap_or(true) {
+                        continue;
+                    }
+                    if let Some(e) = world.get(mz.entity) {
+                        let d = dist(pos, e.pos);
+                        if best.map_or(true, |(_, bd)| d < bd) {
+                            best = Some((e.pos, d));
+                        }
+                    }
+                }
+                if let Some((p, d)) = best {
+                    if d > 2.0 {
+                        goal = Some(p);
+                    }
+                }
+            }
+        }
+    }
     let Some(goal) = goal else {
         if std::env::var("SOD_TUTORIAL_DBG").is_ok() {
             bridge.log_timer += time.delta_secs();
@@ -736,7 +943,7 @@ fn content_autoplay(
     };
 
     let d = dist(pos, goal);
-    bridge.at_goal = d <= 2.5;
+    bridge.at_goal = d <= 1.5;
     if std::env::var("SOD_TUTORIAL_DBG").is_ok() {
         bridge.log_timer += time.delta_secs();
         if bridge.log_timer > 1.0 {
@@ -767,12 +974,23 @@ fn content_autoplay(
 // Per-frame content manager
 // ---------------------------------------------------------------------------
 
+/// How close the player must be to a survey point to run its survey action.
+const SURVEY_REACH: f32 = 8.0;
+/// Searchable containers the native RTS places in each requested building.
+const CONTAINERS_PER_BUILDING: usize = 2;
+
+#[allow(clippy::too_many_arguments)]
 fn content_tick(
+    mut commands: Commands,
     mut bridge: ResMut<ContentBridge>,
     player: Option<Res<crate::Player>>,
     menu: Res<crate::MenuRes>,
     mut cry: Option<NonSendMut<CryHost>>,
     time: Res<Time>,
+    registry: Res<SearchRegistry>,
+    mut searchq: ResMut<SearchSpawnQueue>,
+    combat: Res<CombatStats>,
+    keys: Res<ButtonInput<KeyCode>>,
 ) {
     if !bridge.ready || menu.active {
         return;
@@ -781,7 +999,26 @@ fn content_tick(
     let dt = time.delta_secs().min(0.1);
     let ppos = [player.mstate.pos[0], player.mstate.pos[1], player.mstate.pos[2]];
 
-    // Live non-player actors for `zombie_count_near`.
+    // Story state machine first so newly created missions get ticked.
+    {
+        let ContentBridge { cm, story, state, story_fired, pending_stats, .. } = &mut *bridge;
+        story_step(story, cm, state, story_fired, pending_stats);
+    }
+    // Apply the effects the story machine just produced (mission `Created`
+    // spawns) *before* collecting the world, so the objective's first update
+    // sees the spawned zombies instead of an empty area.
+    let pre = bridge.cm.take_effects();
+    apply_effects(
+        &mut commands,
+        &mut bridge,
+        cry.as_deref_mut(),
+        pre,
+        ppos,
+        &mut searchq,
+        combat.kills,
+    );
+
+    // Live non-player actors: the zombie presence `ClearArea` counts.
     let mut zombies = Vec::new();
     if let Some(cry) = cry.as_deref() {
         let world = cry.host.ctx.world.borrow();
@@ -796,22 +1033,112 @@ fn content_tick(
         }
     }
 
+    // Mission-spawned zombies are host actors outside the B4 director's runtime,
+    // so the player's attacks are resolved against them here through the same
+    // `process_actor_damage` pipeline (real deaths, same as B4).
+    mission_zed_combat(&mut bridge, cry.as_deref_mut(), ppos, player.yaw, dt, &keys);
+
+    // `KillActor`: a mission-spawned actor that died, or a real B4-pipeline
+    // kill since the objective activated.
+    let mut dead_actors: HashSet<(String, usize)> = HashSet::new();
+    let mission_dead: Vec<String> = if let Some(cry) = cry.as_deref() {
+        let actors = cry.host.ctx.actors.borrow();
+        bridge
+            .mission_zeds
+            .iter()
+            .filter(|mz| actors.get(&mz.entity).map(|a| a.is_dead()).unwrap_or(false))
+            .map(|mz| mz.mission.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kill_targets: Vec<(String, usize)> = bridge
+        .cm
+        .active_labels()
+        .into_iter()
+        .filter_map(|label| {
+            let o = bridge.cm.active_objective_ref(label)?;
+            matches!(o.kind, ObjectiveType::KillActor | ObjectiveType::Assassinate)
+                .then(|| (label.to_string(), o.primary_actor_index()))
+        })
+        .collect();
+    for (label, idx) in kill_targets {
+        bridge.kill_baselines.entry(label.clone()).or_insert(combat.kills);
+        let baseline = bridge.kill_baselines.get(&label).copied().unwrap_or(0);
+        let real_kill = combat.kills > baseline;
+        let zed_dead = mission_dead.iter().any(|m| m == &label);
+        if real_kill || zed_dead {
+            dead_actors.insert((label, idx));
+        }
+    }
+
+    // The `Survey` action: hold USE within reach of the group's survey point
+    // for `MinSurveyTime` seconds (`ParseObjectiveSurveyNode` `0x014c6770`,
+    // `LoadSurveyPoints` `0x013b07a0`). `SOD_AUTOSURVEY` is the harness.
+    let auto_survey = std::env::var("SOD_AUTOSURVEY").is_ok();
+    let surveying = keys.pressed(KeyCode::KeyE) || auto_survey;
+    let survey_jobs: Vec<(String, f32)> = bridge
+        .cm
+        .active_labels()
+        .into_iter()
+        .filter_map(|label| {
+            let o = bridge.cm.active_objective_ref(label)?;
+            if o.kind != ObjectiveType::Survey {
+                return None;
+            }
+            let m = bridge.cm.data().mission(label)?;
+            let a = m.actor(o.primary_actor_index())?;
+            if a.kind != ActorKind::SurveyGroup || !bridge.survey_points.contains_key(&a.actor_name) {
+                return None;
+            }
+            Some((a.actor_name.clone(), o.survey_min_time().max(0.01)))
+        })
+        .collect();
+    for (group, need) in survey_jobs {
+        let pt = bridge.survey_points.get(&group).copied().unwrap_or([0.0; 3]);
+        if dist(ppos, pt) > SURVEY_REACH || !surveying {
+            continue;
+        }
+        let prog = bridge.survey_progress.entry(group.clone()).or_insert(0.0);
+        *prog += dt;
+        if *prog >= need && bridge.surveyed.insert(group.clone()) {
+            println!("[content] survey complete: {group}");
+        }
+    }
+
+    // Player downed: fail active missions; `RestoreMissionOnFail` ones come
+    // back. Revive immediately so the harness keeps playing.
+    if let Some(cry) = cry.as_deref() {
+        let dead = cry
+            .host
+            .ctx
+            .actors
+            .borrow()
+            .get(&cry.player)
+            .map(|a| a.is_dead())
+            .unwrap_or(false);
+        if dead && !bridge.player_down {
+            bridge.player_down = true;
+            let n = bridge.cm.on_player_down();
+            println!("[content] player down: {n} mission(s) failed");
+            if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&cry.player) {
+                a.health = a.max_health;
+            }
+        } else if !dead {
+            bridge.player_down = false;
+        }
+    }
+
     // Split-borrow the bridge fields so the world view can borrow `tags`
     // while the runtime mutates `cm`.
     let ContentBridge {
         cm,
-        story,
-        state,
-        story_fired,
-        pending_stats,
         tags,
-        autoplay,
         at_goal,
+        fake,
+        surveyed,
         ..
     } = &mut *bridge;
-
-    // Story state machine first so newly created missions get ticked.
-    story_step(story, cm, state, story_fired, pending_stats);
 
     // `EnterArea` activation: fire when the player reaches the trigger.
     let active: Vec<String> = cm.active_labels().into_iter().map(str::to_string).collect();
@@ -838,21 +1165,40 @@ fn content_tick(
             player: ppos,
             tags,
             zombies: std::mem::take(&mut zombies),
-            autoplay: *autoplay,
+            searchables: &registry.entries,
+            surveyed,
+            dead_actors: &dead_actors,
+            fake: *fake,
             at_goal: *at_goal,
         };
         cm.tick(dt, &view);
     }
 
     let effects = cm.take_effects();
-    apply_effects(&mut bridge, cry.as_deref_mut(), effects, ppos);
+    apply_effects(&mut commands, &mut bridge, cry.as_deref_mut(), effects, ppos, &mut searchq, combat.kills);
 }
 
+/// Save a milestone screenshot when `SOD_G2C_SHOT=<dir>` is set (the scripted
+/// verification harness; independent of `SOD_SHOT` so the run is not cut short).
+fn milestone_shot(commands: &mut Commands, name: &str) {
+    let Ok(dir) = std::env::var("SOD_G2C_SHOT") else { return };
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = PathBuf::from(dir).join(format!("{safe}.png"));
+    commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_effects(
+    commands: &mut Commands,
     bridge: &mut ContentBridge,
     mut cry: Option<&mut CryHost>,
     effects: Vec<ContentEffect>,
     ppos: [f32; 3],
+    searchq: &mut SearchSpawnQueue,
+    kills: u64,
 ) {
     for e in effects {
         match e {
@@ -873,12 +1219,40 @@ fn apply_effects(
                 // Marker for the objective's target, when it resolves.
                 let target = objective_target(bridge, &mission, ppos);
                 bridge.marker = target;
+                // `SearchBuilding`: place the building's searchables (the
+                // native RTS stand-in for the building markup volume).
+                let key = format!("{mission}/{bucket}");
+                if kind == "SearchBuilding" && bridge.search_requested.insert(key) {
+                    if let Some((site, pos, max)) = search_building_plan(bridge, &mission) {
+                        for i in 0..max as usize {
+                            let off = i as f32 * 1.2;
+                            let gsite = format!("{site}#{i}");
+                            for j in 0..CONTAINERS_PER_BUILDING {
+                                let prop = ["CoolerChest", "Cabinet", "Crate"][(i + j) % 3];
+                                let p = [
+                                    pos[0] + off + j as f32 * 0.6 - 0.3,
+                                    pos[1] + if j % 2 == 0 { 0.5 } else { -0.5 },
+                                    pos[2],
+                                ];
+                                searchq.requests.push(SearchSpawnRequest {
+                                    site: gsite.clone(),
+                                    prop: prop.to_string(),
+                                    pos: p,
+                                });
+                            }
+                        }
+                        println!("[content] {mission}: requested {max} searchable buildings at {pos:?}");
+                    }
+                }
+                bridge.kill_baselines.entry(mission.clone()).or_insert(kills);
             }
             ContentEffect::ObjectiveCompleted { mission, objective, .. } => {
                 println!("[content] objective complete {mission}: {}", bridge.loc.get(&objective));
+                milestone_shot(commands, &format!("objective_{mission}"));
             }
             ContentEffect::MissionCompleted(l) => {
                 println!("[content] mission complete: {l}");
+                milestone_shot(commands, &format!("mission_{l}"));
                 if !bridge.done.contains(&l) {
                     bridge.done.push(l.clone());
                 }
@@ -912,10 +1286,25 @@ fn apply_effects(
                     }
                 }
             }
-            ContentEffect::ZombieSpawn { spawn_actor, count, freak, pos } => {
+            ContentEffect::ZombieSpawn { mission, spawn_actor, count, freak, pos } => {
+                // The `Created`/`Activated` events are applied with a world-less
+                // context, so re-resolve the spawn actor's position from the
+                // mission table + tag points here (the original casts it live).
+                let pos = bridge
+                    .cm
+                    .data()
+                    .mission(&mission)
+                    .and_then(|m| resolve_actor(m, spawn_actor.max(0) as usize, &bridge.tags, ppos))
+                    .unwrap_or(pos);
                 println!("[content] spawn {count}x zombie (freak {freak:?}) at {:?}", pos);
-                spawn_zombies(cry.as_deref_mut(), count, &pos);
+                let spawned = spawn_zombies(cry.as_deref_mut(), count, &pos, freak.as_deref());
                 let _ = spawn_actor;
+                for entity in spawned {
+                    bridge.mission_zeds.push(MissionZed {
+                        mission: mission.clone(),
+                        entity,
+                    });
+                }
             }
             ContentEffect::ScenePlay(scene) => {
                 play_scene(bridge, cry.as_deref_mut(), &scene, ppos);
@@ -954,19 +1343,163 @@ fn apply_effects(
     bridge.log_timer += 0.0;
 }
 
-/// Best-effort mission actor spawn through the script host. The native spawn
-/// director owns full zombie ecology; the mission-spawned actors only need to
-/// exist so `zombie_count_near` can see them.
-fn spawn_zombies(cry: Option<&mut CryHost>, count: u32, pos: &[f32; 3]) {
-    let Some(cry) = cry else { return };
-    let (class, script) = class_script("Grunt");
-    for i in 0..count.min(4) {
-        let name = format!("ULMissionZed{}_{}", cry.player, i);
+/// Mission `Zombie.Spawn`/`Zombie.FreakSpawn` actors through the script host.
+/// `FreakHash="Zombie.Feral"` selects the Feral class, whose own script body and
+/// ULSM family the actor system loads; an empty/unknown hash is the Grunt.
+fn spawn_zombies(
+    cry: Option<&mut CryHost>,
+    count: u32,
+    pos: &[f32; 3],
+    freak_hash: Option<&str>,
+) -> Vec<sod_core::cry::world::EntityId> {
+    let Some(cry) = cry else { return Vec::new() };
+    let entity_class = freak_entity_class(freak_hash.unwrap_or(""));
+    let (class, script) = class_script(entity_class);
+    let mut out = Vec::new();
+    for i in 0..count.min(8) {
+        let name = format!(
+            "ULMissionZed{}_{}",
+            cry.player,
+            cry.host.ctx.instances.borrow().len() + i as usize
+        );
         let p = [pos[0] + i as f32 * 1.5, pos[1], pos[2]];
-        if let Err(e) = cry.host.spawn_actor(class, script, &name, p, false) {
-            log::debug!("[content] zombie spawn failed: {e}");
+        match cry.host.spawn_actor(class, script, &name, p, false) {
+            Ok(id) => {
+                if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&id) {
+                    let hp = kind_for_class(class).stats().hp;
+                    a.max_health = hp;
+                    a.health = hp;
+                }
+                out.push(id);
+            }
+            Err(e) => log::debug!("[content] zombie spawn failed: {e}"),
         }
     }
+    out
+}
+
+/// Resolve the player's melee/fire attack against the nearest live
+/// mission-spawned zombie, through the same game-rules damage pipeline B4 uses.
+/// The auto-fight harness (`SOD_AUTOFIGHT`) swings on a cadence; normal play
+/// uses the attack keys.
+fn mission_zed_combat(
+    bridge: &mut ContentBridge,
+    cry: Option<&mut CryHost>,
+    player_pos: [f32; 3],
+    yaw: f32,
+    dt: f32,
+    keys: &ButtonInput<KeyCode>,
+) {
+    let Some(cry) = cry else { return };
+    if bridge.mission_zeds.is_empty() {
+        return;
+    }
+    let auto = std::env::var("SOD_AUTOFIGHT").is_ok();
+    let auto_gun = std::env::var("SOD_AUTOGUN").is_ok();
+    bridge.zed_melee_cd = (bridge.zed_melee_cd - dt).max(0.0);
+    bridge.zed_gun_cd = (bridge.zed_gun_cd - dt).max(0.0);
+    let melee = keys.just_pressed(KeyCode::Space) || (auto && bridge.zed_melee_cd <= 0.0);
+    let gun = keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && bridge.zed_gun_cd <= 0.0);
+    if !melee && !gun {
+        return;
+    }
+    let fwd = [yaw.cos(), yaw.sin()];
+    let pick = {
+        let actors = cry.host.ctx.actors.borrow();
+        let world = cry.host.ctx.world.borrow();
+        let mut best: Option<(usize, f32)> = None;
+        for (i, mz) in bridge.mission_zeds.iter().enumerate() {
+            if actors.get(&mz.entity).map(|a| a.is_dead()).unwrap_or(true) {
+                continue;
+            }
+            let Some(e) = world.get(mz.entity) else { continue };
+            let d = dist(e.pos, player_pos);
+            let to = [e.pos[0] - player_pos[0], e.pos[1] - player_pos[1]];
+            let dot = if d > 1e-3 { (to[0] * fwd[0] + to[1] * fwd[1]) / d } else { 1.0 };
+            if melee && d > 2.6 {
+                continue;
+            }
+            // The auto-fight harness does not steer the camera; it faces the
+            // target like B4's own auto-aim. Manual play still needs the facing.
+            if melee && !auto && dot < 0.15 {
+                continue;
+            }
+            if gun && d > 45.0 {
+                continue;
+            }
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    };
+    let Some(i) = pick else { return };
+    let entity = bridge.mission_zeds[i].entity;
+    let cur = cry.host.ctx.actors.borrow().get(&entity).map(|a| a.health).unwrap_or(25.0);
+    let zpos = cry
+        .host
+        .ctx
+        .world
+        .borrow()
+        .get(entity)
+        .map(|e| e.pos)
+        .unwrap_or(player_pos);
+    let dir = [fwd[0], fwd[1], 0.0];
+    let (hit, dmg) = if gun {
+        (Hit::bullet(entity, cry.player, 0, 200.0, HitMaterial::Torso, zpos, dir), 200.0)
+    } else {
+        (Hit::melee(entity, cry.player, 80.0, HitMaterial::Torso, zpos, dir), 80.0)
+    };
+    let out = cry_combat::process_actor_damage(
+        cur,
+        DamageTarget::Zombie(ZombieKind::Grunt),
+        &hit,
+        cry_combat::BLOATER_HEADSHOT_KILL,
+    );
+    if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&entity) {
+        a.health = out.health;
+    }
+    println!(
+        "[content] mission-zed hit {dmg:.0} dmg ({cur:.0}->{:.0} hp){}",
+        out.health,
+        if out.dead { " KILL" } else { "" }
+    );
+    if gun {
+        bridge.zed_gun_cd = 0.3;
+    } else {
+        bridge.zed_melee_cd = 0.6;
+    }
+}
+
+/// The `SearchBuilding` objective's building: its `SiteTag` and the tag point
+/// its `Building` actor resolves to, plus the `MaxCount` of buildings to search.
+fn search_building_plan(
+    bridge: &ContentBridge,
+    mission_label: &str,
+) -> Option<(String, [f32; 3], u32)> {
+    let m = bridge.cm.data().mission(mission_label)?;
+    let o = bridge.cm.active_objective_ref(mission_label)?;
+    if o.kind != ObjectiveType::SearchBuilding {
+        return None;
+    }
+    let idx = o.primary_actor_index();
+    let a = m.actor(idx)?;
+    let site = a
+        .attrs
+        .iter()
+        .find(|(k, _)| k == "SiteTag")
+        .map(|(_, v)| v.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Search".to_string());
+    let pos = resolve_actor(m, idx, &bridge.tags, [0.0; 3])?;
+    let max = o
+        .attrs
+        .iter()
+        .find(|(k, _)| k == "MaxCount")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Some((site, pos, max))
 }
 
 /// Resolve a `Scene_ScenePlay` bucket to its authored dialog lines: show the

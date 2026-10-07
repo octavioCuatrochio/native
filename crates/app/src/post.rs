@@ -38,7 +38,10 @@ use bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel;
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::post_process::dof::DepthOfField;
 use bevy::prelude::*;
+use bevy::ecs::schedule::ScheduleConfigs;
+use bevy::ecs::system::BoxedSystem;
 use bevy::render::extract_component::ExtractComponent;
+use bevy::render::mesh::VertexAttributeValues;
 use bevy::render::render_resource::ShaderType;
 use bevy::render::view::Msaa;
 use bevy::shader::{Shader, ShaderRef};
@@ -79,6 +82,24 @@ impl FullscreenMaterial for CryPostMaterial {
             Some(h) => ShaderRef::Handle(h.clone()),
             None => ShaderRef::Default,
         }
+    }
+
+    /// Run after bloom and before tonemapping.
+    ///
+    /// Bevy's bloom is `.before(tonemapping).in_set(PostProcess)`, the same set
+    /// and the same only-ordering as the default here. Without an explicit edge
+    /// the graph is free to interleave this pass with bloom's multi-pass
+    /// ping-pong, so this pass would sample a bloom intermediate (bright) and
+    /// white out the scene. Ordering after bloom makes the source the
+    /// bloom-composited HDR scene, which is what the tone-mapped result
+    /// expects.
+    fn schedule_configs(
+        system: ScheduleConfigs<BoxedSystem>,
+    ) -> ScheduleConfigs<BoxedSystem> {
+        system
+            .in_set(bevy::core_pipeline::Core3dSystems::PostProcess)
+            .after(bevy::post_process::bloom::bloom)
+            .before(bevy::core_pipeline::tonemapping::tonemapping)
     }
 }
 
@@ -121,6 +142,13 @@ impl Plugin for PostPlugin {
             shadows.max_tex_res,
             shadows.gsm_lods,
         );
+        if std::env::var("SOD_R3B_DIAG").is_ok() {
+            app.insert_resource(bevy::render::error_handler::RenderErrorHandler(|e, world, _| {
+                eprintln!("R3B-DIAG render error: {:?} :: {} :: {:?}", e.ty, e.description, e.source);
+                world.write_message(bevy::app::AppExit::error());
+                bevy::render::error_handler::RenderErrorPolicy::StopRendering
+            }));
+        }
         app.insert_resource(PostConfig { spec, settings, shadows })
             .init_resource::<PostApplied>()
             .add_plugins(FullscreenMaterialPlugin::<CryPostMaterial>::default())
@@ -143,6 +171,10 @@ fn apply_post_chain(
     let Ok(cam) = camera.single() else {
         return;
     };
+    // Debug A/B switches for per-pass profiling (see REPORT.md). Each turns
+    // off one pass while leaving the rest of the chain in place.
+    let debug_off = |name: &str| std::env::var(name).is_ok();
+
     let s = &cfg.settings;
     let sh = &cfg.shadows;
 
@@ -151,7 +183,9 @@ fn apply_post_chain(
     });
 
     let mut e = commands.entity(cam);
-    e.insert(Hdr);
+    if std::env::var("SOD_NOHDR").is_err() {
+        e.insert(Hdr);
+    }
     // `r_ShadowsPCFiltering = 1` -> the Gaussian PCF kernel.
     e.insert(ShadowFilteringMethod::Gaussian);
 
@@ -159,7 +193,7 @@ fn apply_post_chain(
     // through `x/(offset+x)`; Bevy's prefilter threshold is the same kind of
     // knee, so map the authored pair onto the [0,1] fraction of the HDR range
     // it represents.
-    if s.hdr_rendering >= 1 {
+    if s.hdr_rendering >= 1 && !debug_off("SOD_NOBLOOM") {
         let knee = if s.hdr_bright_threshold + s.hdr_bright_offset > 0.0 {
             (s.hdr_bright_threshold / (s.hdr_bright_threshold + s.hdr_bright_offset))
                 .clamp(0.0, 1.0)
@@ -177,7 +211,7 @@ fn apply_post_chain(
     // Depth of field: on at High (`r_DepthOfField = 3`). Kept physically
     // shallow so it reads as the engine's mild gameplay DOF rather than a
     // heavy portrait blur.
-    if s.dof > 0 {
+    if s.dof > 0 && !debug_off("SOD_NODOFF") {
         e.insert(DepthOfField {
             focal_distance: 12.0,
             aperture_f_stops: 16.0,
@@ -188,7 +222,7 @@ fn apply_post_chain(
 
     // SSAO: `r_ssao` 3 (High) / 5 (Ultra). Bevy's SSAO needs the depth+normal
     // prepass and MSAA off; the authored radius/omega are not exposed by Bevy.
-    if s.ssao > 0 {
+    if s.ssao > 0 && !debug_off("SOD_NOSSAO") {
         let quality = match s.ssao_quality {
             0 => ScreenSpaceAmbientOcclusionQualityLevel::Low,
             1 => ScreenSpaceAmbientOcclusionQualityLevel::Medium,
@@ -202,32 +236,83 @@ fn apply_post_chain(
         });
     }
 
-    e.insert(CryPostMaterial::default());
+    if !debug_off("SOD_NOPOST") {
+        e.insert(CryPostMaterial::default());
+    }
     applied.0 = true;
 }
 
-/// Mark meshes without vertex normals as non-shadow-casters.
+/// Make normal-less meshes safe for Bevy's shadow *and* normal prepasses.
 ///
-/// Turning on the sun's cascaded shadow maps makes Bevy build a shadow
-/// (prepass) pipeline per shadow-casting mesh. That pipeline's fragment stage
-/// reads the world normal, so a mesh with no `ATTRIBUTE_NORMAL` (the unlit
-/// particle quads built by `particle_bridge.rs`, a `Mesh` with only position /
-/// uv / colour) makes the vertex stage emit no `@location(0)` and wgpu rejects
-/// the pipeline with a validation error that aborts the frame. CryEngine's
-/// unlit/particle geometry likewise does not write the sun shadow map, so such
-/// meshes are marked `NotShadowCaster`. The `Added` filter keeps the scan to
-/// newly spawned meshes.
+/// Turning on the sun's cascaded shadow maps and SSAO makes Bevy build a
+/// prepass pipeline per visible mesh. Its vertex stage reads
+/// `ATTRIBUTE_NORMAL`, so a mesh with no normal attribute (the unlit particle
+/// quads from `particle_bridge.rs`, and the terrain root whose setup mesh is
+/// replaced with an empty placeholder by `terrain_bridge.rs`) makes the vertex
+/// stage emit no `@location(0)`; wgpu then rejects `pbr_prepass_pipeline` and
+/// aborts the frame, which showed as the flat grey capture.
+///
+/// This checks every `Mesh3d` each frame rather than relying on `Added<Mesh3d>`
+/// or asset events: `terrain_bridge` replaces the root mesh *in place* (the
+/// entity's `Mesh3d` component never changes) and streaming spawns meshes from
+/// a background thread, so both filters raced the first render and let the
+/// validation error through. A mesh with real geometry gets computed normals;
+/// an empty placeholder gets a canonical empty position+normal layout.
+/// Referencing entities are marked `NotShadowCaster` (the authored unlit
+/// geometry never wrote the sun shadow map).
 fn guard_shadow_casters(
     mut commands: Commands,
-    meshes: Res<Assets<Mesh>>,
-    q: Query<(Entity, &Mesh3d), (Added<Mesh3d>, Without<NotShadowCaster>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    q: Query<(Entity, &Mesh3d)>,
 ) {
     for (e, m) in &q {
-        if let Some(mesh) = meshes.get(&m.0) {
-            if !mesh.attributes().any(|(a, _)| *a == Mesh::ATTRIBUTE_NORMAL) {
-                commands.entity(e).insert(NotShadowCaster);
+        let id = m.0.id();
+        // A mesh is bad when it has no normal attribute at all, or when the
+        // normal attribute is empty while positions exist (some decoders emit
+        // an empty normal list). Both make the prepass vertex interface miss
+        // the world-normal varying.
+        let (has_normal, bad) = match meshes.get(id) {
+            Some(mesh) => {
+                let nrm = mesh
+                    .try_attribute_option(Mesh::ATTRIBUTE_NORMAL)
+                    .ok()
+                    .flatten();
+                let pos = mesh
+                    .try_attribute_option(Mesh::ATTRIBUTE_POSITION)
+                    .ok()
+                    .flatten();
+                let bad = match (nrm, pos) {
+                    (Some(n), Some(p)) => n.is_empty() && !p.is_empty(),
+                    (Some(n), None) => !n.is_empty(),
+                    _ => false,
+                };
+                (nrm.is_some(), bad)
             }
+            None => (true, false),
+        };
+        if has_normal && !bad {
+            continue;
         }
+        let Some(mut mesh) = meshes.get_mut(id) else { continue };
+        let has_positions = mesh
+            .try_attribute_option(Mesh::ATTRIBUTE_POSITION)
+            .ok()
+            .flatten()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        if has_positions {
+            // `try_compute_normals` is flat for non-indexed geometry and
+            // smooth for indexed. Unlit materials ignore the result.
+            let _ = mesh.try_compute_normals();
+        } else {
+            // Empty placeholder: declare a canonical empty layout so the
+            // prepass pipeline's vertex interface matches (nothing draws).
+            if mesh.try_attribute_option(Mesh::ATTRIBUTE_POSITION).ok().flatten().is_none() {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(Vec::new()));
+            }
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(Vec::new()));
+        }
+        commands.entity(e).insert(NotShadowCaster);
     }
 }
 
@@ -260,18 +345,18 @@ fn update_sun_uniform(
         }
     }
 
-    mat.sun = Vec4::new(
-        uv.x,
-        uv.y,
-        visible,
-        if cfg.settings.sunshafts { 1.0 } else { 0.0 },
-    );
+    let sunshafts = cfg.settings.sunshafts && std::env::var("SOD_NOSHAFTS").is_err();
+    mat.sun = Vec4::new(uv.x, uv.y, visible, if sunshafts { 1.0 } else { 0.0 });
     mat.tint = Vec4::new(1.0, 0.97, 0.9, 0.0);
-    mat.params = Vec4::new(
-        cfg.settings.hdr_blue_shift,
-        cfg.settings.hdr_grain,
-        time.elapsed_secs() * 60.0,
-        0.0,
-    );
-    mat.misc = Vec4::ONE;
+    let blue = if std::env::var("SOD_NOBLUE").is_ok() {
+        0.0
+    } else {
+        cfg.settings.hdr_blue_shift
+    };
+    mat.params = Vec4::new(blue, cfg.settings.hdr_grain, time.elapsed_secs() * 60.0, 0.0);
+    mat.misc = if std::env::var("SOD_PASSTHRU").is_ok() {
+        Vec4::ZERO
+    } else {
+        Vec4::ONE
+    };
 }

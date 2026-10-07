@@ -71,6 +71,11 @@ fn sun_shafts(uv: vec2<f32>, sun_uv: vec2<f32>, strength: f32) -> vec3<f32> {
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
     var c = textureSample(screen, screen_sampler, uv).rgb;
+    // Debug: pass-through copy (SOD_PASSTHRU). Isolates the pass plumbing from
+    // the effect maths.
+    if (post.misc.x < 0.5) {
+        return vec4<f32>(c, 1.0);
+    }
 
     // --- r_sunshafts -------------------------------------------------------
     if (post.sun.z > 0.5 && post.sun.w > 0.0) {

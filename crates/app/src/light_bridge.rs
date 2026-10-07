@@ -63,11 +63,17 @@ const SUN_LUX_PER_UNIT: f32 = 10_000.0;
 /// luminance→irradiance conversion would fold in a factor of pi; 1 000 keeps
 /// shaded surfaces filled without flattening the directional contrast.
 const SKY_LUX_PER_UNIT: f32 = 1_000.0;
-/// Extra stops applied on top of the derived EV100. The recovered exposure
-/// curve targets the engine's relative scene; this small stop brings the
-/// shipped level's sunlit terrain off the top of Bevy's tone-map shoulder so
-/// noon keeps contrast instead of reading washed out.
-const EXPOSURE_BIAS_STOPS: f32 = 0.4;
+/// Stops applied on top of the derived EV100 to make Bevy's physically-based
+/// shading reproduce the engine's relative exposure.
+///
+/// The engine shades relative radiance with no `1/PI` factor, while Bevy's
+/// Lambertian `Fd_Burley` divides the directional contribution by `PI`. The
+/// derived `ev100` already folds in `SUN_LUX_PER_UNIT`, so the missing factor
+/// is exactly one stop count of `-log2(PI)`: with it, `SUN_LUX_PER_UNIT *
+/// sun_luminance` and the recovered `ExposureParams::exposure()` reproduce the
+/// same midtone the engine's `HDRLevel/(1+HDROffset*adapted)` curve produced
+/// for the relative scene. Using `+0.4` here made noon ~2 stops too dark.
+const EXPOSURE_BIAS_STOPS: f32 = -1.651_496_3; // -log2(PI)
 /// Luminous power (lm) per unit of a level light's uploaded intensity.
 const LUMEN_PER_UNIT: f32 = 150.0;
 /// Level lights are gathered within this many metres of the player start.
@@ -166,6 +172,7 @@ fn apply_lighting(
     let display_lum = luminance(sun_display);
     let sun_dir = cry_to_bevy(frame.sun_dir).normalize_or_zero();
     let sh = shadow_cfg.0;
+    let shadows_on = sh.gsm_lods > 0 && std::env::var("SOD_NOSHADOWS").is_err();
     if display_lum > 1e-4 && frame.sun_radiance.iter().any(|c| *c > 0.0) {
         let color = Vec3::from_array(sun_display) / display_lum;
         let sun_lum = luminance(frame.sun_radiance).max(0.0);
@@ -196,7 +203,7 @@ fn apply_lighting(
             DirectionalLight {
                 color: Color::linear_rgb(color.x, color.y, color.z),
                 illuminance: sun_lum * SUN_LUX_PER_UNIT,
-                shadow_maps_enabled: sh.gsm_lods > 0,
+                shadow_maps_enabled: shadows_on,
                 shadow_depth_bias: sh.depth_bias(),
                 shadow_normal_bias: sh.normal_bias(),
                 ..default()
@@ -247,12 +254,47 @@ fn apply_lighting(
     // before its tone map; converting it to a physical EV100 lets Bevy's
     // camera exposure reproduce the same midtone for the scaled scene.
     let e = frame.exposure.exposure().max(1e-6);
-    let ev100 = -(1.2 * e / SUN_LUX_PER_UNIT).log2() + EXPOSURE_BIAS_STOPS;
+    let bias = std::env::var("SOD_EXPOSURE_BIAS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(EXPOSURE_BIAS_STOPS);
+    let ev100 = -(1.2 * e / SUN_LUX_PER_UNIT).log2() + bias;
     commands.entity(cam).insert(Exposure { ev100 });
+    if std::env::var("SOD_R3B_DIAG").is_ok() {
+        let g = &frame.grading;
+        eprintln!(
+            "R3B-LIGHT: sun_rad {:?} lum {:.3} | sky {:?} ground {:?} | scene_lum {:.3} \
+             adapted {:.4} exp {:.4} ev100 {:.2} | grade sat {:.3} contrast {:.3} bright {:.3} \
+             gamma {:.3} min_in {:.3} max_in {:.3} min_out {:.3} max_out {:.3} photo_d {:.3}",
+            frame.sun_radiance,
+            luminance(frame.sun_radiance),
+            frame.sky_ambient,
+            frame.ambient_ground,
+            frame.scene_luminance,
+            frame.exposure.adapted_luminance,
+            e,
+            ev100,
+            g.saturation,
+            g.contrast,
+            g.brightness,
+            g.levels_gamma,
+            g.levels_min_in,
+            g.levels_max_in,
+            g.levels_min_out,
+            g.levels_max_out,
+            g.photofilter_density,
+        );
+    }
 
     // --- tone map + colour grade ------------------------------------------
-    commands.entity(cam).insert(Tonemapping::KhronosPbrNeutral);
-    commands.entity(cam).insert(grading_from(&frame.grading));
+    if std::env::var("SOD_NOTONEMAP").is_ok() {
+        commands.entity(cam).insert(Tonemapping::None);
+    } else {
+        commands.entity(cam).insert(Tonemapping::KhronosPbrNeutral);
+    }
+    if std::env::var("SOD_NOGRADE").is_err() {
+        commands.entity(cam).insert(grading_from(&frame.grading));
+    }
 
     // --- level lights ------------------------------------------------------
     let spawned = spawn_level_lights(&mut commands, lighting.as_ref(), sh);
@@ -379,6 +421,7 @@ fn spawn_level_lights(
         // (CryEngine point-light cube shadows are the expensive path and are
         // off in the shipped config). Capped to bound the frame cost.
         let cast = shadows.gsm_lods > 0
+            && std::env::var("SOD_NOSHADOWS").is_err()
             && p.kind == LightKind::Projector
             && shadow_casters < MAX_SHADOW_LIGHTS;
         if cast {

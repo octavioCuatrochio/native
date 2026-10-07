@@ -119,6 +119,16 @@ pub struct CameraState {
     pub yaw: f32,
     /// Pitch (radians, positive = up).
     pub pitch: f32,
+    /// Active lower pitch clamp (rad). The third-person update `FUN_015ea260`
+    /// clamps to `behavior+0x30` during input and eases back toward
+    /// `behavior+0x38` when idle; those per-spec bounds are not static, so the
+    /// camera carries them explicitly. Default `-`[`PITCH_LIMIT`].
+    pub pitch_min: f32,
+    /// Active upper pitch clamp (rad), `behavior+0x34`.
+    pub pitch_max: f32,
+    /// Seconds of continuous sub-gate (idle) input, tracked for
+    /// [`auto_center`] (`FUN_015ea260` timer `behavior+0x6c`).
+    pub idle_time: f32,
     /// Current yaw angular velocity (rad/s).
     pub yaw_vel: f32,
     /// Current pitch angular velocity (rad/s).
@@ -144,6 +154,9 @@ impl CameraState {
         CameraState {
             yaw: 0.0,
             pitch: 0.0,
+            pitch_min: -PITCH_LIMIT,
+            pitch_max: PITCH_LIMIT,
+            idle_time: 0.0,
             yaw_vel: 0.0,
             pitch_vel: 0.0,
             mode: CameraMode::Nav,
@@ -253,18 +266,27 @@ pub fn update_mode(
     if v[0].abs() > CAM_INPUT_DEADZONE || v[1].abs() > CAM_INPUT_DEADZONE {
         state.yaw_vel = CAM_YAW_SPEED * v[0] * device_scale;
         state.pitch_vel = CAM_PITCH_SPEED * v[1] * device_scale;
+        state.idle_time = 0.0;
     } else {
         state.yaw_vel = 0.0;
         state.pitch_vel = 0.0;
+        state.idle_time = (state.idle_time + dt).max(0.0);
     }
+
+    // Per-spec pitch bounds (`behavior+0x30/+0x34` in `FUN_015ea260`), clamped
+    // to the global 80 deg limit. Defaults to +-`PITCH_LIMIT`; the capture
+    // replay sets the observed range.
+    let pmin = sane(state.pitch_min).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    let pmax = sane(state.pitch_max).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    let (pmin, pmax) = if pmin <= pmax { (pmin, pmax) } else { (pmax, pmin) };
 
     state.yaw = sane(state.yaw) + state.yaw_vel * dt;
     state.pitch = sane(state.pitch) + state.pitch_vel * dt;
-    if state.pitch > PITCH_LIMIT {
-        state.pitch = PITCH_LIMIT;
+    if state.pitch > pmax {
+        state.pitch = pmax;
         state.pitch_vel = 0.0;
-    } else if state.pitch < -PITCH_LIMIT {
-        state.pitch = -PITCH_LIMIT;
+    } else if state.pitch < pmin {
+        state.pitch = pmin;
         state.pitch_vel = 0.0;
     }
 
@@ -577,6 +599,78 @@ pub const STICK_DEVICE_SCALE: f32 = 1.0;
 /// Input value per mouse count for a normalised sensitivity.
 pub fn mouse_count_scale(s: f32) -> f32 {
     MOUSE_COUNT_BASE + MOUSE_COUNT_PER_SENS * sane(s)
+}
+
+/// The engine's `rotate` action accumulator (`0x1588ee0`): each mouse event
+/// adds `counts * (0.01 + 0.025*s)` to the persistent `player+0xc8/+0xcc`
+/// register, then the register is clamped to `[-1, 1]`. The camera reads the
+/// (stick-shaped) register through `+0xd8/+0xdc`; the register is consumed and
+/// cleared once per game frame, so callers must pass only the counts that
+/// arrived *this frame*. Returns the clamped register.
+///
+/// The disassembly has no decay term: `0x1588ef0` adds and `0x1588f47` clamps
+/// with the `-1.0`/`+1.0` constants at `0x171e22c`/`0x171e0f0`.
+pub fn accumulate_mouse(accum: &mut [f32; 2], counts: [f32; 2], s: f32) -> [f32; 2] {
+    let k = mouse_count_scale(s);
+    accum[0] = (sane(accum[0]) + sane(counts[0]) * k).clamp(-1.0, 1.0);
+    accum[1] = (sane(accum[1]) + sane(counts[1]) * k).clamp(-1.0, 1.0);
+    *accum
+}
+
+/// Default idle auto-centre delay (s). The third-person update `FUN_015ea260`
+/// holds the timer at `behavior+0x6c` until `behavior+0x2c` before easing the
+/// camera back; the runtime values live in the camera-spec behaviour object and
+/// are not numerically recovered, so this is a caller-supplied parameter when
+/// [`auto_center`] is used.
+pub const RECENTER_DELAY: f32 = 0.5;
+
+/// Idle auto-centre (`FUN_015ea260` else branch, `0x15ea59c`..`0x15ea780`).
+///
+/// Reachable only when both input axes are below [`CAM_INPUT_DEADZONE`]. The
+/// branch advances a hold timer (`behavior+0x6c` toward `behavior+0x2c`) and,
+/// once it expires, eases the camera yaw toward `target_yaw` at `yaw_speed`
+/// (`behavior+0x40/0x44`) and pulls pitch back inside `[pitch_min, pitch_max]`
+/// (`behavior+0x38/0x3c`). `target_yaw` is the aim/boom direction supplied by
+/// the caller. `dt` is the frame time. Returns the new yaw.
+///
+/// Note: the captured `cam_msweep_session2_*` idle motion is fully accounted
+/// for by the per-frame input accumulator (the tail counts of a holding phase
+/// are applied on the first frame after release), so this helper is not driven
+/// by `update`; it is provided for the moving-character call path the branch
+/// implements.
+pub fn auto_center(
+    state: &mut CameraState,
+    target_yaw: f32,
+    dt: f32,
+    delay: f32,
+    yaw_speed: f32,
+) -> f32 {
+    let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
+    let delay = if delay.is_finite() && delay >= 0.0 { delay } else { RECENTER_DELAY };
+    let speed = sane(yaw_speed);
+    if state.idle_time < delay {
+        state.idle_time = (sane(state.idle_time) + dt).max(0.0);
+        return sane(state.yaw);
+    }
+    // Ease yaw along the shortest way toward the aim direction.
+    let mut d = sane(target_yaw) - sane(state.yaw);
+    while d > core::f32::consts::PI {
+        d -= core::f32::consts::TAU;
+    }
+    while d < -core::f32::consts::PI {
+        d += core::f32::consts::TAU;
+    }
+    let step = (speed * dt).clamp(0.0, 1.0);
+    state.yaw = sane(state.yaw) + d * step;
+    // Pitch eases back inside the active bounds (soft re-clamp).
+    let pmin = sane(state.pitch_min).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    let pmax = sane(state.pitch_max).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    if state.pitch > pmax {
+        state.pitch += (pmax - state.pitch) * step;
+    } else if state.pitch < pmin {
+        state.pitch += (pmin - state.pitch) * step;
+    }
+    sane(state.yaw)
 }
 
 /// Camera-stick linear dead zone per axis (`cl_input_*_camera_deadzone_pc_
@@ -2225,5 +2319,73 @@ mod tests {
         };
         assert_eq!(apply_invert(1.0, 2.0, both), (-1.0, -2.0));
         assert_eq!(apply_invert(f32::NAN, f32::NAN, both), (-0.0, -0.0));
+    }
+
+    // --- per-frame mouse accumulation + configurable pitch bounds ----------
+
+    #[test]
+    fn mouse_accumulator_adds_and_clamps() {
+        let mut acc = [0.0f32; 2];
+        // One count at s = 0.5 -> 0.0225; five counts -> 0.1125.
+        assert!((accumulate_mouse(&mut acc, [1.0, 0.0], 0.5)[0] - 0.0225).abs() < 1e-7);
+        assert!((accumulate_mouse(&mut acc, [4.0, 0.0], 0.5)[0] - 0.1125).abs() < 1e-7);
+        // Saturates at +-1.
+        let big = accumulate_mouse(&mut acc, [1000.0, -1000.0], 0.5);
+        assert_eq!(big, [1.0, -1.0]);
+        // Total on non-finite.
+        let nan = accumulate_mouse(&mut [f32::NAN, f32::NAN], [f32::NAN, f32::NAN], f32::NAN);
+        assert!(nan.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn per_spec_pitch_bounds_override_the_global_clamp() {
+        let t = t();
+        let mut s = CameraState::new();
+        // Captured session-2 third-person range: [-3 deg, +35 deg].
+        s.pitch_min = (-3.0f32).to_radians();
+        s.pitch_max = (35.0f32).to_radians();
+        for _ in 0..600 {
+            let inp = CameraInput { mouse_dy: 100.0, ..idle(false) };
+            update(&mut s, &inp, &t, [0.0; 3]);
+        }
+        assert!((s.pitch - s.pitch_max).abs() < 1e-4, "pitch {} max {}", s.pitch, s.pitch_max);
+        for _ in 0..600 {
+            let inp = CameraInput { mouse_dy: -100.0, ..idle(false) };
+            update(&mut s, &inp, &t, [0.0; 3]);
+        }
+        assert!((s.pitch - s.pitch_min).abs() < 1e-4, "pitch {} min {}", s.pitch, s.pitch_min);
+        // Swapped bounds are normalised.
+        let mut r = CameraState::new();
+        r.pitch_min = 1.0;
+        r.pitch_max = -1.0;
+        update(&mut r, &idle(false), &t, [0.0; 3]);
+        assert!(r.pitch >= -1.0 && r.pitch <= 1.0);
+    }
+
+    #[test]
+    fn auto_center_holds_then_eases_to_target() {
+        let mut s = CameraState::new();
+        s.yaw = 1.0;
+        s.pitch = 0.5;
+        s.pitch_min = -0.2;
+        s.pitch_max = 0.2;
+        // Inside the delay: no motion.
+        auto_center(&mut s, 0.0, 0.1, 0.5, 1.0);
+        assert!((s.yaw - 1.0).abs() < 1e-6);
+        // After the delay it eases toward the target and back inside bounds.
+        for _ in 0..100 {
+            auto_center(&mut s, 0.0, 0.1, 0.5, 1.0);
+        }
+        assert!(s.yaw.abs() < 1e-3, "yaw {}", s.yaw);
+        assert!(s.pitch <= 0.2 + 1e-4, "pitch {}", s.pitch);
+        // Shortest-way wrap: 0.1 -> -0.1 turns by -0.2, not +6.1.
+        let mut w = CameraState::new();
+        w.yaw = 0.1;
+        auto_center(&mut w, -0.1, 1.0, 0.0, 1.0);
+        assert!((w.yaw - (-0.1)).abs() < 1e-5, "yaw {}", w.yaw);
+        // Total on non-finite.
+        let mut n = CameraState::new();
+        n.yaw = f32::NAN;
+        assert!(auto_center(&mut n, f32::NAN, f32::NAN, f32::NAN, f32::NAN).is_finite());
     }
 }

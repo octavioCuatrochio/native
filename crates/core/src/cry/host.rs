@@ -611,6 +611,7 @@ impl ScriptHost {
         super::actor::install(&host.lua, &host.ctx)?;
         super::gamerules::install(&host.lua, &host.ctx)?;
         super::binds_sound::install(&host.lua, &host.ctx)?;
+        super::ai::install(&host.lua, &host.ctx)?;
         host.load_class_registry();
         for (class, script) in ACTOR_CLASSES {
             host.class_scripts.insert(class.to_ascii_lowercase(), (class.to_string(), Some(script.to_string())));
@@ -645,6 +646,11 @@ impl ScriptHost {
     pub fn boot(&self) -> Result<()> {
         Self::exec_file(&self.lua, &self.ctx, "scripts/main.lua", false);
         self.call_global("OnInit", ())?;
+        // The AI system initialises with the engine, before any game rules:
+        // aiconfig.lua, then AIReset / AIReload (`notes/ai-system.md`).
+        if let Err(e) = super::ai::boot(&self.lua, &self.ctx) {
+            self.ctx.error(format!("AI boot: {e}"));
+        }
         Self::exec_file(&self.lua, &self.ctx, "scripts/gamerules/singleplayer.lua", false);
         Ok(())
     }

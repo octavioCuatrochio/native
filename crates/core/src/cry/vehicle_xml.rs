@@ -255,6 +255,11 @@ impl ArcadeWheeled {
     /// Maximum steering angle in **radians** at `speed` (`m/s`), following the
     /// recovered curve `v0SteerMax - min(|v|/vMaxSteerMax,1) * kvSteerMax`
     /// (degrees). Reverse uses the `rv*` pair when `speed < 0`.
+    ///
+    /// Ported from the `0x01672f30` accessor: `value = v0 - t*kv` with the
+    /// forward pair `[+0x14]/[+0x10]` or the reverse pair `[+0x7c]/[+0x78]`,
+    /// then returned in radians (`* 0x017201f0` = deg→rad). The computed angle
+    /// is cached at `[this+0x4a4]` in the original.
     pub fn max_steer(&self, speed: f32) -> f32 {
         let fwd = speed >= 0.0;
         let (v0, k, vmax) = if fwd {

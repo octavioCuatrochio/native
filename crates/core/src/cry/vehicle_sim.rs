@@ -729,33 +729,60 @@ impl VehicleBody {
         self.update_drive_train(next_long, dt);
     }
 
+    /// Gear-shift event handler, the recovered
+    /// `CVehicleMovementArcadeWheeled` event virtual `0x01676f70`: event `4`
+    /// shifts up one gear and event `5` shifts down. The new index is clamped
+    /// to `0..=num_gears` (the engine's reported gear count) and, only when it
+    /// actually changes, the shift state at `[this+0x520]` is recomputed — the
+    /// native stand-in resets the `minChange*Time` gate. Returns `true` if the
+    /// gear index moved.
+    ///
+    /// The original drives this from engine events, not from speed directly;
+    /// [`VehicleBody::update_drive_train`] uses the speed band to synthesise
+    /// those events so the same clamp/reset path runs.
+    pub fn apply_gear_event(&mut self, event: u32, num_gears: usize) -> bool {
+        let delta: isize = match event {
+            4 => 1,
+            5 => -1,
+            _ => return false,
+        };
+        let new = (self.state.gear as isize + delta).clamp(0, num_gears as isize) as usize;
+        if new != self.state.gear {
+            self.state.gear = new;
+            self.shift_timer = 0.0;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Fake gears + RPM from the XML. `<FakeGears>` `ratios` are upshift
     /// fractions of top speed; `minChange*Time` gates the shifts. RPM chases
-    /// the current band at `rpmInterpSpeed` and relaxes at `rpmRelaxSpeed`;
-    /// `rpmGearShiftSpeed` caps how fast the gear index may move.
+    /// the current band at `rpmInterpSpeed` and relaxes at `rpmRelaxSpeed`.
     fn update_drive_train(&mut self, vlong: f32, dt: f32) {
-        let m = &self.setup.movement;
-        let ratios = &m.fake_gears.ratios;
-        let top = m.power.top_speed.max(1e-3);
-        let frac = (vlong.abs() / top).clamp(0.0, 1.0);
-
-        let target_gear = ratios.iter().take_while(|&&r| frac >= r).count();
+        // Read-only phase first so `apply_gear_event` can take `&mut self`.
+        let (target_gear, num_gears, min_up, min_down, top) = {
+            let m = &self.setup.movement;
+            let ratios = &m.fake_gears.ratios;
+            let top = m.power.top_speed.max(1e-3);
+            let frac = (vlong.abs() / top).clamp(0.0, 1.0);
+            let target_gear = ratios.iter().take_while(|&&r| frac >= r).count();
+            (target_gear, ratios.len(), m.fake_gears.min_change_up_time, m.fake_gears.min_change_down_time, top)
+        };
+        let _ = top;
         self.shift_timer += dt;
-        let max_gear_step = (m.rpm_gear_shift_speed.max(1.0) * dt).max(1.0) as usize;
         if target_gear > self.state.gear {
-            if self.shift_timer >= m.fake_gears.min_change_up_time {
-                self.state.gear = (self.state.gear + 1).min(target_gear);
-                self.shift_timer = 0.0;
+            if self.shift_timer >= min_up {
+                self.apply_gear_event(4, num_gears);
             }
-        } else if target_gear < self.state.gear {
-            if self.shift_timer >= m.fake_gears.min_change_down_time {
-                self.state.gear = self.state.gear.saturating_sub(1).max(target_gear);
-                self.shift_timer = 0.0;
-            }
+        } else if target_gear < self.state.gear && self.shift_timer >= min_down {
+            self.apply_gear_event(5, num_gears);
         }
-        let _ = max_gear_step;
 
         // Local fraction inside the current gear band -> RPM sweep.
+        let m = &self.setup.movement;
+        let ratios = &m.fake_gears.ratios;
+        let frac = (vlong.abs() / m.power.top_speed.max(1e-3)).clamp(0.0, 1.0);
         let ratios_empty = ratios.is_empty();
         let lo = if self.state.gear == 0 || ratios_empty {
             0.0
@@ -1078,6 +1105,27 @@ mod tests {
         let idle = b.setup.movement.wheeled_legacy.engine_idle_rpm;
         assert!(b.state.rpm > idle);
         assert!(b.state.rpm <= b.setup.movement.wheeled_legacy.engine_max_rpm + 1e-3);
+    }
+
+    /// `0x01676f70` shifts one gear per event 4/5 and clamps to `0..=num_gears`.
+    #[test]
+    fn gear_event_shift_clamps_at_ends() {
+        let mut b = VehicleBody::new(hatch(), [0.0, 0.0, 0.0], 0.0);
+        assert_eq!(b.state.gear, 0);
+        assert!(!b.apply_gear_event(9, 4), "unrelated event must not shift");
+        assert!(b.apply_gear_event(4, 4) && b.state.gear == 1);
+        assert!(b.apply_gear_event(4, 4) && b.state.gear == 2);
+        assert!(b.apply_gear_event(5, 4) && b.state.gear == 1);
+        // Clamp high.
+        for _ in 0..10 {
+            b.apply_gear_event(4, 3);
+        }
+        assert_eq!(b.state.gear, 3);
+        // Clamp low.
+        for _ in 0..10 {
+            b.apply_gear_event(5, 3);
+        }
+        assert_eq!(b.state.gear, 0);
     }
 
     #[test]

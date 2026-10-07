@@ -52,13 +52,25 @@ fn install_system(lua: &Lua, ctx: &Ctx) -> Result<()> {
     system.raw_set(
         "GetCVar",
         lua.create_function(move |lua, name: String| {
-            let v = c.cvars.borrow().get(&name.to_ascii_lowercase()).cloned();
+            let key = name.to_ascii_lowercase();
+            let v = c.cvars.borrow().get(&key).cloned();
             Ok(match v {
-                Some(s) => match s.trim().parse::<f64>() {
-                    Ok(n) => Value::Number(n),
-                    Err(_) => Value::String(lua.create_string(&s)?),
-                },
                 None => Value::Nil,
+                Some(s) => {
+                    // The registration kind decides the Lua type; cvars the
+                    // executable never registered (but a config set) fall back
+                    // to "looks numeric".
+                    let numeric = match super::cvars::kind(&key) {
+                        Some(super::cvars::Kind::String) => false,
+                        Some(_) => true,
+                        None => s.trim().parse::<f64>().is_ok(),
+                    };
+                    if numeric {
+                        Value::Number(s.trim().parse::<f64>().unwrap_or(0.0))
+                    } else {
+                        Value::String(lua.create_string(&s)?)
+                    }
+                }
             })
         })?,
     )?;

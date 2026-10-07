@@ -6,6 +6,7 @@ pub mod actor;
 pub mod binds_entity;
 pub mod binds_sound;
 pub mod binds_system;
+mod cvar_table;
 pub mod constants;
 pub mod cvars;
 pub mod gamerules;

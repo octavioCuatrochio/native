@@ -398,7 +398,7 @@ fn single(alias: &str, path: String) -> Resolved {
 }
 
 /// Sibling `.chrparams` of a `.chr` (`…/skeleton.chr` → `…/skeleton.chrparams`).
-fn chrparams_for(chr: &str) -> String {
+pub fn chrparams_for(chr: &str) -> String {
     let norm = chr.replace('\\', "/");
     match norm.rsplit_once('.') {
         Some((stem, _)) => format!("{stem}.chrparams"),

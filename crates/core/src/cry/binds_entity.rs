@@ -43,9 +43,33 @@ fn flow_value(v: &Value) -> FlowValue {
 /// that matches exactly one `.caf` in the mounted paks) parse its duration via
 /// [`crate::anim::Caf`]; otherwise 0.0.
 ///
-/// TODO: symbolic animation names (`"Default"`, `"weaponRecoil"`) are resolved
-/// through the character's animation set / CDF in the original engine; that
-/// mapping is not wired up yet, so such clips report 0.0.
+/// Clip length through the entity's own character animation set, as CryEngine's
+/// `GetAnimationLength(slot, name)` does (`ICharacterInstance` → animation set →
+/// `.chrparams` `<AnimationList>` name → `.caf`). Tables are cached per model.
+fn slot_clip_len(vfs: &crate::crypak::Vfs, model: &str, name: &str) -> Option<f32> {
+    use crate::anim_alias::{chrparams_for, AnimNameTable};
+    use std::collections::HashMap;
+    thread_local!(static TABLES: std::cell::RefCell<HashMap<String, Option<AnimNameTable>>> = Default::default());
+    let lower = model.to_ascii_lowercase();
+    let clip = TABLES.with(|t| {
+        let mut t = t.borrow_mut();
+        let table = t.entry(lower.clone()).or_insert_with(|| {
+            if lower.ends_with(".cdf") {
+                AnimNameTable::load_character(vfs, model)
+            } else if lower.ends_with(".chr") {
+                AnimNameTable::load_chrparams(vfs, &chrparams_for(model))
+            } else {
+                None
+            }
+        });
+        table.as_ref()?.resolve_literal(name)?.clips.first().map(|c| c.0.clone())
+    })?;
+    let bytes = vfs.read(&clip)?;
+    crate::anim::Caf::parse(&bytes).map(|c| c.duration_secs())
+}
+
+/// Fallback when the entity has no character slot: a direct `.caf` path or a
+/// clip file stem anywhere in the paks.
 fn resolve_caf(vfs: &crate::crypak::Vfs, name: &str) -> Option<f32> {
     if name.is_empty() {
         return None;
@@ -698,9 +722,16 @@ pub fn install(lua: &Lua, ctx: &Ctx) -> Result<()> {
     let c = ctx.clone();
     n.raw_set(
         "GetAnimationLength",
-        lua.create_function(move |_, (this, _slot, name): (Table, Value, Value)| {
-            let _ = self_id(&this);
-            Ok(value_str(&name).and_then(|n| resolve_caf(&c.vfs, &n)).unwrap_or(0.0) as f64)
+        lua.create_function(move |_, (this, slot, name): (Table, Value, Value)| {
+            let Some(n) = value_str(&name) else { return Ok(0.0) };
+            let model = self_id(&this).and_then(|id| {
+                let w = c.world.borrow();
+                let e = w.get(id)?;
+                let i = num(&slot).unwrap_or(0.0).max(0.0) as usize;
+                e.slots.get(i).cloned().flatten().map(|s| s.path)
+            });
+            let len = model.and_then(|m| slot_clip_len(&c.vfs, &m, &n)).or_else(|| resolve_caf(&c.vfs, &n));
+            Ok(len.unwrap_or(0.0) as f64)
         })?,
     )?;
     let c = ctx.clone();

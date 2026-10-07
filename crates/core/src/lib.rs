@@ -14,6 +14,7 @@ pub mod anim_manifest;
 pub mod architecture;
 pub mod asset;
 pub mod audio;
+pub mod audio_fev;
 pub mod cache;
 pub mod camera;
 pub mod cdf;

@@ -72,6 +72,16 @@ fn main() {
         .expect("spawn player");
     host.add_area_listener(player);
     println!("[player] id {player} instance={}", host.ctx.instance(player).is_some());
+    if let Some(a) = host.ctx.actors.borrow().get(&player) {
+        println!("[player] actor after init: {a:?}");
+    }
+    if let Ok(v) = host.lua.load(r#"
+        local p = System.GetEntityByName("Dev")
+        local d = p and p.Properties and p.Properties.Damage
+        return tostring(d and d.health) .. " class.Damage=" .. tostring(Player.Properties.Damage and Player.Properties.Damage.health)
+    "#).eval::<String>() {
+        println!("[player] Properties.Damage.health = {v}");
+    }
 
     let dt = 1.0 / 30.0;
     let frames = (seconds / dt) as usize;

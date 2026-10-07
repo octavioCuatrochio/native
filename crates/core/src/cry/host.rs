@@ -105,6 +105,10 @@ impl Timers {
     }
 }
 
+fn host_cvars(ctx: &Ctx) -> std::cell::RefMut<'_, HashMap<String, String>> {
+    ctx.cvars.borrow_mut()
+}
+
 /// Native state shared by all bind closures.
 #[derive(Clone)]
 pub struct Ctx {
@@ -576,6 +580,7 @@ impl ScriptHost {
             f.call::<()>(*ns)?;
         }
 
+        *host_cvars(&ctx) = super::cvars::load(&ctx.vfs);
         let mut host = ScriptHost {
             lua,
             ctx,

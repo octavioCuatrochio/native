@@ -449,7 +449,24 @@ impl CharacterGraph {
     where
         F: Fn(usize) -> Option<CandidateMotion>,
     {
-        let values = graph_inputs(&self.graph, m);
+        self.update_with_inputs(m, |_| {}, motion_of, step)
+    }
+
+    /// [`update`](Self::update), letting the caller overwrite graph inputs
+    /// before the candidates are evaluated. The player's state machine uses
+    /// this to apply its `AnimationGraphInput` actions (workerA3b).
+    pub fn update_with_inputs<F, A>(
+        &mut self,
+        m: &MovementSnapshot,
+        apply: A,
+        motion_of: F,
+        step: bool,
+    ) where
+        F: Fn(usize) -> Option<CandidateMotion>,
+        A: FnOnce(&mut InputValues),
+    {
+        let mut values = graph_inputs(&self.graph, m);
+        apply(&mut values);
         let cands = self.graph.candidates(&values);
         let current = self.inst.current;
         // Expensive locomotion selection (`FUN_007cb5f0`/`FUN_007cbaf0`): when

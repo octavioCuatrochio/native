@@ -39,7 +39,8 @@
 //! consumes, for each `action_ids` entry of a block, `descriptor.code_size`
 //! bytes aligned to `descriptor.code_align` from
 //! `block_strings + block.code_offset`, bounded by `block.code_length`.
-//! [`crate::sm_payload`] records that slice as [`SmActionRecord::code`]; the
+//! [`crate::sm_payload`] records that slice as
+//! [`crate::sm_payload::SmActionRecord::code`]; the
 //! runtime surfaces it on [`SmActionCommand::code`].
 //!
 //! ### GraphDriven hand-off
@@ -55,7 +56,7 @@
 //! [`SmEnv::eval_raw_trigger`], and the whole runtime is panic-free on
 //! malformed / truncated machines.
 
-use crate::sm_payload::{SmActionRecord, SmTriggerOperand};
+use crate::sm_payload::SmTriggerOperand;
 use crate::statemachine::{StateMachine, SmTransition, SmTransitionList};
 use std::collections::HashMap;
 
@@ -313,6 +314,25 @@ pub fn action_kind(id: u8) -> SmActionKind {
     }
 }
 
+/// Name of the graph input written by an `AnimationGraphInput` action
+/// (descriptor id 15, evaluator `0x0168b120`). The action's `code` operand is a
+/// 128-byte buffer holding a NUL-terminated input name at offset 0
+/// (e.g. `Signal`, `CarryWeapon`); the value it writes is not encoded in the
+/// operand we decode, so callers choose one. Returns `None` for any other
+/// action or an empty name.
+pub fn animation_graph_input_name(cmd: &SmActionCommand) -> Option<&str> {
+    if action_kind(cmd.descriptor_id) != SmActionKind::AnimationGraphInput {
+        return None;
+    }
+    let end = cmd.code.iter().position(|&b| b == 0).unwrap_or(cmd.code.len());
+    let name = std::str::from_utf8(&cmd.code[..end]).ok()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// One action descriptor invocation, emitted by [`SmInstance::tick`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SmActionCommand {
@@ -378,6 +398,11 @@ pub struct SmInstance<'a> {
     /// Global trigger index lookup `(state, block, index)` -> record index,
     /// built once at construction.
     trigger_index: HashMap<(u32, u32, u16), usize>,
+    /// `(state, block)` -> indices into `sm.payloads.actions`, in emission
+    /// order. Avoids rescanning the whole action table every tick.
+    action_index: HashMap<(u32, u32), Vec<usize>>,
+    /// `(state, block)` -> indices into `sm.transitions`, in emission order.
+    transition_index: HashMap<(u32, u32), Vec<usize>>,
     persist: HashMap<(u32, u32), Persist>,
     /// Transition chosen this tick, applied at the end of the tick.
     pub pending: Option<SmPending>,
@@ -395,6 +420,14 @@ impl<'a> SmInstance<'a> {
         for (i, t) in sm.payloads.triggers.iter().enumerate() {
             trigger_index.insert((t.state, t.block, t.index), i);
         }
+        let mut action_index: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (i, a) in sm.payloads.actions.iter().enumerate() {
+            action_index.entry((a.state, a.block)).or_default().push(i);
+        }
+        let mut transition_index: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (i, t) in sm.transitions.iter().enumerate() {
+            transition_index.entry((t.source, t.block)).or_default().push(i);
+        }
         let mut inst = SmInstance {
             sm,
             state: sm.start_state,
@@ -404,6 +437,8 @@ impl<'a> SmInstance<'a> {
             outputs: Vec::new(),
             trigger_of_output: Vec::new(),
             trigger_index,
+            action_index,
+            transition_index,
             persist: HashMap::new(),
             pending: None,
             commands: Vec::new(),
@@ -424,6 +459,16 @@ impl<'a> SmInstance<'a> {
             .get(self.state as usize)
             .map(|s| s.name.as_str())
             .unwrap_or("<none>")
+    }
+
+    /// Number of states in the machine.
+    pub fn state_count(&self) -> usize {
+        self.sm.states.len()
+    }
+
+    /// Name of the state at `state`, if it exists.
+    pub fn state_name_at(&self, state: u32) -> Option<&str> {
+        self.sm.states.get(state as usize).map(|s| s.name.as_str())
     }
 
     /// Locomotion ownership derived from the current state name.
@@ -452,6 +497,24 @@ impl<'a> SmInstance<'a> {
     /// Take the commands emitted since the last call.
     pub fn take_commands(&mut self) -> Vec<SmCommand> {
         std::mem::take(&mut self.commands)
+    }
+
+    /// Index of the state whose name matches `name` (exact, case-insensitive,
+    /// then substring), for debug / scripted entry.
+    pub fn find_state(&self, name: &str) -> Option<u32> {
+        let key = name.to_ascii_lowercase();
+        self.sm
+            .states
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .or_else(|| self.sm.states.iter().find(|s| s.name.to_ascii_lowercase().contains(&key)))
+            .map(|s| s.index)
+    }
+
+    /// Force the machine into `state`, emitting its fragment / drive-mode like a
+    /// normal transition. Used by the `SOD_SMTEST` debug entry point.
+    pub fn go_to(&mut self, state: u32) {
+        self.enter_state(state, None, None);
     }
 
     /// Enter `state`, emitting its fragment and a [`SmCommand::DriveMode`] on
@@ -781,12 +844,11 @@ impl<'a> SmInstance<'a> {
         let mut weights: Vec<u16> = Vec::new();
         for &bi in st.blocks.iter().rev() {
             let mut i = 0usize;
-            // Gather this block's transitions once (flattened in emission order).
-            let block_trans: Vec<&SmTransition> = sm
-                .transitions
-                .iter()
-                .filter(|t| t.source == st.index && t.block == bi)
-                .collect();
+            // This block's transitions, in emission order (indexed once at
+            // construction so the whole table is not rescanned every tick).
+            let idxs = self.transition_index.get(&(st.index, bi)).cloned().unwrap_or_default();
+            let block_trans: Vec<&SmTransition> =
+                idxs.iter().map(|&t| &sm.transitions[t]).collect();
             while i < block_trans.len() {
                 let cur = block_trans[i];
                 let (list, cond) = (cur.list, cur.condition);
@@ -832,13 +894,9 @@ impl<'a> SmInstance<'a> {
             return;
         };
         for &bi in &st.blocks {
-            let group: Vec<&SmActionRecord> = sm
-                .payloads
-                .actions
-                .iter()
-                .filter(|a| a.state == st.index && a.block == bi)
-                .collect();
-            for a in group {
+            let idxs = self.action_index.get(&(st.index, bi)).cloned().unwrap_or_default();
+            for ai in idxs {
+                let a = &sm.payloads.actions[ai];
                 let name = a.desc.map(|d| d.name).unwrap_or("?");
                 self.commands.push(SmCommand::Action(SmActionCommand {
                     state: a.state,
@@ -1117,6 +1175,46 @@ mod tests {
         // The decoded types cover the dominant share of trigger *records*.
         // (Type coverage is a lower bound; raw types are still surfaced to env.)
         assert!(covered > 0);
+    }
+
+    #[test]
+    fn animation_graph_input_action_name() {
+        let mut code = vec![0u8; 128];
+        code[..6].copy_from_slice(b"Signal");
+        let cmd = SmActionCommand {
+            state: 25,
+            block: 0,
+            index: 44,
+            action_id: 44,
+            descriptor_id: 15,
+            name: "AnimationGraphInput",
+            kind: SmActionKind::AnimationGraphInput,
+            flags: 0,
+            data: Vec::new(),
+            code,
+        };
+        assert_eq!(animation_graph_input_name(&cmd), Some("Signal"));
+        // A non-AGI action (e.g. Animation, descriptor 13) is rejected.
+        let other = SmActionCommand { descriptor_id: 13, kind: SmActionKind::Animation, ..cmd };
+        assert_eq!(animation_graph_input_name(&other), None);
+        // An empty operand has no name.
+        let empty = SmActionCommand { code: vec![0u8; 128], ..other };
+        assert_eq!(animation_graph_input_name(&empty), None);
+    }
+
+    #[test]
+    fn force_state_and_find_by_name() {
+        let Some(bytes) = real_sm("player", "win") else { return };
+        let sm = parse_sm(&bytes).expect("player parses");
+        let mut inst = SmInstance::new(&sm, 1);
+        let react = inst
+            .find_state("Reaction.Core.Heavy.High.Front")
+            .expect("reaction state exists");
+        inst.go_to(react);
+        assert_eq!(inst.state_name(), "MachineDriven.Reaction.Core.Heavy.High.Front");
+        assert!(!inst.is_graph_driven());
+        let cmds = inst.take_commands();
+        assert!(cmds.iter().any(|c| matches!(c, SmCommand::PlayFragment { .. })));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::material::AlphaMode;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use sod_core::crypak::Vfs;
+use sod_core::sm_runtime::{SmCommand, SmDriveMode, SmEnv, SmInstance};
 use sod_core::{ai, architecture, cache, camera, character, combat, hud, inventory, locomotion, mission, npc_ai, player_locomotion, surfaces, tagpoints, tuning, vegetation, zombie_ai};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::ui::Display;
@@ -105,6 +106,108 @@ struct LevelLighting {
 /// The player's AnimationGraph (playerfullbody.xml) driven from movement.
 #[derive(Resource)]
 struct PlayerGraph(sod_core::ag_driver::CharacterGraph);
+
+/// A debug request for the player state machine (`SOD_SMTEST`): force a signal,
+/// the grab actor flag, or jump straight to a named `MachineDriven.*` state,
+/// then pulse the engine's leave signal (`358`) so the graph takes over again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmTest {
+    None,
+    /// Hold this engine signal during the window (type-19 triggers read it).
+    Signal(u16),
+    /// Hold actor flag bit 3 (the type-71 grab trigger).
+    Grab,
+    /// Force the machine into this state, then release it.
+    Jump(u32),
+}
+
+/// The player's original `.sm` instance plus the debug driver. The parsed
+/// [`sod_core::statemachine::StateMachine`] is leaked once at startup so the
+/// instance can be a `'static` Bevy resource.
+#[derive(Resource)]
+struct PlayerSm {
+    inst: SmInstance<'static>,
+    test: SmTest,
+    /// Frames ticked since the first play frame; the debug driver schedules on
+    /// this (not wall time) so it lines up with the fixed screenshot frames.
+    frame: u32,
+    /// The jump / entry has been applied.
+    armed: bool,
+    /// Next frame to pulse the leave signal while still machine-driven.
+    next_release_frame: u32,
+    released: bool,
+    /// Tracks the previous frame's ownership so a `MachineDriven` ->
+    /// `GraphDriven` hand-back forces the graph to re-pose.
+    was_graph_driven: bool,
+    /// `SOD_SMDBG=1`: log state-machine transitions.
+    dbg: bool,
+}
+
+impl PlayerSm {
+    /// Parse `SOD_SMTEST`: `grab`, `reaction`/`react`, `item`/`journal`, a
+    /// numeric signal id, or a state-name substring.
+    fn parse_test(inst: &SmInstance, value: &str) -> SmTest {
+        let low = value.trim().to_ascii_lowercase();
+        match low.as_str() {
+            "" => SmTest::None,
+            "grab" | "flag3" => SmTest::Grab,
+            "react" | "reaction" => inst
+                .find_state("Reaction.Core.Heavy.High.Front")
+                .map(SmTest::Jump)
+                .unwrap_or(SmTest::None),
+            "item" | "journal" => inst
+                .find_state("Item.Journal.Normal.Start")
+                .map(SmTest::Jump)
+                .unwrap_or(SmTest::None),
+            _ => {
+                if let Ok(n) = low.parse::<u16>() {
+                    SmTest::Signal(n)
+                } else {
+                    match inst.find_state(&low) {
+                        Some(i) => SmTest::Jump(i),
+                        None => {
+                            eprintln!("[sm] SOD_SMTEST={value}: no such signal or state");
+                            SmTest::None
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-frame engine-side inputs for the player state machine, built from the
+/// real player state (workerA3b).
+struct PlayerSmEnv {
+    dt: f32,
+    time: f32,
+    /// Actor flags byte `actor+0x1364` (grab/attach reads bit 3).
+    actor_flags: u32,
+    /// Actual horizontal speed (m/s).
+    speed: f32,
+    /// Normalised phase of the clip currently playing on the rig.
+    phase: f32,
+    /// Engine signals forced true this frame by the debug driver.
+    signals: Vec<u16>,
+}
+
+impl SmEnv for PlayerSmEnv {
+    fn delta_seconds(&self) -> f32 {
+        self.dt
+    }
+    fn time_seconds(&self) -> f32 {
+        self.time
+    }
+    fn actor_flags(&self) -> u32 {
+        self.actor_flags
+    }
+    fn signal(&self, id: u16) -> bool {
+        self.signals.contains(&id)
+    }
+    fn animation_phase(&self) -> f32 {
+        self.phase
+    }
+}
 
 /// Player AnimationGraph resolution context: the character's animation-name
 /// table (`<chr>.chrparams` aliases + LocomotionGroups), the VFS to load the
@@ -948,6 +1051,42 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         None
     };
 
+    // The player's original ULSM state machine, run on top of the graph
+    // (workerA3b). The parsed machine is leaked once so its `SmInstance` can be
+    // a `'static` Bevy resource.
+    let player_sm = if play {
+        vfs.read("libs/statemachines/player/general.win.sm")
+            .or_else(|| vfs.read("gamedata/libs/statemachines/player/general.win.sm"))
+            .and_then(|b| sod_core::statemachine::parse_sm(&b))
+            .map(|sm| {
+                let leaked: &'static sod_core::statemachine::StateMachine = Box::leak(Box::new(sm));
+                let inst = sod_core::sm_runtime::SmInstance::new(leaked, 0x5eed_1234);
+                let test = std::env::var("SOD_SMTEST")
+                    .ok()
+                    .map(|v| PlayerSm::parse_test(&inst, &v))
+                    .unwrap_or(SmTest::None);
+                println!(
+                    "[sm] player state machine: {} states, start [{}] {}, test {:?}",
+                    inst.state_count(),
+                    inst.state,
+                    inst.state_name(),
+                    test
+                );
+                PlayerSm {
+                    inst,
+                    test,
+                    frame: 0,
+                    armed: false,
+                    next_release_frame: 0,
+                    released: false,
+                    was_graph_driven: true,
+                    dbg: std::env::var("SOD_SMDBG").is_ok(),
+                }
+            })
+    } else {
+        None
+    };
+
     let mut app = App::new();
     app.add_plugins(DefaultPlugins
         .set(WindowPlugin {
@@ -976,6 +1115,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     }
     if let Some(c) = collision {
         app.insert_resource(c);
+    }
+    if let Some(s) = player_sm {
+        app.insert_resource(s);
     }
     if let Some(g) = player_graph {
         app.insert_resource(g);
@@ -1559,7 +1701,7 @@ fn build_state_anim(
     caf_cache: &mut HashMap<String, anim::Caf>,
     bank: &character::ClipBank,
 ) -> Option<LoadedAnim> {
-    use sod_core::anim_alias::{AnimInputs, ResolvedKind};
+    use sod_core::anim_alias::AnimInputs;
     let tpl = sod_core::ag_driver::state_template(graph, state);
     let playback_speed = tpl.speed();
     let one_shot = tpl.one_shot();
@@ -1572,29 +1714,8 @@ fn build_state_anim(
             .with("direction", "fwd")
             .with("version", "01");
         if let Some(res) = ctx.table.resolve(name, &inputs) {
-            let mut clips = Vec::new();
-            let mut speeds = Vec::new();
-            for (path, _) in &res.clips {
-                let Some(caf) = read_caf(ctx, caf_cache, path) else { continue };
-                let speed = clip_speed(&caf, &ctx.skeleton);
-                speeds.push(speed);
-                clips.push(AnimClipDef { caf, pos: [0.0; 3], speed, weight: 0.0 });
-            }
-            if !clips.is_empty() {
-                let (blend_type, params) = match &res.kind {
-                    ResolvedKind::Blend(info) => {
-                        for (i, p) in info.params.iter().enumerate() {
-                            if let Some(c) = clips.get_mut(i) {
-                                c.pos = *p;
-                            }
-                        }
-                        (Some(info.blend_type.clone()), info.params.clone())
-                    }
-                    ResolvedKind::Single => (None, Vec::new()),
-                };
-                let motion = sod_core::ag_driver::motion_from_resolved(&res, &speeds)
-                    .unwrap_or_else(|| sod_core::ag_cost::CandidateMotion::from_speed(0.0, 0.0));
-                return Some(LoadedAnim { clips, blend_type, params, playback_speed, one_shot, motion, ref_speed: 0.0, rate: playback_speed });
+            if let Some(anim) = load_resolved_anim(ctx, caf_cache, &res, playback_speed, one_shot) {
+                return Some(anim);
             }
         }
     }
@@ -1744,6 +1865,14 @@ impl Player {
     /// previous one over the link `transitionTime`.
     fn switch_state(&mut self, state: usize, trans: f32) {
         let Some(anim) = self.anim_cache.get(&state).and_then(|a| a.clone()) else { return };
+        self.switch_anim(anim, trans);
+        self.anim_state = Some(state);
+    }
+
+    /// Switch the current animation to an already-resolved [`LoadedAnim`]
+    /// (a graph state or a state-machine fragment), crossfading from the
+    /// previous layer over `trans` seconds.
+    fn switch_anim(&mut self, anim: LoadedAnim, trans: f32) {
         let start_phase = if anim.one_shot {
             0.0
         } else {
@@ -1760,8 +1889,80 @@ impl Player {
             self.blend_dur = 0.0;
         }
         self.anim_finished = false;
-        self.anim_state = Some(state);
+        self.anim_state = None;
     }
+}
+
+/// Resolve and load an already-resolved animation to a playable [`LoadedAnim`]
+/// (shared by graph states and state-machine fragments).
+fn load_resolved_anim(
+    ctx: &AnimCtx,
+    caf_cache: &mut HashMap<String, anim::Caf>,
+    res: &sod_core::anim_alias::Resolved,
+    playback_speed: f32,
+    one_shot: bool,
+) -> Option<LoadedAnim> {
+    use sod_core::anim_alias::ResolvedKind;
+    let mut clips = Vec::new();
+    let mut speeds = Vec::new();
+    for (path, _) in &res.clips {
+        let Some(caf) = read_caf(ctx, caf_cache, path) else { continue };
+        let speed = clip_speed(&caf, &ctx.skeleton);
+        speeds.push(speed);
+        clips.push(AnimClipDef { caf, pos: [0.0; 3], speed, weight: 0.0 });
+    }
+    if clips.is_empty() {
+        return None;
+    }
+    let (blend_type, params) = match &res.kind {
+        ResolvedKind::Blend(info) => {
+            for (i, p) in info.params.iter().enumerate() {
+                if let Some(c) = clips.get_mut(i) {
+                    c.pos = *p;
+                }
+            }
+            (Some(info.blend_type.clone()), info.params.clone())
+        }
+        ResolvedKind::Single => (None, Vec::new()),
+    };
+    let motion = sod_core::ag_driver::motion_from_resolved(res, &speeds)
+        .unwrap_or_else(|| sod_core::ag_cost::CandidateMotion::from_speed(0.0, 0.0));
+    Some(LoadedAnim {
+        clips,
+        blend_type,
+        params,
+        playback_speed,
+        one_shot,
+        motion,
+        ref_speed: 0.0,
+        rate: playback_speed,
+    })
+}
+
+/// Resolve a state-machine fragment clip (`PlayFragment`) through the same
+/// animation alias table the graph uses and build it as a player layer. The
+/// fragment's `flags` bit 0 marks a one-shot; the fragment `speed` is the
+/// playback rate.
+fn build_fragment_anim(
+    clip: &str,
+    player: &mut Player,
+    ctx: &AnimCtx,
+    speed: f32,
+    one_shot: bool,
+) -> Option<LoadedAnim> {
+    use sod_core::anim_alias::AnimInputs;
+    let inputs = AnimInputs::new()
+        .with("stance", "relaxed")
+        .with("item", "nw")
+        .with("dir", "fwd")
+        .with("direction", "fwd")
+        .with("version", "01");
+    let res = ctx
+        .table
+        .resolve(clip, &inputs)
+        .or_else(|| ctx.table.resolve_literal(clip))?;
+    let playback_speed = if speed > 0.0 { speed } else { 1.0 };
+    load_resolved_anim(ctx, &mut player.caf_cache, &res, playback_speed, one_shot)
 }
 
 fn move_player(
@@ -1777,6 +1978,7 @@ fn move_player(
     collision: Option<Res<Collision>>,
     graph: Option<ResMut<PlayerGraph>>,
     anim_ctx: Option<Res<AnimCtx>>,
+    sm: Option<ResMut<PlayerSm>>,
 ) {
     if menu.active {
         return;
@@ -1852,7 +2054,118 @@ fn move_player(
     // AnimationGraph: drive the player's clips exactly as the engine does —
     // resolve the current state's animation through `anim_alias`, play/blend
     // its clips, and walk the link path when a one-shot transition finishes.
+    //
+    // Layered on top, the player's original `.sm` state machine runs every
+    // frame (workerA3's `sm_runtime`). While it is in a `GraphDriven.*` state
+    // the graph owns locomotion exactly as before; while it is in a
+    // `MachineDriven.*` state its fragment is played over the graph and its
+    // `AnimationGraphInput` actions are fed to the graph inputs. Ownership is
+    // derived from the state name, as the engine's `SmTick` does.
     let use_graph = graph.is_some() && anim_ctx.is_some();
+
+    // ---- player state machine ----
+    let was_graph_before = sm.as_ref().map(|s| s.was_graph_driven).unwrap_or(true);
+    let mut machine_driven = false;
+    let mut returning_to_graph = false;
+    let mut sm_agi: Vec<(String, f32)> = Vec::new();
+    if let Some(mut smr) = sm {
+        let v = player.mstate.vel;
+        let speed = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let dbg = smr.dbg;
+        smr.frame = smr.frame.wrapping_add(1);
+        let frame = smr.frame;
+        // Frame 90 is the first play frame after the menu auto-start (frame
+        // 60); the hold ends at frame 390, well before the late screenshot
+        // (frame 700) and after the play screenshot (frame 200).
+        let enter_frame = 90u32;
+        let release_frame = enter_frame + 300;
+        let mut signals: Vec<u16> = Vec::new();
+        let mut actor_flags = 0u32;
+        let mut jump: Option<u32> = None;
+        match smr.test {
+            SmTest::None => {}
+            SmTest::Grab => {
+                if frame >= enter_frame && frame < release_frame {
+                    actor_flags |= 1 << 3;
+                }
+            }
+            SmTest::Signal(s) => {
+                if frame >= enter_frame && frame < release_frame {
+                    signals.push(s);
+                }
+            }
+            SmTest::Jump(idx) => {
+                if frame >= enter_frame && !smr.armed {
+                    jump = Some(idx);
+                }
+            }
+        }
+        // After the hold, pulse the engine leave signal (358) so a
+        // `MachineDriven` state hands back to the graph. Repeat it while the
+        // machine is still not back (some reaction chains need a few hops).
+        if frame >= release_frame && (!smr.released || frame >= smr.next_release_frame) {
+            signals.push(358);
+            smr.released = true;
+            smr.next_release_frame = frame + 45;
+        }
+        if let Some(idx) = jump {
+            smr.inst.go_to(idx);
+            smr.armed = true;
+        }
+        let env = PlayerSmEnv {
+            dt,
+            time: smr.inst.time,
+            actor_flags,
+            speed,
+            phase: player.cur_layer.as_ref().map(|l| l.phase).unwrap_or(0.0),
+            signals,
+        };
+        smr.inst.tick(&env);
+        let in_machine = !smr.inst.is_graph_driven();
+        for cmd in smr.inst.take_commands() {
+            match cmd {
+                SmCommand::PlayFragment { clip, speed, blend_in, flags, .. } => {
+                    if let Some(ctx) = anim_ctx.as_deref() {
+                        match build_fragment_anim(&clip, &mut player, ctx, speed, flags & 1 != 0) {
+                            Some(anim) => {
+                                if dbg {
+                                    eprintln!("[sm] fragment {clip} ({speed:.2}x) blend_in {blend_in:.2}");
+                                }
+                                player.switch_anim(anim, blend_in.max(0.02));
+                            }
+                            None => {
+                                if dbg {
+                                    eprintln!("[sm] fragment {clip} unresolved");
+                                }
+                            }
+                        }
+                    }
+                }
+                SmCommand::Action(a) => {
+                    if in_machine {
+                        if let Some(name) = sod_core::sm_runtime::animation_graph_input_name(&a) {
+                            sm_agi.push((name.to_string(), 1.0));
+                        }
+                    }
+                }
+                SmCommand::DriveMode(SmDriveMode::GraphDriven(_)) | SmCommand::DriveMode(SmDriveMode::MachineDriven) => {}
+            }
+        }
+        machine_driven = in_machine;
+        returning_to_graph = !machine_driven && !was_graph_before;
+        if dbg && machine_driven != !smr.was_graph_driven {
+            eprintln!(
+                "[sm] f{} {} -> [{}] {} (v {:.2})",
+                frame,
+                if smr.was_graph_driven { "GraphDriven" } else { "MachineDriven" },
+                smr.inst.state,
+                smr.inst.state_name(),
+                speed
+            );
+        }
+        smr.was_graph_driven = !machine_driven;
+    }
+
     if let (Some(mut g), Some(ctx)) = (graph, anim_ctx) {
         let desired_speed = if sprint { t.sprint } else { t.run } * mag.min(1.0);
         let wl = (wdx * wdx + wdy * wdy).sqrt().max(1e-6);
@@ -1884,13 +2197,48 @@ fn move_player(
         // A one-shot transition state holds until its clip finishes; steady
         // states release their link immediately (engine's "can leave" check).
         let cur_one_shot = player.cur_layer.as_ref().map(|l| l.anim.one_shot).unwrap_or(false);
-        let step = if cur_one_shot { player.anim_finished } else { true };
-        g.0.update(&snap, motion_of, step);
+        let step = if machine_driven { true } else if cur_one_shot { player.anim_finished } else { true };
+        // The state machine's `AnimationGraphInput` actions overwrite graph
+        // inputs while it owns the character.
+        let overrides = if machine_driven { std::mem::take(&mut sm_agi) } else { Vec::new() };
+        let input_kinds: Vec<(String, sod_core::ag_runtime::InputKind)> = g
+            .0
+            .graph
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.kind.clone()))
+            .collect();
+        g.0.update_with_inputs(
+            &snap,
+            |values| {
+                for (name, num) in &overrides {
+                    match input_kinds.iter().find(|(n, _)| n == name) {
+                        Some((_, sod_core::ag_runtime::InputKind::Float { .. }))
+                        | Some((_, sod_core::ag_runtime::InputKind::Integer { .. })) => {
+                            values.set_number(name, *num)
+                        }
+                        Some((_, sod_core::ag_runtime::InputKind::Key { keys })) => {
+                            if let Some(k) = keys
+                                .iter()
+                                .find(|k| k.as_str() == "1" || k.eq_ignore_ascii_case("true"))
+                            {
+                                values.set_key(name, k);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            },
+            motion_of,
+            step,
+        );
         let idx_now = g.0.inst.current;
-        if idx_now != idx_before {
+        // While the machine owns the pose the graph keeps running (so its
+        // inputs stay warm) but must not steal the layer from the fragment.
+        if !machine_driven && (idx_now != idx_before || returning_to_graph) {
             if let Some(i) = idx_now {
                 player.ensure_state_anim(&g.0.graph, &ctx, i, &snap.stance, &snap.item);
-                let trans = g.0.inst.blend;
+                let trans = if returning_to_graph { g.0.inst.blend.max(0.12) } else { g.0.inst.blend };
                 player.switch_state(i, trans);
             }
             if std::env::var("SOD_AGDBG").is_ok() {
@@ -1901,33 +2249,36 @@ fn move_player(
             }
         }
         // Refresh the current layer's LocomotionGroup blend and playback rate
-        // from this frame's movement (requested speed/direction).
-        let lateral = if mag > 1e-4 { (strafe_l / mag).clamp(-1.0, 1.0) } else { 0.0 };
-        let gait = gait_param(actual_speed, &t);
-        if let Some(l) = player.cur_layer.as_mut() {
-            let n = l.anim.clips.len();
-            if n > 0 {
-                let w = if n == 1 {
-                    vec![1.0]
-                } else {
-                    sod_core::ag_driver::blend_weights_for(l.anim.blend_type.as_ref(), &l.anim.params, lateral, gait)
-                };
-                let mut wsum = 0.0f32;
-                for (i, c) in l.anim.clips.iter_mut().enumerate() {
-                    c.weight = w.get(i).copied().unwrap_or(1.0 / n as f32);
-                    wsum += c.weight.max(0.0);
+        // from this frame's movement (requested speed/direction). The machine's
+        // fragment layer is driven by its own one-shot/loop semantics instead.
+        if !machine_driven {
+            let lateral = if mag > 1e-4 { (strafe_l / mag).clamp(-1.0, 1.0) } else { 0.0 };
+            let gait = gait_param(actual_speed, &t);
+            if let Some(l) = player.cur_layer.as_mut() {
+                let n = l.anim.clips.len();
+                if n > 0 {
+                    let w = if n == 1 {
+                        vec![1.0]
+                    } else {
+                        sod_core::ag_driver::blend_weights_for(l.anim.blend_type.as_ref(), &l.anim.params, lateral, gait)
+                    };
+                    let mut wsum = 0.0f32;
+                    for (i, c) in l.anim.clips.iter_mut().enumerate() {
+                        c.weight = w.get(i).copied().unwrap_or(1.0 / n as f32);
+                        wsum += c.weight.max(0.0);
+                    }
+                    let ref_speed = if wsum > 1e-6 {
+                        l.anim.clips.iter().map(|c| c.weight.max(0.0) * c.speed).sum::<f32>() / wsum
+                    } else {
+                        0.0
+                    };
+                    l.anim.ref_speed = ref_speed;
+                    l.anim.rate = if l.anim.blend_type.is_some() && ref_speed > 0.1 && actual_speed > 0.05 {
+                        (l.anim.playback_speed * (actual_speed / ref_speed)).clamp(0.25, 2.5)
+                    } else {
+                        l.anim.playback_speed
+                    };
                 }
-                let ref_speed = if wsum > 1e-6 {
-                    l.anim.clips.iter().map(|c| c.weight.max(0.0) * c.speed).sum::<f32>() / wsum
-                } else {
-                    0.0
-                };
-                l.anim.ref_speed = ref_speed;
-                l.anim.rate = if l.anim.blend_type.is_some() && ref_speed > 0.1 && actual_speed > 0.05 {
-                    (l.anim.playback_speed * (actual_speed / ref_speed)).clamp(0.25, 2.5)
-                } else {
-                    l.anim.playback_speed
-                };
             }
         }
     }

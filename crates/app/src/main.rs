@@ -6,6 +6,7 @@
 //!   `sod-native <game> <model.cgf|.chr>` single asset
 
 mod cry_bridge;
+mod ai_bridge;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
@@ -889,6 +890,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if play {
         if let Some(h) = cry_host {
             cry_bridge::install(&mut app, h);
+            ai_bridge::install(&mut app);
             app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));
         }
         app.insert_resource(player_state);

@@ -23,6 +23,7 @@ pub mod phys_proxy;
 pub mod phys_world;
 pub mod render;
 pub mod world;
+pub mod zombie_runtime;
 pub mod zombie_spawn;
 
 pub use host::{Ctx, ScriptHost};

@@ -286,26 +286,34 @@ pub fn rolloff_from_mode(mode: u32) -> Rolloff {
 ///
 /// `min <= 0` is clamped to a tiny positive value so the inverse model cannot
 /// divide by zero; custom events (which ship `min = 0`) use the linear fallback
-/// and are unaffected.
+/// and are unaffected. A degenerate `max <= min` (the ambient volumes ship
+/// `min = max = 1`) falls back to FMOD's default maximum distance so the source
+/// is not faded to silence.
 pub fn attenuation(model: Rolloff, distance: f32, min: f32, max: f32) -> f32 {
     let min = min.max(0.0);
-    let max = if max > min { max } else { min + 1e-3 };
     let d = distance.max(0.0);
     if d <= min {
         return 1.0;
     }
-    let linear_nd = ((d.min(max) - min) / (max - min)).clamp(0.0, 1.0);
+    // A degenerate authored range (`max <= min`, e.g. the ambient volumes ship
+    // `min = max = 1`) would collapse a fade-to-zero model to zero width. The
+    // inverse models already hold near full volume in that case, so only the
+    // fade-to-zero models fall back to FMOD's default maximum distance (10000)
+    // to keep the source audible.
+    let span_max = if max > min { max } else { min + 1e-3 };
+    let fade_max = if max > min { max } else { 10000.0_f32.max(min + 1.0) };
+    let linear_nd = ((d.min(fade_max) - min) / (fade_max - min)).clamp(0.0, 1.0);
     match model {
         Rolloff::Inverse => {
             let m = if min > 1e-4 { min } else { 1e-4 };
-            let dc = d.min(max);
+            let dc = d.min(span_max);
             m / (m + (dc - m).max(0.0))
         }
         Rolloff::Linear | Rolloff::Custom => 1.0 - linear_nd,
         Rolloff::LinearSquared => (1.0 - linear_nd).powi(2),
         Rolloff::InverseTapered => {
             let m = if min > 1e-4 { min } else { 1e-4 };
-            let inv = m / (m + (d.min(max) - m).max(0.0));
+            let inv = m / (m + (d.min(span_max) - m).max(0.0));
             inv.min((1.0 - linear_nd).powi(2))
         }
     }

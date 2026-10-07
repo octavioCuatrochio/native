@@ -40,6 +40,93 @@ pub struct CryStats {
     pub missing_binds: usize,
 }
 
+/// The listener the audio thread mixes for (CryEngine space), written by the
+/// camera each frame.
+#[derive(Resource, Clone)]
+pub struct CryListener(pub std::sync::Arc<std::sync::Mutex<sod_core::audio_play::Listener>>);
+
+/// Keeps the audio output stream alive (cpal streams are not `Send`).
+pub struct AudioOut(#[allow(dead_code)] cpal::Stream);
+
+/// Open the default output device and attach a sound system at its rate.
+/// `SOD_MUTE=1` disables audio.
+fn open_audio(host: &ScriptHost) -> Option<(AudioOut, CryListener)> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::{Arc, Mutex};
+    if std::env::var("SOD_MUTE").is_ok() {
+        return None;
+    }
+    let device = cpal::default_host().default_output_device()?;
+    let config = device.default_output_config().ok()?;
+    let rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+    let system = Arc::new(Mutex::new(sod_core::audio_play::SoundSystem::new(rate)));
+    host.attach_audio(system.clone());
+    let listener = Arc::new(Mutex::new(sod_core::audio_play::Listener {
+        position: [0.0; 3],
+        forward: [0.0, 1.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+    }));
+    let (sys, lis) = (system, listener.clone());
+    // SOD_AUDIODBG=1: once per second, report how many voices mixed and the
+    // loudest sample seen, so audio activity is provable without listening.
+    let dbg = std::env::var("SOD_AUDIODBG").is_ok();
+    let mut dbg_frames: u64 = 0;
+    let mut dbg_blocks: u64 = 0;
+    let mut dbg_voices: usize = 0;
+    let mut dbg_peak: f32 = 0.0;
+    let stream = device
+        .build_output_stream(
+            &config.config(),
+            move |out: &mut [f32], _| {
+                let frames = out.len() / channels.max(1);
+                let l = lis.lock().map(|l| l.clone()).ok();
+                let (mix, voices) = match (sys.lock(), l) {
+                    (Ok(mut s), Some(l)) => {
+                        let mix = s.render(frames, &l);
+                        let n = s.voice_count();
+                        (mix, n)
+                    }
+                    _ => (vec![0.0; frames * 2], 0),
+                };
+                if dbg {
+                    dbg_frames += frames as u64;
+                    dbg_blocks += 1;
+                    dbg_voices = dbg_voices.max(voices);
+                    for &s in &mix {
+                        dbg_peak = dbg_peak.max(s.abs());
+                    }
+                    if dbg_frames >= rate as u64 {
+                        eprintln!(
+                            "[audiodbg] {:>5} Hz | voices={} peak={:.5} blocks={}",
+                            rate, dbg_voices, dbg_peak, dbg_blocks
+                        );
+                        dbg_frames = 0;
+                        dbg_blocks = 0;
+                        dbg_voices = 0;
+                        dbg_peak = 0.0;
+                    }
+                }
+                for (f, frame) in out.chunks_mut(channels.max(1)).enumerate() {
+                    let (lv, rv) = (mix.get(2 * f).copied().unwrap_or(0.0), mix.get(2 * f + 1).copied().unwrap_or(0.0));
+                    for (c, sample) in frame.iter_mut().enumerate() {
+                        *sample = match c {
+                            0 => lv,
+                            1 => rv,
+                            _ => 0.5 * (lv + rv),
+                        };
+                    }
+                }
+            },
+            |e| eprintln!("[audio] stream error: {e}"),
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    println!("[audio] output {rate} Hz, {channels} ch on '{}'", device.name().unwrap_or_default());
+    Some((AudioOut(stream), CryListener(listener)))
+}
+
 /// Whether the script layer is enabled (`SOD_CRY=0` disables it).
 pub fn enabled() -> bool {
     !std::env::var("SOD_CRY").map(|v| v == "0").unwrap_or(false)
@@ -109,6 +196,10 @@ pub fn build_host(game_dir: &str, spawn: [f32; 3]) -> Option<CryHost> {
 /// Register the booted host and its per-frame systems with the app.
 pub fn install(app: &mut App, host: CryHost) {
     app.init_resource::<CryPlayerPos>().init_resource::<CryStats>();
+    if let Some((out, listener)) = open_audio(&host.host) {
+        app.insert_non_send_resource(out);
+        app.insert_resource(listener);
+    }
     app.insert_non_send_resource(host);
     app.configure_sets(Update, (CrySet::Sync, CrySet::Tick).chain());
     app.add_systems(Update, cry_tick.in_set(CrySet::Tick));

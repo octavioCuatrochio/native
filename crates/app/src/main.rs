@@ -1601,6 +1601,7 @@ fn follow_camera(
     cam_state: Option<ResMut<CameraStateRes>>,
     lag: Option<ResMut<CamLagRes>>,
     mut cam: Query<&mut Transform, (With<MainCamera>, Without<PlayerRoot>)>,
+    listener: Option<Res<cry_bridge::CryListener>>,
 ) {
     let Some(player) = player else { return };
     let Some(mut cs) = cam_state else { return };
@@ -1646,6 +1647,17 @@ fn follow_camera(
     let tgt = base_rot * Vec3::new(target[0], target[1], target[2]);
     for mut tr in &mut cam {
         *tr = Transform::from_translation(pos).looking_at(tgt, Vec3::Y);
+    }
+    // Audio listener = the camera, in CryEngine space (Z-up).
+    if let Some(l) = listener {
+        let to_cry = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let fwd = to_cry * (tgt - pos).normalize_or_zero();
+        let up = to_cry * Vec3::Y;
+        if let Ok(mut li) = l.0.lock() {
+            li.position = cam_pos;
+            li.forward = fwd.to_array();
+            li.up = up.to_array();
+        }
     }
 }
 

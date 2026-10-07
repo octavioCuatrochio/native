@@ -474,9 +474,9 @@ pub fn build_ground_albedo(
 //
 //   * [`resolve_ground_layers`] collapses the level palette to the distinct
 //     coloured ground images and an id -> layer-index table;
-//   * [`build_terrain_layer_map`] bakes a cheap *categorical* per-texel map
-//     (top-2 layer indices + blend weight) with no colour sampling, so it
-//     cannot alias;
+//   * [`build_terrain_layer_weights`] bakes a continuous per-sample weight for
+//     every layer (no colour sampling, so it cannot alias), which the shader
+//     filters and blends per pixel;
 //   * [`decode_layer_array`] / [`generate_layer_mips`] build the 2D texture
 //     array the shader samples at `world_xy * tile`, giving correct
 //     minification filtering.
@@ -540,77 +540,103 @@ pub fn resolve_ground_layers(types: &[SurfaceType]) -> GroundLayerSet {
     GroundLayerSet { paths, tiles, index_by_id }
 }
 
-/// Bake the per-texel ground-layer map the terrain shader indexes into.
+/// Bake the continuous per-layer coverage weights the terrain shader blends.
 ///
-/// One output texel per terrain sample: `R` = dominant layer, `G` = second
-/// layer, `B` = weight of the second layer (0..255), `A` = 255. The dominant
-/// pair is chosen by voting over a `(2*radius+1)²` sample neighbourhood, which
-/// smooths the categorical surface data into continuous blend weights at layer
-/// boundaries (the shipping engine's per-pixel layer blending). No colour is
-/// sampled, so there is no aliasing.
+/// One `u8` per terrain sample per ground layer, layer-major:
+/// `data[l * s * s + j * s + i]` is ground layer `l`'s weight at sample
+/// `(i, j)` (`0` absent, `255` full). Every valid sample casts a one-hot vote
+/// for its surface's layer; the votes are then box-blurred over a
+/// `(2*radius+1)²` sample neighbourhood, so a categorical boundary (the terrain
+/// file stores exactly one surface id per sample) becomes a continuous ramp a
+/// few cells wide. The terrain material samples this with bilinear filtering and
+/// blends *every* layer by its interpolated weight, so neighbouring surface ids
+/// fade into each other instead of meeting at a hard cell edge.
 ///
-/// Returns `(samples, samples, rgba)` or `None` for degenerate terrain.
-pub fn build_terrain_layer_map(
+/// This mirrors the shipping engine, whose `Terrain.Layer` materials blend per
+/// pixel from an interpolated per-vertex surface-type weight
+/// (`saturate(1 - |surfaceType - layerType|)` in `terrain.cfx`): the layer weight
+/// is interpolated across the terrain grid rather than switched at a border.
+///
+/// [`terrain::SURFACE_UNDEFINED`] and ids with no ground layer vote for nothing,
+/// but pick up weight from valid neighbours after the blur. Returns
+/// `(samples, samples, layer-major weights)` or `None` for degenerate terrain or
+/// an empty layer set. Never panics.
+pub fn build_terrain_layer_weights(
     ter: &terrain::Terrain,
     set: &GroundLayerSet,
+    radius: usize,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let s = ter.samples;
-    if s == 0 || ter.surfaces.len() < s.checked_mul(s)? || set.paths.is_empty() {
+    if s == 0 || set.paths.is_empty() || ter.surfaces.len() < s.checked_mul(s)? {
         return None;
     }
-    if set.paths.len() > 255 {
-        return None;
-    }
-    let radius: isize = 2;
-    let mut out = vec![0u8; s * s * 4];
-    // Votes per layer for the current texel (bounded: the level palette never
-    // exceeds a few dozen distinct ground images).
-    let mut counts = vec![0u32; set.paths.len()];
-    for j in 0..s {
-        for i in 0..s {
-            for c in counts.iter_mut() {
-                *c = 0;
-            }
-            for dj in -radius..=radius {
-                let jj = (j as isize + dj).clamp(0, s as isize - 1) as usize;
-                for di in -radius..=radius {
-                    let ii = (i as isize + di).clamp(0, s as isize - 1) as usize;
-                    let id = ter.surfaces[jj * s + ii];
-                    if id == terrain::SURFACE_UNDEFINED {
-                        continue;
-                    }
-                    let li = set.layer_of(id);
-                    if li != SURFACE_LAYER_NONE {
-                        counts[li as usize] += 1;
-                    }
-                }
-            }
-            let (mut a, mut b) = (0u8, 0u8);
-            let (mut ca, mut cb) = (0u32, 0u32);
-            for (li, &c) in counts.iter().enumerate() {
-                if c > ca {
-                    b = a;
-                    cb = ca;
-                    a = li as u8;
-                    ca = c;
-                } else if c > cb {
-                    b = li as u8;
-                    cb = c;
-                }
-            }
-            let o = (j * s + i) * 4;
-            if ca == 0 {
-                out[o + 3] = 255;
-                continue;
-            }
-            let w = cb as f32 / (ca + cb) as f32;
-            out[o] = a;
-            out[o + 1] = b;
-            out[o + 2] = (w * 255.0 + 0.5) as u8;
-            out[o + 3] = 255;
+    let layers = set.paths.len();
+    let plane = s * s;
+    let mut data = vec![0u8; layers.checked_mul(plane)?];
+    for (idx, &id) in ter.surfaces.iter().take(plane).enumerate() {
+        if id == terrain::SURFACE_UNDEFINED {
+            continue;
+        }
+        let li = set.layer_of(id);
+        if li != SURFACE_LAYER_NONE && (li as usize) < layers {
+            data[li as usize * plane + idx] = 255;
         }
     }
-    Some((s as u32, s as u32, out))
+    if radius > 0 {
+        let side = 2 * radius + 1;
+        let inv = 1.0f32 / (side * side) as f32;
+        let mut tmp = vec![0u16; plane];
+        for l in 0..layers {
+            let base = l * plane;
+            box_blur_h(&data[base..base + plane], s, radius, &mut tmp);
+            box_blur_v(&tmp, s, radius, inv, &mut data[base..base + plane]);
+        }
+    }
+    Some((s as u32, s as u32, data))
+}
+
+/// Horizontal `(2*radius+1)`-tap box sum of a square `u8` plane, edge-clamped.
+fn box_blur_h(src: &[u8], s: usize, radius: usize, dst: &mut [u16]) {
+    let side = 2 * radius + 1;
+    let last = s - 1;
+    for y in 0..s {
+        let row = y * s;
+        let mut sum = 0u32;
+        for k in 0..side {
+            let x = (k as isize - radius as isize).clamp(0, last as isize) as usize;
+            sum += src[row + x] as u32;
+        }
+        dst[row] = sum as u16;
+        for x in 1..s {
+            let add = (x + radius).min(last);
+            let rem = (x - 1).saturating_sub(radius).min(last);
+            sum += src[row + add] as u32;
+            sum -= src[row + rem] as u32;
+            dst[row + x] = sum as u16;
+        }
+    }
+}
+
+/// Vertical `(2*radius+1)`-tap box average over a square `u16` sum plane.
+/// `inv` must be `1 / (2*radius+1)²` so the result is the 2D box mean.
+fn box_blur_v(src: &[u16], s: usize, radius: usize, inv: f32, dst: &mut [u8]) {
+    let side = 2 * radius + 1;
+    let last = s - 1;
+    for x in 0..s {
+        let mut sum = 0u32;
+        for k in 0..side {
+            let y = (k as isize - radius as isize).clamp(0, last as isize) as usize;
+            sum += src[y * s + x] as u32;
+        }
+        dst[x] = (sum as f32 * inv + 0.5).clamp(0.0, 255.0) as u8;
+        for y in 1..s {
+            let add = (y + radius).min(last);
+            let rem = (y - 1).saturating_sub(radius).min(last);
+            sum += src[add * s + x] as u32;
+            sum -= src[rem * s + x] as u32;
+            dst[y * s + x] = (sum as f32 * inv + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 /// Bilinearly resample a decoded RGBA image into `dst` (`size * size * 4`).
@@ -1044,33 +1070,63 @@ mod tests {
     }
 
     #[test]
-    fn layer_map_blends_two_neighbouring_layers() {
+    fn layer_weights_are_one_hot_without_blur() {
         let types = parse_surface_types(SAMPLE.as_bytes());
         let set = resolve_ground_layers(&types);
         let ter = tiny_terrain(); // 4x4, top half id4 grass, bottom half id6 asphalt
-        let (w, h, map) = build_terrain_layer_map(&ter, &set).expect("layer map");
+        let plane = 4 * 4;
+        let (w, h, data) = build_terrain_layer_weights(&ter, &set, 0).expect("weights");
         assert_eq!((w, h), (4, 4));
-        assert_eq!(map.len(), 4 * 4 * 4);
+        assert_eq!(data.len(), set.len() * plane);
 
-        let grass = set.layer_of(4);
-        let asphalt = set.layer_of(6);
-        let mut saw_grass = false;
-        let mut saw_asphalt = false;
-        let mut saw_blend = false;
-        for px in map.chunks(4) {
-            let (a, b, wb) = (px[0], px[1], px[2]);
-            assert_eq!(px[3], 255);
-            assert!(a == grass || a == asphalt || b == grass || b == asphalt);
-            saw_grass |= a == grass || b == grass;
-            saw_asphalt |= a == asphalt || b == asphalt;
-            if wb > 0 && wb < 255 {
-                saw_blend = true;
+        let grass = set.layer_of(4) as usize;
+        let asphalt = set.layer_of(6) as usize;
+        for idx in 0..plane {
+            let top = idx < plane / 2;
+            assert_eq!(data[grass * plane + idx], if top { 255 } else { 0 });
+            assert_eq!(data[asphalt * plane + idx], if top { 0 } else { 255 });
+            for l in 0..set.len() {
+                if l != grass && l != asphalt {
+                    assert_eq!(data[l * plane + idx], 0, "layer {l} texel {idx}");
+                }
             }
         }
-        // Both surfaces appear, and the 5x5 vote smooths the row boundary into
-        // at least one fractional (blended) weight.
-        assert!(saw_grass && saw_asphalt, "both layers should be present");
-        assert!(saw_blend, "expected a blended boundary texel");
+    }
+
+    #[test]
+    fn layer_weights_blur_the_boundary_to_a_continuous_ramp() {
+        let types = parse_surface_types(SAMPLE.as_bytes());
+        let set = resolve_ground_layers(&types);
+        let ter = tiny_terrain();
+        let plane = 4 * 4;
+        let (_, _, data) = build_terrain_layer_weights(&ter, &set, 1).expect("weights");
+
+        let grass = set.layer_of(4) as usize;
+        let asphalt = set.layer_of(6) as usize;
+        let mut saw_fraction = false;
+        for idx in 0..plane {
+            let sum: u32 = (0..set.len()).map(|l| data[l * plane + idx] as u32).sum();
+            assert!(sum > 0, "every texel keeps a layer");
+            let g = data[grass * plane + idx];
+            let a = data[asphalt * plane + idx];
+            if g > 0 && g < 255 && a > 0 && a < 255 {
+                saw_fraction = true;
+            }
+        }
+        // The 3-tap blur turns the sharp row split into fractional weights on
+        // both sides, which the GPU then interpolates per pixel.
+        assert!(saw_fraction, "expected a fractional grass/asphalt boundary");
+    }
+
+    #[test]
+    fn layer_weights_are_total_for_degenerate_input() {
+        let set = resolve_ground_layers(&parse_surface_types(SAMPLE.as_bytes()));
+        let mut ter = tiny_terrain();
+        ter.samples = 0;
+        assert!(build_terrain_layer_weights(&ter, &set, 2).is_none());
+        // Empty layer set: no layers to weight.
+        let empty = GroundLayerSet { paths: Vec::new(), tiles: Vec::new(), index_by_id: [SURFACE_LAYER_NONE; 256] };
+        assert!(build_terrain_layer_weights(&tiny_terrain(), &empty, 2).is_none());
     }
 
     #[test]
@@ -1103,18 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_map_is_total_for_degenerate_input() {
-        let set = resolve_ground_layers(&parse_surface_types(SAMPLE.as_bytes()));
-        let mut ter = tiny_terrain();
-        ter.samples = 0;
-        assert!(build_terrain_layer_map(&ter, &set).is_none());
-        // Empty layer set: no layers to map.
-        let empty = GroundLayerSet { paths: Vec::new(), tiles: Vec::new(), index_by_id: [SURFACE_LAYER_NONE; 256] };
-        assert!(build_terrain_layer_map(&tiny_terrain(), &empty).is_none());
-    }
-
-    #[test]
-    fn layer_map_decodes_real_palette_if_present() {
+    fn layer_weights_decode_real_palette_if_present() {
         let level = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted-game/level/leveldata.xml");
         let Ok(bytes) = std::fs::read(level) else { return };
         let types = parse_surface_types(&bytes);

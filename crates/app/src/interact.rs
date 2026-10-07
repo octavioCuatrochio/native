@@ -11,13 +11,55 @@
 //!
 //! The engine side (data, tables, inventory, `ItemSystem` binds) lives in
 //! `sod_core::cry::items`. This module only wires it to Bevy + the `ScriptHost`.
+//!
+//! ## Models
+//!
+//! `ul_searchable.lua` is a two-slot prop: `LoadObject(NotSearchedSlot,
+//! Properties.object_ModelNotSearched)` and `LoadObject(SearchedSlot,
+//! Properties.object_ModelSearched)`, with `DrawSlot` hiding one slot and
+//! showing the other per state (`NotSearched` draws slot 0, `Searched` slot 1).
+//! The RTS layer fills those two properties per prop from
+//! `libs/class3/rts/props.xml` (`base` before searching, `depleted` after,
+//! matching the class defaults). The native RTS stand-in here resolves the
+//! prop's models from that same table and renders both variants from the shared
+//! [`crate::PropAssets`] handles the level pipeline already built, swapping them
+//! on the script's `Searched` transition. No placeholder geometry, no tint.
+//!
+//! Note: the app's `EntityNative` geometry binds (`LoadObject`/`DrawSlot`) are
+//! stubs in `sod_core`, so the script's slot state is not projected into the
+//! entity world and drawn generically; this module mirrors the exact two-slot
+//! semantics the script expresses, using the same models and the same draw
+//! order the class defines.
 
 use bevy::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use sod_core::cry::items::{self, ItemRuntime, SearchSession, BASE_BACKPACK_CAPACITY, SEARCH_REACH};
 use sod_core::cry::world::EntityId;
+use sod_core::crypak::Vfs;
+
+/// Shipped RTS prop → model table (the prop distribution reads it alongside
+/// `Search.xml`; see `notes/ghidra/rts-sim.md`).
+const PROPS_XML: &str = "libs/class3/rts/props.xml";
+
+/// `ul_searchable.lua`'s class defaults, used when a prop has no `props.xml`
+/// entry (the script would keep these values).
+const DEFAULT_NOT_SEARCHED: &str =
+    "objects/decor/resources/resource_food/food_cooler_chest/food_cooler_chest.cgf";
+const DEFAULT_SEARCHED: &str =
+    "objects/decor/resources/resource_food/food_cooler_chest/food_cooler_chest_depleted.cgf";
+
+/// The original RTS generates `UL_Searchable` props from buildings at runtime;
+/// the shipped level has no authored instances (see `/tmp/opencode-g1/REPORT.md`).
+/// This is the native stand-in, placing the real `.ent` class at the tutorial
+/// start bound to real `search.xml` site/prop pairs.
+const SPAWN_SPECS: [(&str, &str, &str, f32, f32); 3] = [
+    ("UL_Searchable_Cooler", "Any", "CoolerChest", 2.0, 0.0),
+    ("UL_Searchable_Cabinet", "Any", "Cabinet", 2.6, 1.0),
+    ("UL_Searchable_Crate", "Any", "Crate", 3.0, -1.0),
+];
 
 /// One searchable container the interaction loop knows about.
 struct Container {
@@ -27,11 +69,10 @@ struct Container {
     /// CryEngine-space (Z-up) position, for the proximity check.
     pos: [f32; 3],
     searched: bool,
-    /// Presentation stand-in for the container model (the app does not draw
-    /// `ScriptHost` slots yet); recoloured when the script state changes.
-    #[allow(dead_code)]
-    marker: Entity,
-    marker_mat: Handle<StandardMaterial>,
+    /// `NotSearched` slot meshes (`DrawSlot(0, 1)`).
+    not_searched: Vec<Entity>,
+    /// `Searched` slot meshes (`DrawSlot(1, 1)`).
+    searched_slot: Vec<Entity>,
 }
 
 /// Interaction state. Non-send because the shared item runtime owns a
@@ -46,6 +87,9 @@ struct InteractState {
     notice: Option<(String, f32)>,
     spawned: bool,
     cooldown: f32,
+    /// `propId` (lowercase) -> (`object_ModelNotSearched`, `object_ModelSearched`),
+    /// from `props.xml`.
+    prop_models: HashMap<String, (String, String)>,
 }
 
 /// Registers the interaction loop and installs the `ItemSystem` script binds.
@@ -57,13 +101,20 @@ pub struct InteractPlugin;
 
 impl Plugin for InteractPlugin {
     fn build(&self, app: &mut App) {
-        let (rt, player) = match app.world().get_non_send::<crate::cry_bridge::CryHost>() {
+        let (rt, player, prop_models) = match app.world().get_non_send::<crate::cry_bridge::CryHost>() {
             Some(host) => {
+                let prop_models = host
+                    .host
+                    .ctx
+                    .vfs
+                    .read(PROPS_XML)
+                    .map(|b| parse_props_xml(&b))
+                    .unwrap_or_default();
                 let rt = Rc::new(RefCell::new(ItemRuntime::load(host.host.ctx.vfs.clone())));
                 if let Err(e) = items::install(&host.host.lua, &host.host.ctx, rt.clone()) {
                     eprintln!("[interact] ItemSystem install failed: {e}");
                 }
-                (rt, Some(host.player as u64))
+                (rt, Some(host.player as u64), prop_models)
             }
             None => (
                 Rc::new(RefCell::new(ItemRuntime::new(
@@ -73,6 +124,7 @@ impl Plugin for InteractPlugin {
                     0x5eed_1234_9abc_def0,
                 ))),
                 None,
+                HashMap::new(),
             ),
         };
 
@@ -105,6 +157,7 @@ impl Plugin for InteractPlugin {
             notice: None,
             spawned: false,
             cooldown: 0.0,
+            prop_models,
         });
         app.add_systems(
             Update,
@@ -117,20 +170,65 @@ impl Plugin for InteractPlugin {
     }
 }
 
+/// `propId` -> (`object_ModelNotSearched`, `object_ModelSearched`) for every
+/// self-closing `<Prop>` in `props.xml`. The first entry for a `propId` wins.
+fn parse_props_xml(bytes: &[u8]) -> HashMap<String, (String, String)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = HashMap::new();
+    let mut rest: &str = &text;
+    while let Some(i) = rest.find("<Prop") {
+        let after = &rest[i..];
+        let Some(end) = after.find('>') else { break };
+        let tag = &after[..=end];
+        if let (Some(prop), Some(base)) = (attr(tag, "propId"), attr(tag, "base")) {
+            let searched = attr(tag, "depleted").unwrap_or(base);
+            out.entry(prop.to_ascii_lowercase())
+                .or_insert_with(|| (base.to_string(), searched.to_string()));
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// Value of `name="..."` inside a single XML tag.
+fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let pat = format!("{name}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let end = tag[start..].find('"')? + start;
+    Some(&tag[start..end])
+}
+
+/// The `props.xml` model paths the native searchables need, so the level build
+/// can decode their meshes/materials before the runtime spawn (see
+/// `main.rs`'s `run_world`). Includes the class defaults as a fallback.
+pub fn searchable_wanted_models(vfs: &Vfs) -> Vec<String> {
+    let map = vfs.read(PROPS_XML).map(|b| parse_props_xml(&b)).unwrap_or_default();
+    let mut out = vec![DEFAULT_NOT_SEARCHED.to_string(), DEFAULT_SEARCHED.to_string()];
+    for (_, _, prop, _, _) in SPAWN_SPECS {
+        if let Some((not_searched, searched)) = map.get(&prop.to_ascii_lowercase()) {
+            out.push(not_searched.clone());
+            out.push(searched.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Spawn the searchable containers once the player exists.
 ///
 /// The shipped level has no authored `UL_Searchable` entities (the RTS layer
 /// generates them from buildings at runtime), so this places the original
-/// class near the player start, bound to real `search.xml` props.
+/// class near the player start, bound to real `search.xml` props and to their
+/// `props.xml` models (drawn from the level's own asset handles).
 fn interact_spawn(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     player: Option<Res<crate::Player>>,
+    assets: Option<Res<crate::PropAssets>>,
     cry: Option<NonSendMut<crate::cry_bridge::CryHost>>,
     state: Option<NonSendMut<InteractState>>,
 ) {
-    let (Some(player), Some(mut cry), Some(mut state)) = (player, cry, state) else { return };
+    let (Some(player), Some(assets), Some(mut cry), Some(mut state)) = (player, assets, cry, state) else { return };
     if state.spawned {
         return;
     }
@@ -138,32 +236,72 @@ fn interact_spawn(
     let (s, co) = (player.yaw.sin(), player.yaw.cos());
     let fwd = [co, s];
     let right = [-s, co];
-    let specs: [(&str, &str, &str, f32, f32); 3] = [
-        ("UL_Searchable_Cooler", "Any", "CoolerChest", 2.0, 0.0),
-        ("UL_Searchable_Cabinet", "Any", "Cabinet", 2.6, 1.0),
-        ("UL_Searchable_Crate", "Any", "Crate", 3.0, -1.0),
-    ];
-    let mesh = meshes.add(Cuboid::new(0.7, 0.9, 0.7));
-    for (name, site, prop, dist, side) in specs {
+    for (name, site, prop, dist, side) in SPAWN_SPECS {
         let pos = [p[0] + fwd[0] * dist + right[0] * side, p[1] + fwd[1] * dist + right[1] * side, p[2]];
+        let (not_searched_path, searched_path) = state
+            .prop_models
+            .get(&prop.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| (DEFAULT_NOT_SEARCHED.to_string(), DEFAULT_SEARCHED.to_string()));
         match items::spawn_searchable(&mut cry.host, name, pos, site, prop) {
             Ok(id) => {
-                // Marker sits on the ground where the script entity is.
-                let bevy_pos = crate::base_rot() * Vec3::new(pos[0], pos[1], pos[2] + 0.45);
-                let mat = materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.55, 0.42, 0.30),
-                    perceptual_roughness: 0.9,
-                    ..default()
+                // Model root at the container's world transform. CryEngine Z-up
+                // maps to Bevy Y-up through `base_rot`, as the level root does.
+                let root = commands
+                    .spawn((
+                        Transform {
+                            translation: crate::base_rot() * Vec3::new(pos[0], pos[1], pos[2]),
+                            rotation: crate::base_rot(),
+                            scale: Vec3::ONE,
+                        },
+                        Visibility::default(),
+                    ))
+                    .id();
+                let mut not_searched = Vec::new();
+                let mut searched_slot = Vec::new();
+                commands.entity(root).with_children(|parent| {
+                    // NotSearched.OnBeginState: DrawSlot(0, 1), DrawSlot(1, 0).
+                    if let Some(list) = assets.0.get(&not_searched_path) {
+                        for (mesh, mat) in list {
+                            not_searched.push(
+                                parent
+                                    .spawn((
+                                        Mesh3d(mesh.clone()),
+                                        MeshMaterial3d(mat.clone()),
+                                        Transform::default(),
+                                        Visibility::Visible,
+                                    ))
+                                    .id(),
+                            );
+                        }
+                    }
+                    // Searched.OnBeginState: DrawSlot(0, 0), DrawSlot(1, 1).
+                    if let Some(list) = assets.0.get(&searched_path) {
+                        for (mesh, mat) in list {
+                            searched_slot.push(
+                                parent
+                                    .spawn((
+                                        Mesh3d(mesh.clone()),
+                                        MeshMaterial3d(mat.clone()),
+                                        Transform::default(),
+                                        Visibility::Hidden,
+                                    ))
+                                    .id(),
+                            );
+                        }
+                    }
                 });
-                let marker = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::from_translation(bevy_pos))).id();
+                if not_searched.is_empty() && searched_slot.is_empty() {
+                    eprintln!("[interact] {name}: no meshes for {not_searched_path} / {searched_path}");
+                }
                 state.containers.push(Container {
                     id,
                     site: site.to_string(),
                     prop: prop.to_string(),
                     pos,
                     searched: false,
-                    marker,
-                    marker_mat: mat,
+                    not_searched,
+                    searched_slot,
                 });
             }
             Err(e) => eprintln!("[interact] spawn {name} failed: {e}"),
@@ -176,15 +314,15 @@ fn interact_spawn(
 /// The per-frame interaction loop: pick the nearest container in front of the
 /// player, run the hold-to-search timer and complete the search.
 fn interact_update(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     menu: Option<Res<crate::MenuRes>>,
     player: Option<Res<crate::Player>>,
     cry: Option<NonSendMut<crate::cry_bridge::CryHost>>,
     state: Option<NonSendMut<InteractState>>,
 ) {
-    let (Some(player), Some(mut cry), Some(mut state)) = (player, cry, state) else { return };
+    let (Some(player), Some(cry), Some(mut state)) = (player, cry, state) else { return };
     if state.player == 0 {
         return;
     }
@@ -264,14 +402,17 @@ fn interact_update(
             let (site, prop) = (state.containers[idx].site.clone(), state.containers[idx].prop.clone());
             let loot = state.rt.borrow_mut().complete_search(state.player, &site, &prop);
             // The flowgraph `Searched` input calls `UL_Searchable.Event_Searched`,
-            // which runs `GotoState("Searched")` (model swap).
+            // which runs `GotoState("Searched")` and swaps the drawn slot.
             let _ = cry.host.callback(state.containers[idx].id, "Event_Searched");
             state.containers[idx].searched = true;
             state.session = None;
             state.cooldown = items::SR_COOLDOWN_DURATION;
-            // Visual stand-in for the `Searched` model swap.
-            if let Some(mut m) = materials.get_mut(&state.containers[idx].marker_mat) {
-                m.base_color = Color::srgb(0.28, 0.30, 0.32);
+            // `Searched.OnBeginState`: DrawSlot(0, 0), DrawSlot(1, 1).
+            for e in &state.containers[idx].not_searched {
+                commands.entity(*e).insert(Visibility::Hidden);
+            }
+            for e in &state.containers[idx].searched_slot {
+                commands.entity(*e).insert(Visibility::Visible);
             }
 
             let items_txt: Vec<String> = loot.items.iter().map(|s| format!("{} x{}", s.id, s.count)).collect();

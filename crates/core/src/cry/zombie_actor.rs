@@ -55,6 +55,8 @@
 
 use super::phys_world::CollisionWorld;
 
+pub mod variant;
+
 /// `BasicActor` stand-stance capsule radius (`size.x`).
 pub const DEFAULT_RADIUS: f32 = 0.375;
 /// `BasicActor` stand-stance `size.z` (step-over height).
@@ -123,16 +125,14 @@ pub struct CharacterDef {
     pub parts: &'static [(&'static str, &'static str)],
 }
 
-/// The male zombie body fragments the `ZombieVariant` "noshirt" type composes
-/// (`body/noshirt02` + `legs/jeans` + `heads/head01`). The body mesh alone has
-/// no shins (that region comes from the jeans), so it must not be drawn alone.
-const GRUNT_PARTS: &[(&str, &str)] = &[
-    ("body", "characters/male/zombie/body/noshirt02/noshirt02.chr"),
-    ("legs", "characters/male/zombie/legs/jeans/jeans.chr"),
-    ("head", "characters/male/zombie/heads/head01/head01.chr"),
-];
-
 /// Map a `ZombieTypes.xml` `EntityClass` to its character asset and rig.
+///
+/// Freaks name a self-contained `.cdf`/`.chr` in their scripts and are loaded
+/// directly. The humanoid classes (`Grunt`, `FreshGrunt`) have an empty
+/// `fileModel`: the engine composes them at spawn from `ZombieVariant.xml`
+/// (see [`variant`]). Their `path` here is the shipped body `.cdf`, kept only
+/// for logging and as a last-resort probe; geometry comes from
+/// [`variant::pick_for_class`].
 pub fn character_for_class(entity_class: &str) -> CharacterDef {
     match entity_class {
         "ArmyZombie" | "SwatZombie" => CharacterDef {
@@ -168,13 +168,13 @@ pub fn character_for_class(entity_class: &str) -> CharacterDef {
             parts: &[],
         },
         // Grunt / FreshGrunt: the ZombieVariant system assembles a civilian at
-        // spawn from separate body/legs/head meshes. `path` stays the shipped
-        // body CDF (used for logging/tests); rendering uses `parts`.
+        // spawn from separate per-slot meshes. `path` stays the shipped body CDF
+        // (used for logging/tests only); geometry comes from `variant`.
         _ => CharacterDef {
             path: "characters/male/zombie/body/noshirt_jeans/noshirt_jeans.cdf",
             rig: "zombie_male",
-            skeleton: "characters/male/zombie/skeleton/skeleton.chr",
-            parts: GRUNT_PARTS,
+            skeleton: "",
+            parts: &[],
         },
     }
 }
@@ -294,12 +294,10 @@ mod tests {
         let grunt = character_for_class("Grunt");
         assert!(grunt.path.ends_with(".cdf"));
         assert_eq!(grunt.rig, "zombie_male");
-        // The ambient grunt is assembled from the ZombieVariant fragments
-        // (body + legs + head) against the shared zombie rig, because no single
-        // shipped `.cdf` is a complete body.
-        assert_eq!(grunt.parts.len(), 3, "grunt body/legs/head fragments");
-        assert!(grunt.parts.iter().any(|(n, _)| *n == "legs"));
-        assert!(grunt.skeleton.ends_with("zombie/skeleton/skeleton.chr"));
+        // The ambient grunt is composed at spawn from `ZombieVariant.xml`, not
+        // from a fixed fragment list on the class map.
+        assert!(variant::is_variant_class("Grunt"));
+        assert!(grunt.parts.is_empty(), "grunt geometry comes from ZombieVariant");
         // Every freak maps to its own complete asset (no explicit parts).
         for (class, needle, rig) in [
             ("ArmyZombie", "armored", "freaks/armored"),

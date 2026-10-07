@@ -37,6 +37,7 @@ use sod_core::game::ZombieKind;
 use sod_core::cry::navmesh::{self, NavMesh};
 use sod_core::cry::phys_world::CollisionWorld;
 use sod_core::cry::world::EntityId;
+use sod_core::cry::zombie_actor::variant::{self, Appearance, VariantData};
 use sod_core::cry::zombie_actor::{self, Body};
 use sod_core::cry::zombie_runtime::ZombieRuntime;
 use sod_core::cry::zombie_spawn::{parse_spawn_markup, SpawnDirector, ZombieTable, ZombieTuning};
@@ -48,7 +49,9 @@ use sod_core::sm_runtime::{self, SmCommand, SmEnv, SmInstance};
 use sod_core::statemachine::StateMachine;
 use sod_core::anim;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use crate::char_material::{build_char_material, CharMaterial};
 use crate::cry_bridge::{CryHost, CryPlayerPos};
 use crate::{AnimPart, Collision, Player, TextureCacheRes};
 
@@ -62,7 +65,9 @@ const SEPARATION_ITERATIONS: usize = 3;
 struct ZombieTemplate {
     model: DecodedModel,
     slots: Vec<MaterialSlot>,
-    tex_bytes: HashMap<String, Vec<u8>>,
+    /// Referenced textures, interned in [`ZombieBridge::tex_pool`] so every
+    /// assembled variant shares the same decoded image bytes.
+    tex_bytes: HashMap<String, Arc<Vec<u8>>>,
     skeleton: Skeleton,
     influences: Vec<Vec<[BoneWeight; 4]>>,
     /// Neutral idle loop (never the burning/reaction clips the bank may pick).
@@ -74,7 +79,7 @@ struct ZombieTemplate {
     /// Best available hit-reaction clip (played once on a hit).
     react: Option<anim::Caf>,
     /// Built once on the first render spawn.
-    mats: Vec<Handle<StandardMaterial>>,
+    mats: Vec<Handle<CharMaterial>>,
 }
 
 /// Per-live-handle combat state driven by the native perception/attack loop.
@@ -136,8 +141,15 @@ pub struct CombatStats {
 pub struct ZombieBridge {
     rt: Option<ZombieRuntime>,
     nav: Option<NavMesh>,
-    /// `EntityClass` → loaded character (or a cached load failure).
+    /// Appearance key → loaded character (or a cached load failure). For the
+    /// humanoid classes the key encodes the picked `ZombieVariant` composition
+    /// (`class#<geometry hash>`), so each distinct spawn look is assembled once;
+    /// freaks keep their class name as the key.
     templates: HashMap<String, Option<ZombieTemplate>>,
+    /// Parsed `ZombieVariant.xml` (ambient/humanoid appearance table).
+    variant_data: Option<VariantData>,
+    /// Process-wide decoded-texture pool shared by every assembled variant.
+    tex_pool: HashMap<String, Arc<Vec<u8>>>,
     /// Logical handle → script-host entity id.
     host_entities: HashMap<u32, EntityId>,
     /// Logical handle → Bevy render entity.
@@ -251,6 +263,16 @@ fn ensure_init(br: &mut ZombieBridge, cry: &CryHost) -> bool {
         .read("libs/class3/zombies/zombietypes.xml")
         .map(|b| ZombieTable::parse(&b))
         .unwrap_or_default();
+    // The ambient zombie appearance table. Its weighted gender/body-type/model
+    // draws drive every humanoid spawn's geometry (`0x0133dc40`, `0x01320270`).
+    br.variant_data = vfs
+        .read("libs/class3/zombies/zombievariant.xml")
+        .or_else(|| vfs.read("gamedata/libs/class3/zombies/zombievariant.xml"))
+        .and_then(|b| VariantData::parse(&b));
+    match &br.variant_data {
+        Some(v) => println!("[zombie] variants: {} genders loaded", v.genders.len()),
+        None => eprintln!("[zombie] WARNING: ZombieVariant.xml unavailable"),
+    }
     let mut tuning = ZombieTuning::default();
     if let Some(b) = vfs.read("libs/class3/rts/zombies.xml") {
         tuning.apply_rts_xml(&b);
@@ -322,62 +344,99 @@ fn ensure_init(br: &mut ZombieBridge, cry: &CryHost) -> bool {
     true
 }
 
-/// Load the character for `class` once and cache it (including failures, so a
-/// missing asset is not re-read every frame).
-fn ensure_template(br: &mut ZombieBridge, cry: &CryHost, class: &str) -> bool {
-    if let Some(t) = br.templates.get(class) {
+/// Pick a spawn's appearance key and, for humanoid classes, its `ZombieVariant`
+/// composition. The draw is deterministic in the logical handle, so a zombie
+/// keeps the same look for its whole life and across frames.
+fn appearance_for(bridge: &ZombieBridge, class: &str, handle: u32) -> (String, Option<Appearance>) {
+    if let Some(vd) = &bridge.variant_data {
+        if variant::is_variant_class(class) {
+            if let Some(app) = variant::pick_for_class(vd, class, handle) {
+                let key = format!("{class}#{:016x}", app.geometry_key());
+                return (key, Some(app));
+            }
+        }
+    }
+    (class.to_string(), None)
+}
+
+/// Share one decoded copy of every texture across assembled variants.
+fn intern_textures(
+    pool: &mut HashMap<String, Arc<Vec<u8>>>,
+    raw: HashMap<String, Vec<u8>>,
+) -> HashMap<String, Arc<Vec<u8>>> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        let arc = pool.entry(k.clone()).or_insert_with(|| Arc::new(v)).clone();
+        out.insert(k, arc);
+    }
+    out
+}
+
+/// Load the character for `key` once and cache it (including failures, so a
+/// missing asset is not re-read every frame). `class` selects the rig and, when
+/// `appearance` is present, the picked part set to assemble.
+fn ensure_template(
+    br: &mut ZombieBridge,
+    cry: &CryHost,
+    key: &str,
+    class: &str,
+    appearance: Option<&Appearance>,
+) -> bool {
+    if let Some(t) = br.templates.get(key) {
         return t.is_some();
     }
     let vfs = cry.host.ctx.vfs.clone();
-    let def = zombie_actor::character_for_class(class);
-    let loaded = load_template(&vfs, def);
+    let loaded = load_template(&vfs, class, appearance, &mut br.tex_pool);
     match &loaded {
         Some(t) => println!(
-            "[zombie] character {class} -> {} ({} meshes, {} slots, {} textures)",
-            def.path,
+            "[zombie] character {class} [{key}] -> {} ({} meshes, {} slots, {} textures)",
+            appearance.map(|a| a.body_type.as_str()).unwrap_or(class),
             t.model.meshes.len(),
             t.slots.len(),
             t.tex_bytes.len()
         ),
-        None => eprintln!("[zombie] WARNING: character {class} ({}) failed to load", def.path),
+        None => eprintln!("[zombie] WARNING: character {class} [{key}] failed to load"),
     }
     let ok = loaded.is_some();
-    br.templates.insert(class.to_string(), loaded);
+    br.templates.insert(key.to_string(), loaded);
     ok
 }
 
-/// Assemble a class's character with its full material palette. `.cdf` files go
-/// through the shared CDF assembler (skeleton + all attachments + `.mtl`
-/// overrides); the clip bank is then rebuilt filtered to the class rig so freaks
-/// do not animate on human clips.
-fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTemplate> {
-    // Classes whose shipped asset is only a fragment of the body (the ambient
-    // Grunt: `ZombieVariant` composes Body + Legs + Head at spawn) are built
-    // from the authored part list against the shared skeleton. Drawing one
-    // fragment alone leaves the rest of the body as disconnected islands that
-    // detach once the skeleton animates.
-    if !def.parts.is_empty() {
-        let spec: Vec<sod_core::cdf::AssemblyPart> = def
-            .parts
+/// Assemble a character with its full material palette.
+///
+/// A humanoid spawn is composed from its picked `ZombieVariant` parts (one mesh
+/// per present slot) against the gender skeleton — the engine's
+/// `FUN_01320270`. Freaks go through the shipped `.cdf`/`.chr` path. The clip
+/// bank is rebuilt filtered to the class rig so freaks do not animate on human
+/// clips.
+fn load_template(
+    vfs: &Vfs,
+    class: &str,
+    appearance: Option<&Appearance>,
+    tex_pool: &mut HashMap<String, Arc<Vec<u8>>>,
+) -> Option<ZombieTemplate> {
+    let rig = zombie_actor::character_for_class(class).rig;
+    if let Some(app) = appearance {
+        let chr = app.chr_parts();
+        let spec: Vec<sod_core::cdf::AssemblyPart> = chr
             .iter()
             .map(|(name, binding)| sod_core::cdf::AssemblyPart { name, binding })
             .collect();
-        let (skeleton, parts) = sod_core::cdf::assemble_explicit(vfs, def.skeleton, &spec)?;
-        let merged = sod_core::cdf::merge_parts(vfs, &parts);
-        // Filter the scan to this class's rig so the fallback bank cannot pick a
-        // human clip, and so the scan stays cheap.
-        let bank = sod_core::character::ClipBank::build(vfs, def.skeleton, Some(def.rig), 3000);
-        let idle = pick_clip(vfs, def.rig, IDLE_CLIPS)
+        let (skeleton, decoded) = sod_core::cdf::assemble_explicit(vfs, &app.skeleton, &spec)?;
+        let merged = sod_core::cdf::merge_parts(vfs, &decoded);
+        let tex_bytes = intern_textures(tex_pool, merged.tex_bytes);
+        let bank = sod_core::character::ClipBank::build(vfs, &app.skeleton, Some(rig), 3000);
+        let idle = pick_clip(vfs, rig, IDLE_CLIPS)
             .or_else(|| bank.caf_for(anim::Locomotion::Idle).cloned())?;
-        let walk = pick_clip(vfs, def.rig, WALK_CLIPS)
+        let walk = pick_clip(vfs, rig, WALK_CLIPS)
             .or_else(|| bank.caf_for(anim::Locomotion::Walk).cloned())
             .unwrap_or_else(|| idle.clone());
-        let death = pick_clip(vfs, def.rig, DEATH_CLIPS);
-        let react = pick_clip(vfs, def.rig, REACT_CLIPS);
+        let death = pick_clip(vfs, rig, DEATH_CLIPS);
+        let react = pick_clip(vfs, rig, REACT_CLIPS);
         return Some(ZombieTemplate {
             model: merged.model,
             slots: merged.slots,
-            tex_bytes: merged.tex_bytes,
+            tex_bytes,
             skeleton,
             influences: merged.influences,
             idle,
@@ -387,9 +446,11 @@ fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTem
             mats: Vec::new(),
         });
     }
+    let def = zombie_actor::character_for_class(class);
     if def.path.to_ascii_lowercase().ends_with(".cdf") {
-        let (model, slots, tex_bytes, skeleton, influences, _caf, bank) =
+        let (model, slots, raw_tex, skeleton, influences, _caf, bank) =
             crate::load_cdf_character(vfs, def.path)?;
+        let tex_bytes = intern_textures(tex_pool, raw_tex);
         let idle = pick_clip(vfs, def.rig, IDLE_CLIPS)
             .or_else(|| bank.caf_for(anim::Locomotion::Idle).cloned())?;
         let walk = pick_clip(vfs, def.rig, WALK_CLIPS)
@@ -400,7 +461,8 @@ fn load_template(vfs: &Vfs, def: zombie_actor::CharacterDef) -> Option<ZombieTem
         Some(ZombieTemplate { model, slots, tex_bytes, skeleton, influences, idle, walk, death, react, mats: Vec::new() })
     } else {
         crate::load_any_character(vfs, def.path, Some(def.rig)).map(
-            |(model, slots, tex_bytes, skeleton, influences, _caf, bank)| {
+            |(model, slots, raw_tex, skeleton, influences, _caf, bank)| {
+                let tex_bytes = intern_textures(tex_pool, raw_tex);
                 let idle = pick_clip(vfs, def.rig, IDLE_CLIPS)
                     .or_else(|| bank.caf_for(anim::Locomotion::Idle).cloned())
                     .unwrap_or_else(|| anim::Caf { start: 0, end: 1, secs_per_tick: 1.0, controllers: Vec::new() });
@@ -1481,7 +1543,7 @@ fn zombie_visual_sync(
     cry: Option<NonSendMut<CryHost>>,
     mut bridge: ResMut<ZombieBridge>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut char_materials: ResMut<Assets<CharMaterial>>,
     mut images: ResMut<Assets<Image>>,
     cache: Option<Res<TextureCacheRes>>,
 ) {
@@ -1490,25 +1552,10 @@ fn zombie_visual_sync(
     }
     let Some(cry) = cry else { return };
 
-    // Which classes currently need a visual, and load their characters.
-    let classes: HashSet<String> = bridge
-        .rt
-        .as_ref()
-        .unwrap()
-        .zombies
-        .iter()
-        .filter(|z| z.live)
-        .map(|z| z.entity_class.clone())
-        .collect();
-    for class in &classes {
-        ensure_template(&mut bridge, &cry, class);
-    }
-
     let cache = cache.as_deref().map(|c| &c.0);
-    for class in &classes {
-        ensure_materials(&mut bridge, class, &mut materials, &mut images, cache);
-    }
 
+    // Newly promoted actors: pick each one's appearance, assemble its template
+    // once (cached by geometry key) and spawn the skinned visual.
     let wanted: Vec<(u32, String, [f32; 3], f32)> = bridge
         .rt
         .as_ref()
@@ -1521,7 +1568,10 @@ fn zombie_visual_sync(
 
     let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     for (handle, class, pos, heading) in wanted {
-        let Some(t) = bridge.templates.get(&class).and_then(|t| t.as_ref()) else { continue };
+        let (key, appearance) = appearance_for(&bridge, &class, handle);
+        ensure_template(&mut bridge, &cry, &key, &class, appearance.as_ref());
+        ensure_materials(&mut bridge, &key, &mut char_materials, &mut images, cache);
+        let Some(t) = bridge.templates.get(&key).and_then(|t| t.as_ref()) else { continue };
         let (parts, skeleton, idle, walk, death, react) = (
             build_parts(t, &mut meshes),
             t.skeleton.clone(),
@@ -1579,45 +1629,36 @@ fn zombie_visual_sync(
     }
 }
 
-/// Build shared StandardMaterials from a class's character palette once.
+/// Build shared character materials from an assembled template's palette once.
+///
+/// Each slot becomes a [`CharMaterial`] reproducing the `UL_Character` /
+/// `UL_Test_Skin` colour pipeline (region recolour from the `Custom` mask map,
+/// decal, blood, normal, alpha) with every authored `PublicParams` fed through.
 fn ensure_materials(
     br: &mut ZombieBridge,
-    class: &str,
-    materials: &mut Assets<StandardMaterial>,
+    key: &str,
+    materials: &mut Assets<CharMaterial>,
     images: &mut Assets<Image>,
     cache: Option<&sod_core::cache::TextureCache>,
 ) {
     let ZombieBridge { templates, tex_memo, .. } = br;
-    let Some(t) = templates.get_mut(class).and_then(|t| t.as_mut()) else { return };
+    let Some(t) = templates.get_mut(key).and_then(|t| t.as_mut()) else { return };
     if !t.mats.is_empty() {
         return;
     }
     let mut memo = std::mem::take(tex_memo);
     let mut handles = Vec::new();
     for slot in &t.slots {
-        // Neutral base so the authored Diffuse texture is not tinted brown.
-        let mut m = StandardMaterial {
-            base_color: Color::srgb(0.85, 0.82, 0.78),
-            perceptual_roughness: 0.9,
-            cull_mode: None,
-            ..default()
-        };
-        if let Some(tp) = slot.texture("Diffuse") {
-            if let Some(bytes) = t.tex_bytes.get(tp) {
-                if let Some(h) = crate::cached_tex(images, cache, &mut memo, tp, bytes, true) {
-                    m.base_color_texture = Some(h);
-                }
-            }
-        }
-        handles.push(materials.add(m));
+        let h = build_char_material(
+            materials, images, cache, &mut memo, slot,
+            |p| t.tex_bytes.get(p).map(|v| v.as_slice()),
+        );
+        handles.push(h);
     }
     if handles.is_empty() {
-        handles.push(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.72, 0.68, 0.62),
-            perceptual_roughness: 0.9,
-            cull_mode: None,
-            ..default()
-        }));
+        handles.push(build_char_material(
+            materials, images, cache, &mut memo, &MaterialSlot::default(), |_| None,
+        ));
     }
     t.mats = handles;
     *tex_memo = memo;
@@ -1654,6 +1695,13 @@ fn build_parts(t: &ZombieTemplate, meshes: &mut Assets<Mesh>) -> Vec<AnimPart> {
                 bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone()));
             }
             bm.insert_indices(Indices::U32(idx));
+            // Character normal maps need tangents (Bevy only bumps if present).
+            let has_bump = t.slots.get(mat_i)
+                .map(|s| s.texture("Bumpmap").or_else(|| s.texture("Normal")).is_some())
+                .unwrap_or(false);
+            if has_bump && m.uvs.len() == m.positions.len() {
+                let _ = bm.generate_tangents();
+            }
             let handle = meshes.add(bm);
             let mat = t.mats.get(mat_i).or_else(|| t.mats.first()).cloned().unwrap_or_default();
             parts.push(AnimPart {

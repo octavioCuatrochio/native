@@ -10,6 +10,7 @@ mod terrain_bridge;
 mod ai_bridge;
 mod char_material;
 mod light_bridge;
+mod post;
 mod particle_bridge;
 mod interact;
 mod content_bridge;
@@ -1396,7 +1397,11 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     // formula, colours from the TOD splines) at its authored start time.
     let level_lighting = read("mission_mission0.xml").map(|b| {
         let ml = sod_core::tod::parse_mission_lighting(&b);
-        let hour = ml.time_of_day.time;
+        // workerR3: `SOD_HOUR=12` / `=18` pins the level time for the
+        // noon/dusk shadow screenshots; unset uses the level's authored hour.
+        let hour = std::env::var("SOD_HOUR").ok().and_then(|v| v.parse::<f32>().ok())
+            .filter(|h| h.is_finite())
+            .unwrap_or(ml.time_of_day.time);
         let tod = ml.time_of_day.sample(hour);
         let d = ml.environment.sun_direction(hour);
         let base = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
@@ -1859,6 +1864,8 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     app.add_systems(Update, update_streaming);
     install_terrain_shader(&mut app);
     install_char_shader(&mut app);
+    post::install_post_shader(&mut app);
+    app.add_plugins(post::PostPlugin);
     app.run();
 }
 

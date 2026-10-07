@@ -722,6 +722,292 @@ fn bounce_style(light: &LevelLight, b: &BounceLightInfo, hour: f32) -> ([f32; 3]
     (color, b.range_scale * 0.5)
 }
 
+// ---------------------------------------------------------------------------
+// Shipped spec level: shadows and post-processing
+// ---------------------------------------------------------------------------
+//
+// The game groups its render settings into `sys_spec_*` CVarGroups
+// (`Engine/Config/CVarGroups/sys_spec_*.cfg`; the shipped paks place them at
+// `config/config/cvargroups/`). `sys_spec_full.cfg` names group `3` as its
+// `[default]`, i.e. the "High" preset, and the groups below are read from
+// `sys_spec_shadows.cfg` / `sys_spec_postprocessing.cfg`. Each non-default
+// group section lists only the values it overrides; anything absent inherits
+// the `[default]` (= group 3) value, which is why every group here is built
+// from the group-3 struct with field overrides.
+
+/// The shipped CVarGroup the game starts at: `sys_spec_full.cfg` `[default] = 3`
+/// (High). `SOD_SPEC=1..4` selects another group.
+pub const SPEC_DEFAULT: u32 = 3;
+
+/// Sun-shadow / cascaded-shadow-map settings, from
+/// `sys_spec_shadows.cfg`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowSettings {
+    /// `e_GsmLodsNum` (0..5), the number of sun cascades.
+    pub gsm_lods: u32,
+    /// `e_GsmRange`: size of the LOD 0 GSM area (metres).
+    pub gsm_range: f32,
+    /// `e_GsmRangeStep`: each cascade's size is the previous times this.
+    pub gsm_range_step: f32,
+    /// `e_ShadowsMaxTexRes`: maximum shadow-map resolution per cascade
+    /// (256/512/1024 in the cvar description).
+    pub max_tex_res: u32,
+    /// `e_ShadowsResScale`: engine-internal resolution scale. CryEngine shares
+    /// one pool across cascades; a fixed per-cascade Bevy shadow map cannot
+    /// express the fractional scale, so it is carried but not applied.
+    pub res_scale: f32,
+    /// `e_ShadowsConstBias`: constant depth bias for shadowgen.
+    pub const_bias: f32,
+    /// `e_ShadowsSlopeBias`: slope-scaled bias for shadowgen.
+    pub slope_bias: f32,
+    /// `r_ShadowBlur`: 0 none, 1..3 blur (3 = leak-free).
+    pub blur: u32,
+    /// `r_ShadowJittering`: shadow-map dither amount.
+    pub jittering: f32,
+    /// `r_ShadowsFadeDistMin` (metres).
+    pub fade_min: f32,
+    /// `r_ShadowsFadeDistMax` (metres).
+    pub fade_max: f32,
+    /// `e_ShadowsCastViewDistRatio`.
+    pub cast_view_dist_ratio: f32,
+    /// `e_ShadowsOnAlphaBlend`.
+    pub on_alpha_blend: bool,
+    /// `r_ShadowsPCFiltering`.
+    pub pcf: bool,
+}
+
+impl ShadowSettings {
+    /// Resolve the shadow CVarGroup for a shipped spec level.
+    pub fn for_spec(spec: u32) -> Self {
+        // Group 3 (empty `[3]` section) = all `[default]` values.
+        let d = ShadowSettings {
+            gsm_lods: 5,
+            gsm_range: 2.0,
+            gsm_range_step: 2.4,
+            max_tex_res: 1024,
+            res_scale: 3.4,
+            const_bias: 0.1,
+            slope_bias: 10.0,
+            blur: 3,
+            jittering: 1.5,
+            fade_min: 50.0,
+            fade_max: 150.0,
+            cast_view_dist_ratio: 1.0,
+            on_alpha_blend: true,
+            pcf: true,
+        };
+        match spec {
+            // [1]: 4 lods, 4 m LOD0, 2.25 step, 512 map, no blur, alpha-blend
+            // shadows off, shorter fade.
+            1 => ShadowSettings {
+                gsm_lods: 4,
+                gsm_range: 4.0,
+                gsm_range_step: 2.25,
+                max_tex_res: 512,
+                blur: 0,
+                jittering: 0.5,
+                fade_min: 30.0,
+                fade_max: 100.0,
+                on_alpha_blend: false,
+                ..d
+            },
+            // [2]: tighter LOD0 (1.7 m), 512 map, alpha-blend off.
+            2 => ShadowSettings {
+                gsm_range: 1.7,
+                gsm_range_step: 2.4,
+                max_tex_res: 512,
+                on_alpha_blend: false,
+                fade_min: 40.0,
+                fade_max: 120.0,
+                jittering: 1.0,
+                ..d
+            },
+            // [4]: 6 lods, 2.3 m LOD0, 2.1 step, terrain casting, longer fade.
+            4 => ShadowSettings {
+                gsm_lods: 6,
+                gsm_range: 2.3,
+                gsm_range_step: 2.1,
+                jittering: 3.0,
+                fade_max: 200.0,
+                ..d
+            },
+            _ => d,
+        }
+    }
+
+    /// Far-plane distance of each cascade, in metres.
+    ///
+    /// `e_GsmRange` is the *size* of the LOD 0 area, so the first far bound is
+    /// `gsm_range`; each following area is `gsm_range_step` times larger and
+    /// the bounds accumulate. At High this gives
+    /// `[2.0, 6.8, 18.32, 45.97, 112.32]` m, which lands just inside the
+    /// `r_ShadowsFadeDistMax` of 150 m.
+    pub fn cascade_bounds(&self) -> Vec<f32> {
+        let n = self.gsm_lods.clamp(1, 8) as usize;
+        let step = self.gsm_range_step.max(1.0);
+        let mut size = self.gsm_range.max(0.1);
+        let mut acc = 0.0;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            acc += size;
+            out.push(acc);
+            size *= step;
+        }
+        out
+    }
+
+    /// Bevy `DirectionalLight::shadow_depth_bias`.
+    ///
+    /// CryEngine's `e_ShadowsConstBias` is in a different unit; calibrated so
+    /// the shipped High value (0.1) reproduces Bevy's tuned default (0.02).
+    pub fn depth_bias(&self) -> f32 {
+        self.const_bias * 0.2
+    }
+
+    /// Bevy `DirectionalLight::shadow_normal_bias`. Calibrated so the shipped
+    /// High slope bias (10) maps onto Bevy's default (1.8).
+    pub fn normal_bias(&self) -> f32 {
+        self.slope_bias * 0.18
+    }
+}
+
+/// Post-processing settings, from `sys_spec_postprocessing.cfg`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostSettings {
+    /// The spec group these came from.
+    pub spec: u32,
+    /// `r_HDRRendering`: 2 = exponential + s-curve tone map (`%_RT_SAMPLE2`).
+    pub hdr_rendering: u32,
+    /// `r_HDRLevel` (group value).
+    pub hdr_level: f32,
+    /// `r_HDROffset`.
+    pub hdr_offset: f32,
+    /// `r_EyeAdaptationBase` (group value).
+    pub eye_adapt_base: f32,
+    /// `r_EyeAdaptationFactor` (group value).
+    pub eye_adapt_factor: f32,
+    /// `r_HDRBrightLevel`.
+    pub hdr_bright_level: f32,
+    /// `r_HDRBrightOffset`.
+    pub hdr_bright_offset: f32,
+    /// `r_HDRBrightThreshold`.
+    pub hdr_bright_threshold: f32,
+    /// `r_HDRBloomMul`: bloom colour multiplier.
+    pub hdr_bloom_mul: f32,
+    /// `r_HDRBlueShift`.
+    pub hdr_blue_shift: f32,
+    /// `r_HDRGrainAmount`.
+    pub hdr_grain: f32,
+    /// `r_colorgrading`: 0 off, 2 on.
+    pub color_grading: u32,
+    /// `r_sunshafts`.
+    pub sunshafts: bool,
+    /// `r_ssao`: 0 off, 3/5 enabled.
+    pub ssao: u32,
+    /// `r_SSAOQuality`.
+    pub ssao_quality: u32,
+    /// `r_SSAODownscale`.
+    pub ssao_downscale: u32,
+    /// `r_SSAOObscuranceRadius`.
+    pub ssao_radius: f32,
+    /// `r_SSAOObscuranceOmega`.
+    pub ssao_omega: f32,
+    /// `r_DepthOfField`: 0 off, 3 on.
+    pub dof: u32,
+    /// `r_MotionBlur`.
+    pub motion_blur: u32,
+    /// `r_GlowAnamorphicFlares`.
+    pub anamorphic_flares: bool,
+    /// `e_SkyType`: 1 = HDR sky.
+    pub sky_type: u32,
+}
+
+impl PostSettings {
+    /// Resolve the post-processing CVarGroup for a shipped spec level.
+    pub fn for_spec(spec: u32) -> Self {
+        // Unknown specs fall back to the shipped default group (High).
+        let spec = if matches!(spec, 1 | 2 | 3 | 4) {
+            spec
+        } else {
+            SPEC_DEFAULT
+        };
+        // Invariants + group 3 `[default]` values.
+        let d = PostSettings {
+            spec,
+            hdr_rendering: 2,
+            hdr_level: 9.0,
+            hdr_offset: 10.0,
+            eye_adapt_base: 0.1,
+            eye_adapt_factor: 0.9,
+            hdr_bright_level: 0.85,
+            hdr_bright_offset: 8.0,
+            hdr_bright_threshold: 9.0,
+            hdr_bloom_mul: 0.8,
+            hdr_blue_shift: 0.5,
+            hdr_grain: 0.0,
+            color_grading: 2,
+            sunshafts: true,
+            ssao: 3,
+            ssao_quality: 2,
+            ssao_downscale: 0,
+            ssao_radius: 0.33,
+            ssao_omega: 0.25,
+            dof: 3,
+            motion_blur: 0,
+            anamorphic_flares: true,
+            sky_type: 1,
+        };
+        match spec {
+            // [1]: no DOF, no flares, half-res SSAO (quality 0), slower eye
+            // adaptation. `r_HDRLevel` is not listed here, so it inherits the
+            // `[default]` value of 9 (the `r_HDRLevel=6` engine registration
+            // default is only the fallback before CVarGroups load).
+            1 => PostSettings {
+                eye_adapt_base: 0.25,
+                eye_adapt_factor: 0.85,
+                dof: 0,
+                anamorphic_flares: false,
+                ssao_downscale: 1,
+                ssao_quality: 0,
+                ..d
+            },
+            // [2]: no DOF / flares, standard eye adaptation.
+            2 => PostSettings {
+                eye_adapt_base: 0.25,
+                eye_adapt_factor: 0.85,
+                dof: 0,
+                anamorphic_flares: false,
+                ..d
+            },
+            // [4]: stronger SSAO and motion blur on.
+            4 => PostSettings {
+                ssao: 5,
+                motion_blur: 1,
+                ..d
+            },
+            _ => d,
+        }
+    }
+
+    /// Sun-shadow settings for the same spec level (convenience for the app).
+    pub fn shadows(&self) -> ShadowSettings {
+        ShadowSettings::for_spec(self.spec)
+    }
+
+    /// Bloom intensity for a Bevy `Bloom`, derived from the CryEngine bright
+    /// pass.
+    ///
+    /// The original bright pass subtracts `r_HDRBrightThreshold`, maps the
+    /// rest through `x / (offset + x)` and scales the additive composite by
+    /// `HDRBrightLevel * HDRBloomMul` (`hdrpostprocess.cfx` `HDRBrightPassFilterPS`
+    /// line 268 and the `cBloom *= HDRParams5 * 3/8` composite, line 922). The
+    /// `3/8` is the engine's bloom tap weight; folding it in keeps the same
+    /// order of magnitude for Bevy's additive composite.
+    pub fn bloom_intensity(&self) -> f32 {
+        (self.hdr_bright_level * self.hdr_bloom_mul * 0.375).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1275,101 @@ mod tests {
         assert!(f.sun_radiance.iter().all(|c| c.is_finite()));
         assert!(f.exposure.exposure() > 0.0);
         assert!(f.sun_dir.iter().all(|c| c.is_finite()));
+    }
+
+    // -- shipped spec level --------------------------------------------------
+
+    #[test]
+    fn high_spec_csm_bounds_are_geometric_and_reach_the_fade_distance() {
+        let s = ShadowSettings::for_spec(SPEC_DEFAULT);
+        assert_eq!(s.gsm_lods, 5);
+        let bounds = s.cascade_bounds();
+        assert_eq!(bounds.len(), 5);
+        // Strictly increasing.
+        assert!(bounds.windows(2).all(|w| w[0] < w[1]));
+        // First bound is the LOD 0 size (e_GsmRange).
+        assert!((bounds[0] - 2.0).abs() < 1e-4);
+        // Each size scales by e_GsmRangeStep: bound[1] - bound[0] = 2.0*2.4.
+        assert!((bounds[1] - bounds[0] - 4.8).abs() < 1e-4);
+        // Last cascade stays within r_ShadowsFadeDistMax (150 m at High).
+        assert!(*bounds.last().unwrap() < s.fade_max);
+    }
+
+    #[test]
+    fn shadow_group_overrides_follow_the_shipped_cfgs() {
+        let low = ShadowSettings::for_spec(1);
+        assert_eq!((low.gsm_lods, low.max_tex_res), (4, 512));
+        assert_eq!(low.blur, 0);
+        assert!(!low.on_alpha_blend);
+        let ultra = ShadowSettings::for_spec(4);
+        assert_eq!((ultra.gsm_lods, ultra.gsm_range), (6, 2.3));
+        assert!((ultra.fade_max - 200.0).abs() < 1e-4);
+        // Unknown spec falls back to the default (High) group.
+        assert_eq!(ShadowSettings::for_spec(99), ShadowSettings::for_spec(3));
+    }
+
+    #[test]
+    fn high_spec_bias_calibration_matches_bevy_defaults() {
+        // The shipped High values (0.1 / 10) are calibrated onto Bevy's own
+        // tuned defaults (0.02 / 1.8) so the mapping is neutral at High.
+        let s = ShadowSettings::for_spec(3);
+        assert!((s.depth_bias() - 0.02).abs() < 1e-5);
+        assert!((s.normal_bias() - 1.8).abs() < 1e-4);
+    }
+
+    #[test]
+    fn post_high_enables_the_shipped_chain() {
+        let p = PostSettings::for_spec(SPEC_DEFAULT);
+        assert_eq!(p.hdr_rendering, 2);
+        assert!(p.sunshafts);
+        assert!(p.ssao > 0);
+        assert!(p.dof > 0);
+        assert_eq!(p.color_grading, 2);
+        assert!((p.eye_adapt_base - 0.1).abs() < 1e-4);
+        assert!((p.eye_adapt_factor - 0.9).abs() < 1e-4);
+        assert!((p.hdr_level - 9.0).abs() < 1e-4);
+        assert!(p.bloom_intensity() > 0.0 && p.bloom_intensity() < 1.0);
+    }
+
+    #[test]
+    fn post_low_disables_dof_and_flares() {
+        let p = PostSettings::for_spec(1);
+        assert_eq!(p.dof, 0);
+        assert!(!p.anamorphic_flares);
+        assert_eq!(p.ssao_downscale, 1);
+        // Sunshafts are an invariant of the group: on at every spec.
+        assert!(p.sunshafts);
+        assert_eq!(PostSettings::for_spec(99), PostSettings::for_spec(3));
+    }
+
+    #[test]
+    fn post_group_variants_only_override_listed_cvars() {
+        // CVarGroup variants inherit every unlisted key from `[default]`
+        // (= group 3). Groups 1/2 do not list `r_HDRLevel`, so they must keep
+        // the shipped `[default]` value of 9 rather than the cvar-registration
+        // fallback of 6.
+        let high = PostSettings::for_spec(3);
+        for spec in [1u32, 2] {
+            let p = PostSettings::for_spec(spec);
+            assert!((p.hdr_level - 9.0).abs() < 1e-4, "spec {spec}");
+            assert!((p.hdr_level - high.hdr_level).abs() < 1e-4);
+            assert_eq!(p.hdr_rendering, high.hdr_rendering);
+            assert_eq!(p.color_grading, high.color_grading);
+            assert_eq!(p.ssao, high.ssao);
+        }
+        // Group 4 lists `r_MotionBlur=1` and `r_ssao=5`; everything else stays.
+        let ultra = PostSettings::for_spec(4);
+        assert_eq!(ultra.motion_blur, 1);
+        assert_eq!(ultra.ssao, 5);
+        assert!((ultra.hdr_level - 9.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn post_spec_selection_is_clamped_to_known_groups() {
+        // The app exposes the spec level through `SOD_SPEC`; anything outside
+        // the shipped 1..4 groups falls back to High.
+        assert_eq!(PostSettings::for_spec(0).spec, SPEC_DEFAULT);
+        assert_eq!(PostSettings::for_spec(7).spec, SPEC_DEFAULT);
+        assert_eq!(ShadowSettings::for_spec(7), ShadowSettings::for_spec(SPEC_DEFAULT));
     }
 }

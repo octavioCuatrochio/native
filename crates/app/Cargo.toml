@@ -16,6 +16,7 @@ features = [
     "bevy_winit",
     "bevy_render",
     "bevy_core_pipeline",
+    "bevy_post_process",
     "bevy_sprite",
     "bevy_sprite_render",
     "bevy_pbr",

@@ -51,9 +51,10 @@
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::CascadeShadowConfig;
 use bevy::prelude::*;
 use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection};
-use sod_core::render_light::{luminance, tonemap, LightKind, LevelLightParams};
+use sod_core::render_light::{luminance, tonemap, LightKind, LevelLightParams, ShadowSettings};
 
 /// Directional illuminance (lux) per unit of TOD sun radiance luminance.
 const SUN_LUX_PER_UNIT: f32 = 10_000.0;
@@ -73,6 +74,8 @@ const LUMEN_PER_UNIT: f32 = 150.0;
 const LIGHT_RADIUS_M: f32 = 150.0;
 /// Hard cap on spawned level lights, nearest first, to bound frame cost.
 const MAX_LEVEL_LIGHTS: usize = 96;
+/// Hard cap on level lights that cast shadows (each adds a shadow pass).
+const MAX_SHADOW_LIGHTS: usize = 8;
 /// Projector cone half-angle (radians) when a light only carries a texture.
 const PROJECTOR_OUTER_ANGLE: f32 = 0.6;
 /// Fraction of the outer angle used as the spot's inner (full-brightness)
@@ -84,11 +87,20 @@ pub struct LightBridgePlugin;
 
 impl Plugin for LightBridgePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<LightingApplied>()
+        // The shipped spec level drives the sun's cascaded shadow maps. The
+        // spec is resolved once here (same source as `post.rs`) so the sun and
+        // the post chain agree on the group.
+        let spec = crate::post::spec_from_env();
+        app.insert_resource(ShadowConfig(ShadowSettings::for_spec(spec)))
+            .init_resource::<LightingApplied>()
             .init_resource::<FrameStats>()
             .add_systems(Update, (apply_lighting, log_frame_time));
     }
 }
+
+/// The sun's shadow CVarGroup for the active spec level.
+#[derive(Resource)]
+struct ShadowConfig(ShadowSettings);
 
 /// Guard so the one-shot lighting setup runs a single time, after
 /// `setup_world` has spawned the camera.
@@ -126,6 +138,7 @@ fn projector_forward(euler: [f32; 3]) -> Vec3 {
 fn apply_lighting(
     mut lighting_applied: ResMut<LightingApplied>,
     lighting: Option<Res<crate::LevelLighting>>,
+    shadow_cfg: Res<ShadowConfig>,
     camera: Query<Entity, With<Camera3d>>,
     mut ambient: Query<&mut AmbientLight, With<Camera3d>>,
     mut commands: Commands,
@@ -152,16 +165,43 @@ fn apply_lighting(
     let sun_display = tonemap(frame.sun_radiance, &frame.tonemap);
     let display_lum = luminance(sun_display);
     let sun_dir = cry_to_bevy(frame.sun_dir).normalize_or_zero();
+    let sh = shadow_cfg.0;
     if display_lum > 1e-4 && frame.sun_radiance.iter().any(|c| *c > 0.0) {
         let color = Vec3::from_array(sun_display) / display_lum;
         let sun_lum = luminance(frame.sun_radiance).max(0.0);
+        // Sun cascaded shadow maps from `sys_spec_shadows.cfg`: the cascade
+        // far bounds are the accumulated `e_GsmRange * e_GsmRangeStep^n` areas
+        // and `e_ShadowsMaxTexRes` sets the per-cascade map size (a global
+        // resource, set by `post.rs`). Biases come from
+        // `e_ShadowsConstBias` / `e_ShadowsSlopeBias`.
+        //
+        // The shipped High group configures 5 cascades (`e_GsmLodsNum`), but
+        // Bevy's directional shadow array is capped at 4
+        // (`bevy_pbr::render::light` warns and ignores the rest). Merge the two
+        // farthest cascades instead of dropping the last: keep the first three
+        // near bounds and stretch the fourth to the 5th's far bound, so the
+        // full `r_ShadowsFadeDistMax` range is still covered.
+        let mut bounds = sh.cascade_bounds();
+        if bounds.len() > 4 {
+            let far = *bounds.last().unwrap();
+            bounds.truncate(3);
+            bounds.push(far);
+        }
+        let cascade = CascadeShadowConfig {
+            bounds,
+            overlap_proportion: 0.1,
+            minimum_distance: 0.1,
+        };
         commands.spawn((
             DirectionalLight {
                 color: Color::linear_rgb(color.x, color.y, color.z),
                 illuminance: sun_lum * SUN_LUX_PER_UNIT,
-                shadow_maps_enabled: false,
+                shadow_maps_enabled: sh.gsm_lods > 0,
+                shadow_depth_bias: sh.depth_bias(),
+                shadow_normal_bias: sh.normal_bias(),
                 ..default()
             },
+            cascade,
             Transform::default().looking_to(sun_dir, Vec3::Y),
         ));
     }
@@ -215,7 +255,7 @@ fn apply_lighting(
     commands.entity(cam).insert(grading_from(&frame.grading));
 
     // --- level lights ------------------------------------------------------
-    let spawned = spawn_level_lights(&mut commands, lighting.as_ref());
+    let spawned = spawn_level_lights(&mut commands, lighting.as_ref(), sh);
 
     info!(
         "[light_bridge] hour {:.2}: sun dir {sun_dir:?} sun_col {sun_display:?} \
@@ -290,7 +330,11 @@ fn grading_from(g: &sod_core::render_light::GradingParams) -> ColorGrading {
 /// `LSUpdate` (`0x15ba8a0`) culls by distance and `level_light_params`
 /// already applies the bounce time window, so this only adds the render-side
 /// cap. Returns how many were spawned.
-fn spawn_level_lights(commands: &mut Commands, lighting: &crate::LevelLighting) -> usize {
+fn spawn_level_lights(
+    commands: &mut Commands,
+    lighting: &crate::LevelLighting,
+    shadows: ShadowSettings,
+) -> usize {
     let Some(lv) = &lighting.lights else {
         return 0;
     };
@@ -317,6 +361,7 @@ fn spawn_level_lights(commands: &mut Commands, lighting: &crate::LevelLighting) 
     picks.truncate(MAX_LEVEL_LIGHTS);
 
     let mut spawned = 0;
+    let mut shadow_casters = 0;
     for (_, pos, p, euler) in &picks {
         // The blend colour can be an HDR magnitude; split it into a unit hue
         // and fold the magnitude into the luminous power.
@@ -328,6 +373,17 @@ fn spawn_level_lights(commands: &mut Commands, lighting: &crate::LevelLighting) 
         let color = Color::linear_rgb(rgb.x / lum, rgb.y / lum, rgb.z / lum);
         let intensity = p.intensity.max(0.0) * LUMEN_PER_UNIT * lum;
         let range = p.radius.max(1.0);
+        // The `.lights` record has no explicit shadow bit (only projector /
+        // cubemap / bounce / geometry / active), so shadow casting follows the
+        // kind: authored projector spot lights cast, plain omni lights do not
+        // (CryEngine point-light cube shadows are the expensive path and are
+        // off in the shipped config). Capped to bound the frame cost.
+        let cast = shadows.gsm_lods > 0
+            && p.kind == LightKind::Projector
+            && shadow_casters < MAX_SHADOW_LIGHTS;
+        if cast {
+            shadow_casters += 1;
+        }
         if p.kind == LightKind::Projector {
             commands.spawn((
                 SpotLight {
@@ -335,7 +391,9 @@ fn spawn_level_lights(commands: &mut Commands, lighting: &crate::LevelLighting) 
                     intensity,
                     range,
                     radius: 0.1,
-                    shadow_maps_enabled: false,
+                    shadow_maps_enabled: cast,
+                    shadow_depth_bias: shadows.depth_bias(),
+                    shadow_normal_bias: shadows.normal_bias(),
                     outer_angle: PROJECTOR_OUTER_ANGLE,
                     inner_angle: PROJECTOR_OUTER_ANGLE * PROJECTOR_INNER_FRACTION,
                     ..default()

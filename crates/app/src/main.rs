@@ -136,6 +136,42 @@ fn world_radius() -> f32 {
     std::env::var("SOD_WORLD_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(6000.0)
 }
 
+/// Shipped object view-distance settings (`Config/CVarGroups/sys_spec_objectdetail.cfg`,
+/// group 3 = High, which uses the `[default]` values; `SOD_SPEC=1..4` picks another group).
+struct ViewDist { min: f32, ratio: f32, ratio_veg: f32 }
+
+fn view_dist_spec() -> ViewDist {
+    let spec = std::env::var("SOD_SPEC").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
+    let (ratio, ratio_veg) = match spec { 1 => (25.0, 30.0), 2 => (30.0, 40.0), 4 => (50.0, 70.0), _ => (35.0, 50.0) };
+    ViewDist { min: 10.0, ratio, ratio_veg }
+}
+
+/// CryEngine 3 `IRenderNode::GetMaxViewDist` for brushes/vegetation:
+/// `max(e_ViewDistMin, bbox_radius * ratio * ViewDistRatio/100)`. The per-object
+/// ViewDistRatio is not decoded yet, so its default of 100 (normalised 1.0) is used.
+fn max_view_dist(radius: f32, ratio: f32, min: f32) -> f32 {
+    (radius * ratio).max(min)
+}
+
+/// Hard cut at `end`, measured to the object's bounding box like CryEngine's
+/// distance to the render node's AABB.
+fn vis_range(end: f32) -> bevy::camera::visibility::VisibilityRange {
+    let mut r = bevy::camera::visibility::VisibilityRange::abrupt(0.0, end);
+    r.use_aabb = true;
+    r
+}
+
+/// Bounding-sphere radius of a model's meshes (unscaled), from their AABBs.
+fn model_radius(meshes: &Assets<Mesh>, list: &[(Handle<Mesh>, Handle<StandardMaterial>)]) -> f32 {
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for (mh, _) in list {
+        if let Some(a) = meshes.get(mh).and_then(|m| bevy::camera::primitives::MeshAabb::compute_aabb(m)) {
+            lo = lo.min(Vec3::from(a.min())); hi = hi.max(Vec3::from(a.max()));
+        }
+    }
+    if lo.x > hi.x { 1.0 } else { (hi - lo).length() * 0.5 }
+}
+
 /// Uniform block for [`TerrainMaterialExt`]: terrain extent in `params.xy`, the
 /// active ground-layer count in `params.z`, and each ground layer's world-space
 /// tiling (repeats per metre) in `tiles`.
@@ -1768,6 +1804,7 @@ fn setup_world(
         } else {
             root.spawn((Mesh3d(terrain_mesh.clone()), MeshMaterial3d(terrain_std.clone().unwrap()), Transform::default()));
             }
+        let vd = view_dist_spec();
         let mut spawned = 0;
         for p in &world.placements {
             let Some(path) = &p.model else { continue };
@@ -1777,7 +1814,9 @@ fn setup_world(
                 rotation: Quat::from_xyzw(p.rot[0], p.rot[1], p.rot[2], p.rot[3]),
                 scale: Vec3::new(p.scale[0], p.scale[1], p.scale[2]),
             };
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf)); }
+            let vr = vis_range(
+                max_view_dist(model_radius(&meshes, list) * p.scale[0].max(p.scale[1]).max(p.scale[2]), vd.ratio, vd.min));
+            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
             spawned += 1;
         }
         // Static architecture (buildings, walls, rocks) as instances.
@@ -1789,7 +1828,9 @@ fn setup_world(
                 rotation: Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]),
                 scale: Vec3::splat(*scale),
             };
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf)); }
+            let vr = vis_range(
+                max_view_dist(model_radius(&meshes, list) * *scale, vd.ratio, vd.min));
+            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
             bspawned += 1;
         }
         // Vegetation (trees/bushes).
@@ -1801,7 +1842,9 @@ fn setup_world(
                 rotation: Quat::from_rotation_z(*yaw),
                 scale: Vec3::splat(*scale),
             };
-            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf)); }
+            let vr = vis_range(
+                max_view_dist(model_radius(&meshes, list) * *scale, vd.ratio_veg, vd.min));
+            for (mh, mat) in list { root.spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat.clone()), tf, vr.clone())); }
             vspawned += 1;
         }
         info!("[world] spawned {} props, {} brushes, {} vegetation", spawned, bspawned, vspawned);

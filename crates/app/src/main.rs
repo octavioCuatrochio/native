@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use sod_core::crypak::Vfs;
 use sod_core::sm_runtime::{SmCommand, SmDriveMode, SmEnv, SmInstance};
-use sod_core::{ai, architecture, cache, camera, character, combat, hud, inventory, locomotion, mission, npc_ai, player_locomotion, surfaces, tagpoints, tuning, vegetation, zombie_ai};
+use sod_core::{architecture, cache, camera, character, combat, hud, inventory, locomotion, mission, npc_ai, player_locomotion, surfaces, tagpoints, tuning, vegetation};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::ui::Display;
 
@@ -481,30 +481,7 @@ struct Spinner;
 struct MainCamera;
 #[derive(Component)]
 struct PlayerRoot;
-#[derive(Resource)]
-struct NpcTemplate {
-    model: DecodedModel,
-    skeleton: Skeleton,
-    influences: Vec<Vec<[BoneWeight; 4]>>,
-    caf: anim::Caf,
-    slots: Vec<MaterialSlot>,
-    tex_bytes: HashMap<String, Vec<u8>>,
-    bank: character::ClipBank,
-}
-#[derive(Component)]
-struct Npc {
-    kind: sod_core::game::ZombieKind,
-    hp: f32,
-    time: f32,
-    parts: Vec<AnimPart>,
-    skeleton: Skeleton,
-    caf: anim::Caf,
-    agent: zombie_ai::ZombieAgent,
-    bank: character::ClipBank,
-    loc: anim::Locomotion,
-}
-
-/// Survivor follower (npc_ai).
+/// Survivor follower (hand-written `npc_ai`; `SOD_LEGACY_FOLLOWER`).
 #[derive(Component)]
 struct Follower {
     agent: npc_ai::NpcAgent,
@@ -528,39 +505,57 @@ struct FollowerTemplate {
     bank: character::ClipBank,
 }
 
-/// Player simulation: combat vitals, weapons and the carried inventory.
+/// Input pacing for the player attack adapter. Not game state: the attack
+/// itself resolves in the original hit pipeline (`ai_bridge::combat_step`).
+#[derive(Resource, Default)]
+struct PlayerCombat {
+    auto_cd: f32,
+    auto_fire_cd: f32,
+}
+
+/// Legacy hand-written weapon model (magazine/reload/stamina/damage tuning).
+/// No original-driven replacement exists yet, so it is off by default and only
+/// runs under `SOD_LEGACY_WEAPONS=1`.
 #[derive(Resource)]
-struct PlayerState {
+struct LegacyWeapons {
     vitals: combat::Vitals,
     melee: combat::MeleeWeapon,
     gun: combat::Firearm,
     gun_state: combat::GunState,
-    equipment: inventory::Equipment,
-    inv: inventory::Inventory,
-    db: inventory::ItemDb,
 }
 
-/// An in-progress container search.
+/// An in-progress container search (legacy `inventory`).
 struct SearchTask {
     state: inventory::SearchState,
 }
 
-/// Mission/tutorial + world-simulation state.
+/// Legacy hand-written search/loot/inventory. No original-driven replacement
+/// exists yet, so it is off by default (`SOD_LEGACY_SEARCH=1`).
 #[derive(Resource)]
-struct GameState {
-    tutorial: mission::Tutorial,
+struct LegacySearch {
     rng: inventory::XorShiftRng,
-    ai_rng: ai::SmallRng,
-    horde: ai::HordeDirector,
     loot: inventory::LootTable,
     search: Option<SearchTask>,
-    kills: u32,
-    move_notified: bool,
     auto_cd: f32,
-    auto_fire_cd: f32,
-    auto_search_cd: f32,
-    /// Tanner-arc mission labels loaded from `missions.xml` (story line for the HUD).
+    inv: inventory::Inventory,
+    db: inventory::ItemDb,
+}
+
+/// Legacy hand-written tutorial/mission objectives. No original-driven
+/// replacement exists yet, so it is off by default (`SOD_LEGACY_MISSION=1`).
+#[derive(Resource)]
+struct LegacyMission {
+    tutorial: mission::Tutorial,
+    move_notified: bool,
     tanner: Vec<String>,
+}
+
+/// True when a `SOD_LEGACY_<NAME>` gap flag is set (default off).
+fn legacy_flag(name: &str) -> bool {
+    match std::env::var(format!("SOD_LEGACY_{name}")) {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
 }
 
 /// 1:1 Class3 camera state (mouse-look, aim, boom).
@@ -1263,35 +1258,24 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         }
     }
 
-    // NPCs (zombies + follower) are opt-in; by default only the player exists.
-    let spawn_npcs = std::env::var("SOD_SPAWN_NPCS").is_ok();
-    let npc_template = if play && spawn_npcs {
-        load_any_character(&vfs, "characters/male/zombie/skin/skin.chr", Some("zombie_male"))
-            .map(|(model, slots, tex, skeleton, influences, caf, bank)| NpcTemplate { model, skeleton, influences, caf, slots, tex_bytes: tex, bank })
-    } else {
-        None
-    };
+    // Legacy approximations not yet covered by the original runtime. Each is
+    // off by default; `SOD_LEGACY_<NAME>=1` re-enables one (listed in the E2
+    // report as gaps). Zombies have a real replacement (ai_bridge spawn
+    // director), so there is no zombie flag.
+    let legacy_follower = legacy_flag("FOLLOWER");
+    let legacy_search = legacy_flag("SEARCH");
+    let legacy_mission = legacy_flag("MISSION");
+    let legacy_weapons = legacy_flag("WEAPONS");
 
-    // Survivor follower (Ed) — assembled from a CDF, driven by npc_ai.
-    let follower_template = if play && spawn_npcs {
+    // Survivor follower (Ed) — hand-written `npc_ai` follower. The original
+    // spawn director only covers zombies, so this is a gap behind a flag.
+    let follower_template = if play && legacy_follower {
         load_any_character(&vfs, "characters/female/human/body/tshirt_jeans/variant/v01.cdf", None)
             .map(|(model, slots, tex, skeleton, influences, caf, bank)| FollowerTemplate { model, slots, tex_bytes: tex, skeleton, influences, caf, bank })
     } else {
         None
     };
 
-    // --- simulation state: item DB, loot, tutorial, player vitals ----------
-    let db = vfs
-        .read("libs/class3/items/items.xml")
-        .map(|b| inventory::ItemDb::load_from_xml(&b))
-        .unwrap_or_else(inventory::ItemDb::new);
-    println!("[game] item db: {} definitions", db.len());
-    let mut loot = inventory::LootTable::new();
-    for id in ["HealthPack", "AmmoBullet9mm", "FuelRucksack", "Machete", "Pistol_M9"] {
-        if db.get(id).is_some() {
-            loot.add(inventory::LootEntry::new(id, 3, 1, 2));
-        }
-    }
     let spawn = player_setup.as_ref().map(|p| p.spawn).unwrap_or(start_cry);
     let ranger = tag_points
         .as_ref()
@@ -1308,46 +1292,63 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if let Some(ps) = player_setup.as_mut() {
         ps.yaw = (survivor[1] - spawn[1]).atan2(survivor[0] - spawn[0]);
     }
-    let opening = mission::OpeningState {
-        player_start: spawn,
-        survivor_pos: survivor,
-        ranger_station: ranger,
-        home_pos: spawn,
-        kill_target: 3,
-        survivor_actor: 0,
+
+    // Legacy inventory/search (no original-driven replacement yet).
+    let legacy_search_state = if play && legacy_search {
+        let db = vfs
+            .read("libs/class3/items/items.xml")
+            .map(|b| inventory::ItemDb::load_from_xml(&b))
+            .unwrap_or_else(inventory::ItemDb::new);
+        println!("[game] item db: {} definitions", db.len());
+        let mut loot = inventory::LootTable::new();
+        for id in ["HealthPack", "AmmoBullet9mm", "FuelRucksack", "Machete", "Pistol_M9"] {
+            if db.get(id).is_some() {
+                loot.add(inventory::LootEntry::new(id, 3, 1, 2));
+            }
+        }
+        Some(LegacySearch {
+            rng: inventory::XorShiftRng::new(0x5eed_1234_9abc_def0),
+            loot,
+            search: None,
+            auto_cd: 1.0,
+            inv: inventory::Inventory::new(8),
+            db,
+        })
+    } else {
+        None
     };
-    // Real Tanner-arc missions (drives the HUD story line).
-    let missions = vfs
-        .read("libs/class3/contentmanager/missions.xml")
-        .map(|b| mission::parse_missions_xml(&b))
-        .unwrap_or_default();
-    let tanner: Vec<String> = mission::tanner_arc(&missions).iter().map(|m| m.label.clone()).collect();
-    println!("[game] Tanner arc ({} missions): {:?}", tanner.len(), tanner);
-    let mut equipment = inventory::Equipment::new();
-    let _ = equipment.equip(inventory::ItemClass::Melee, inventory::ItemStack::new("Machete", 1));
-    let _ = equipment.equip(inventory::ItemClass::Gun, inventory::ItemStack::new("Pistol_M9", 1));
-    let player_state = PlayerState {
-        vitals: combat::Vitals::new(combat::PLAYER_MAX_HEALTH, 100.0),
-        melee: combat::MeleeWeapon::machete(),
-        gun: combat::Firearm::pistol_tacmaster1911(),
-        gun_state: combat::GunState::new(7, 21),
-        equipment,
-        inv: inventory::Inventory::new(8),
-        db,
+
+    // Legacy tutorial/mission objectives (no original-driven replacement yet).
+    let legacy_mission_state = if play && legacy_mission {
+        let opening = mission::OpeningState {
+            player_start: spawn,
+            survivor_pos: survivor,
+            ranger_station: ranger,
+            home_pos: spawn,
+            kill_target: 3,
+            survivor_actor: 0,
+        };
+        let missions = vfs
+            .read("libs/class3/contentmanager/missions.xml")
+            .map(|b| mission::parse_missions_xml(&b))
+            .unwrap_or_default();
+        let tanner: Vec<String> = mission::tanner_arc(&missions).iter().map(|m| m.label.clone()).collect();
+        println!("[game] Tanner arc ({} missions): {:?}", tanner.len(), tanner);
+        Some(LegacyMission { tutorial: mission::Tutorial::new_tanner(&opening), move_notified: false, tanner })
+    } else {
+        None
     };
-    let game_state = GameState {
-        tutorial: mission::Tutorial::new_tanner(&opening),
-        rng: inventory::XorShiftRng::new(0x5eed_1234_9abc_def0),
-        ai_rng: ai::SmallRng::new(0x0dd0_1234_5678_9abc),
-        horde: ai::HordeDirector::new(),
-        loot,
-        search: None,
-        kills: 0,
-        move_notified: false,
-        auto_cd: 0.0,
-        auto_fire_cd: 1.0,
-        auto_search_cd: 1.0,
-        tanner,
+
+    // Legacy player weapon model (ammo/reload/stamina; no replacement yet).
+    let legacy_weapons_state = if play && legacy_weapons {
+        Some(LegacyWeapons {
+            vitals: combat::Vitals::new(combat::PLAYER_MAX_HEALTH, 100.0),
+            melee: combat::MeleeWeapon::machete(),
+            gun: combat::Firearm::pistol_tacmaster1911(),
+            gun_state: combat::GunState::new(7, 21),
+        })
+    } else {
+        None
     };
 
     // AnimationGraph clip resolution (workerA2b): the character's alias table
@@ -1447,9 +1448,6 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     if let Some(l) = level_lighting {
         app.insert_resource(l);
     }
-    if let Some(t) = npc_template {
-        app.insert_resource(t);
-    }
     if let Some(t) = follower_template {
         app.insert_resource(t);
     }
@@ -1459,18 +1457,34 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
             ai_bridge::install(&mut app);
             app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));
         }
-        app.insert_resource(player_state);
-        app.insert_resource(game_state);
+        // Player attack input -> original hit pipeline. Weapon ammo/reload/
+        // stamina is the unreplaced legacy model, so it only appears with its
+        // flag; the base input values always come from the shipped weapon data.
+        app.init_resource::<PlayerCombat>();
+        app.add_systems(Update, player_attack);
+        if let Some(w) = legacy_weapons_state {
+            app.insert_resource(w);
+            app.add_systems(Update, legacy_weapons_tick);
+        }
+        if let Some(s) = legacy_search_state {
+            app.insert_resource(s);
+            app.add_systems(Update, search_system);
+        }
+        if let Some(m) = legacy_mission_state {
+            app.insert_resource(m);
+            app.add_systems(Update, tutorial_system);
+        }
+        // Fixed order: the camera must read this frame's player position.
+        // Unordered, Bevy ran them either way round per frame, so the
+        // camera alternately saw zero and double movement (a vertical jerk
+        // on slopes).
         app.add_systems(Update, (
-            // Fixed order: the camera must read this frame's player position.
-            // Unordered, Bevy ran them either way round per frame, so the
-            // camera alternately saw zero and double movement (a vertical jerk
-            // on slopes).
             menu_input, move_player, animate_player.after(move_player), follow_camera.after(move_player),
-            npc_ai, animate_npcs, player_attack, npc_attack,
-            follower_ai, animate_followers,
-            player_vitals, search_system, tutorial_system, hud_update, auto_screenshot,
+            hud_update, auto_screenshot,
         ));
+        if legacy_follower {
+            app.add_systems(Update, (follower_ai, animate_followers));
+        }
     } else {
         app.insert_resource(Orbit { center, radius: 320.0, height: 210.0, angle: 0.6 });
         app.add_systems(Update, (orbit_camera, auto_screenshot));
@@ -1493,7 +1507,6 @@ fn setup_world(
     cache: Option<Res<TextureCacheRes>>,
     world: Res<World>,
     player_setup: Option<Res<PlayerSetup>>,
-    npc_template: Option<Res<NpcTemplate>>,
     follower_template: Option<Res<FollowerTemplate>>,
     cam_state: Option<ResMut<CameraStateRes>>,
     cam_lag: Option<ResMut<CamLagRes>>,
@@ -1803,67 +1816,10 @@ fn setup_world(
             l.0.seeded = false;
         }
 
-        // Spawn zombies around the player.
-        if let Some(nt) = &npc_template {
-          if std::env::var("SOD_SPAWN_NPCS").is_ok() {
-            let mut nmat_handles: Vec<Handle<StandardMaterial>> = Vec::new();
-            for slot in &nt.slots {
-                let mut nmat = StandardMaterial { base_color: Color::srgb(0.62, 0.55, 0.5), perceptual_roughness: 0.9, cull_mode: None, ..default() };
-                if let Some(tp) = slot.texture("Diffuse") {
-                    if let Some(bytes) = nt.tex_bytes.get(tp) {
-                        if let Some(h) = cached_tex(&mut images, cache, &mut tex_memo, tp, bytes, true) { nmat.base_color_texture = Some(h); }
-                    }
-                }
-                nmat_handles.push(materials.add(nmat));
-            }
-            if nmat_handles.is_empty() {
-                nmat_handles.push(materials.add(StandardMaterial { base_color: Color::srgb(0.62, 0.55, 0.5), perceptual_roughness: 0.9, cull_mode: None, ..default() }));
-            }
-            for i in 0..6 {
-                let cx = ps.spawn[0] + 8.0 + (i % 3) as f32 * 3.5;
-                let cy = ps.spawn[1] + (i as f32 - 2.5) * 2.5;
-                let h = height_at(&world.terrain, cx, cy);
-                let wpos = base.rotation * Vec3::new(cx, cy, h);
-                let mut parts = Vec::new();
-                for (mi, m) in nt.model.meshes.iter().enumerate() {
-                    if m.positions.is_empty() { continue; }
-                    let infl = nt.influences.get(mi).cloned().unwrap_or_default();
-                    let groups: Vec<(usize, Vec<u32>)> = if m.submeshes.is_empty() {
-                        vec![(0, m.indices.clone())]
-                    } else {
-                        m.submeshes.iter().map(|s| (s.material as usize, s.indices.clone())).collect()
-                    };
-                    for (mat_i, idx) in groups {
-                        if idx.is_empty() { continue; }
-                        let mut bm = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-                        bm.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(m.positions.clone()));
-                        bm.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(m.normals.clone()));
-                        if m.uvs.len() == m.positions.len() { bm.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(m.uvs.clone())); }
-                        bm.insert_indices(Indices::U32(idx));
-                        let handle = meshes.add(bm);
-                        let mh = nmat_handles.get(mat_i).cloned().unwrap_or_else(|| nmat_handles[0].clone());
-                        parts.push(AnimPart { handle, bind_pos: m.positions.clone(), bind_nrm: m.normals.clone(), infl: infl.clone(), mat: mh });
-                    }
-                }
-                let kind = match i % 4 {
-                    1 => sod_core::game::ZombieKind::Feral,
-                    3 => sod_core::game::ZombieKind::Screamer,
-                    _ => sod_core::game::ZombieKind::Grunt,
-                };
-                let agent = zombie_ai::ZombieAgent::new(kind, [cx, cy, h]);
-                let npc = Npc { kind, hp: kind.stats().hp, time: i as f32 * 0.31, parts: parts.clone(), skeleton: nt.skeleton.clone(), caf: nt.caf.clone(), agent, bank: nt.bank.clone(), loc: anim::Locomotion::Idle };
-                commands.spawn((Transform::from_translation(wpos).with_rotation(base.rotation), Visibility::default(), npc))
-                    .with_children(|parent| {
-                        for part in &parts { parent.spawn((Mesh3d(part.handle.clone()), MeshMaterial3d(part.mat.clone()))); }
-                    });
-            }
-            println!("[game] spawned 6 zombies");
-          }
-        }
-
-        // Survivor follower (Ed), driven by npc_ai.
+        // Survivor follower (Ed), driven by the hand-written `npc_ai`
+        // (`SOD_LEGACY_FOLLOWER`). The original spawn director only covers
+        // zombies; there is no original-driven follower yet.
         if let Some(ft) = &follower_template {
-          if std::env::var("SOD_SPAWN_NPCS").is_ok() {
             let mut mat = StandardMaterial { base_color: Color::srgb(0.8, 0.72, 0.62), perceptual_roughness: 0.85, cull_mode: None, ..default() };
             if let Some(slot) = ft.slots.iter().find(|s| s.texture("Diffuse").is_some()) {
                 if let Some(tp) = slot.texture("Diffuse") {
@@ -1906,8 +1862,7 @@ fn setup_world(
                 .with_children(|parent| {
                     for part in &parts { parent.spawn((Mesh3d(part.handle.clone()), MeshMaterial3d(part.mat.clone()))); }
                 });
-            println!("[game] spawned follower");
-          }
+            println!("[game] spawned legacy follower");
         }
 
         // HUD: health bar + status text.
@@ -1924,7 +1879,7 @@ fn setup_world(
                 p.spawn((Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() },
                     BackgroundColor(Color::srgb(0.85, 0.75, 0.15)), StaminaBarFill));
             });
-        commands.spawn((Text::new("HP 200/200   Stamina 100   Zombies 6"),
+        commands.spawn((Text::new("HP 200/200   Stamina 100   Zombies 0"),
             TextFont { font_size: FontSize::Px(18.0), ..default() }, TextColor(Color::WHITE), HudLine::Status, HudHide,
             Node { position_type: PositionType::Absolute, left: Val::Px(20.0), top: Val::Px(66.0), ..default() }));
         commands.spawn((Text::new("OBJECTIVE: Use [WASD] to move."),
@@ -2407,7 +2362,7 @@ fn move_player(
     menu: Res<MenuRes>,
     cam_state: Option<Res<CameraStateRes>>,
     mut player: ResMut<Player>,
-    mut game: ResMut<GameState>,
+    mut game: Option<ResMut<LegacyMission>>,
     mut q: Query<&mut Transform, With<PlayerRoot>>,
     collision: Option<Res<Collision>>,
     graph: Option<ResMut<PlayerGraph>>,
@@ -2719,9 +2674,13 @@ fn move_player(
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();
     player.moving = speed > 0.05;
 
-    if player.moving && !game.move_notified {
-        game.move_notified = true;
-        game.tutorial.notify(&mission::TutorialTrigger::Custom("Scene.Move".to_string()));
+    if player.moving {
+        if let Some(game) = game.as_deref_mut() {
+            if !game.move_notified {
+                game.move_notified = true;
+                game.tutorial.notify(&mission::TutorialTrigger::Custom("Scene.Move".to_string()));
+            }
+        }
     }
 
     // Decompiled locomotion state machine: real speed thresholds -> PseudoSpeed band.
@@ -3089,70 +3048,6 @@ fn animate_single(_anim: Option<ResMut<SingleAnim>>, _meshes: ResMut<Assets<Mesh
 
 fn base_rot() -> Quat { Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2) }
 
-fn npc_ai(time: Res<Time>, menu: Res<MenuRes>, player: Option<Res<Player>>, world: Res<World>, mut game: ResMut<GameState>, mut q: Query<(&mut Transform, &mut Npc)>) {
-    if menu.active { return; }
-    let Some(player) = player else { return };
-    let dt = time.delta_secs().min(0.1);
-    let br = base_rot();
-    // Player is a noise source: louder while running.
-    let ph = height_at(&world.terrain, player.pos[0], player.pos[1]);
-    let ppos = [player.pos[0], player.pos[1], ph];
-    let noise = if player.moving { 2.2 } else { 0.6 };
-    game.horde.tick(dt);
-    for (mut t, mut npc) in &mut q {
-        let rng = game.ai_rng.next_f32();
-        let input = zombie_ai::ZombieInput { player_pos: ppos, player_noise: noise, dt, rng };
-        let out = zombie_ai::update(&mut npc.agent, &input);
-        if out.speed > 0.0 {
-            npc.agent.pos[0] += out.move_dir[0] * out.speed * dt;
-            npc.agent.pos[1] += out.move_dir[1] * out.speed * dt;
-        }
-        let h = height_at(&world.terrain, npc.agent.pos[0], npc.agent.pos[1]);
-        npc.agent.pos[2] = h;
-        t.translation = br * Vec3::new(npc.agent.pos[0], npc.agent.pos[1], h);
-        t.rotation = br * Quat::from_rotation_z(sod_core::class3_move::render_yaw(npc.agent.yaw));
-    }
-}
-
-fn animate_npcs(time: Res<Time>, mut meshes: ResMut<Assets<Mesh>>, mut q: Query<&mut Npc>) {
-    for mut npc in &mut q {
-        if npc.parts.is_empty() { continue; }
-        // Locomotion clip from the zombie behaviour state.
-        let want = match npc.agent.behavior {
-            zombie_ai::ZombieBehavior::Attack => anim::Locomotion::Attack,
-            zombie_ai::ZombieBehavior::Chase
-            | zombie_ai::ZombieBehavior::Flee
-            | zombie_ai::ZombieBehavior::Grab
-            | zombie_ai::ZombieBehavior::Feasting => anim::Locomotion::Run,
-            zombie_ai::ZombieBehavior::Wander
-            | zombie_ai::ZombieBehavior::Alert
-            | zombie_ai::ZombieBehavior::Search => anim::Locomotion::Walk,
-            _ => anim::Locomotion::Idle,
-        };
-        if want != npc.loc {
-            let c = npc.bank.caf_for(want).cloned();
-            if let Some(c) = c {
-                npc.caf = c;
-                npc.loc = want;
-            }
-        }
-        npc.time += time.delta_secs();
-        let dur = npc.caf.duration_secs().max(1.0 / 30.0);
-        let tick = npc.caf.tick_from_seconds(npc.time % dur);
-        let sample = npc.caf.sample_tick(tick);
-        let posed = npc.skeleton.pose_anchored(&sample);
-        let skin_m = npc.skeleton.skin_matrices(&posed);
-        for part in &npc.parts {
-            let npos = skin::deform(&part.bind_pos, &part.infl, &skin_m);
-            let nnrm = skin::deform_normals(&part.bind_nrm, &part.infl, &skin_m);
-            if let Some(mut m) = meshes.get_mut(&part.handle) {
-                m.insert_attribute(Mesh::ATTRIBUTE_POSITION, VertexAttributeValues::Float32x3(npos));
-                m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, VertexAttributeValues::Float32x3(nnrm));
-            }
-        }
-    }
-}
-
 fn follower_ai(
     time: Res<Time>,
     menu: Res<MenuRes>,
@@ -3211,31 +3106,46 @@ fn animate_followers(time: Res<Time>, mut meshes: ResMut<Assets<Mesh>>, mut q: Q
     }
 }
 
-/// Player melee/firearm input. The attack itself now runs through the original
-/// game-rules pipeline: this only translates the input into a
+/// Player melee/firearm input. The attack itself runs through the original
+/// game-rules pipeline: this only translates the pressed keys into a
 /// [`ai_bridge::PlayerAttackRequest`] (the bridge owns the script host and the
 /// damage model), exactly as `CreateHit` does in `singleplayer.lua:332`.
+///
+/// Base damages are the shipped weapon values: machete `80`
+/// (`meleemachete02.xml`, `notes/ai-combat.md §4.5`) and TacMaster 1911 `200`
+/// with a 600 rpm interval (`pistol_tacmaster1911.xml`). The unreplaced
+/// magazine/reload/stamina model lives in [`LegacyWeapons`] behind
+/// `SOD_LEGACY_WEAPONS`.
 fn player_attack(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     menu: Res<MenuRes>,
     player: Option<Res<Player>>,
-    state: Option<ResMut<PlayerState>>,
-    mut game: ResMut<GameState>,
+    mut combat_state: Option<ResMut<PlayerCombat>>,
+    legacy: Option<ResMut<LegacyWeapons>>,
     mut req: Option<ResMut<ai_bridge::PlayerAttackRequest>>,
 ) {
     if menu.active { return; }
-    let (Some(player), Some(mut state)) = (player, state) else { return };
+    let Some(player) = player else { return };
     let dt = time.delta_secs();
-    let PlayerState { vitals, melee, gun, gun_state, .. } = &mut *state;
     let auto = std::env::var("SOD_AUTOFIGHT").is_ok();
     // `SOD_AUTOFIGHT` closes to melee; `SOD_AUTOGUN` also fires at range.
     let auto_gun = std::env::var("SOD_AUTOGUN").is_ok();
-    game.auto_cd = (game.auto_cd - dt).max(0.0);
-    game.auto_fire_cd = (game.auto_fire_cd - dt).max(0.0);
-    let melee_now = keys.just_pressed(KeyCode::Space) || (auto && game.auto_cd <= 0.0);
-    let fire_now =
-        keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && game.auto_fire_cd <= 0.0);
+
+    // Weapon XML values (`notes/ai-combat.md §4.5`).
+    const MELEE_DAMAGE: f32 = 80.0;
+    const BULLET_DAMAGE: f32 = 200.0;
+    const MELEE_INTERVAL: f32 = 0.6;
+    const BULLET_INTERVAL: f32 = 60.0 / 600.0;
+
+    let (mut auto_cd, mut auto_fire_cd) = combat_state
+        .as_deref()
+        .map(|c| (c.auto_cd, c.auto_fire_cd))
+        .unwrap_or((0.0, 0.0));
+    auto_cd = (auto_cd - dt).max(0.0);
+    auto_fire_cd = (auto_fire_cd - dt).max(0.0);
+    let melee_now = keys.just_pressed(KeyCode::Space) || (auto && auto_cd <= 0.0);
+    let fire_now = keys.just_pressed(KeyCode::KeyF) || (auto && auto_gun && auto_fire_cd <= 0.0);
 
     let mut out = ai_bridge::PlayerAttackRequest {
         origin: player.mstate.pos,
@@ -3243,106 +3153,87 @@ fn player_attack(
         ..Default::default()
     };
 
-    // Auto-fight harness: keep the demo supplied so both weapon paths stay
-    // exercised (normal play waits for a real reload).
-    if auto && gun_state.in_mag == 0 && gun_state.reserve == 0 {
-        *gun_state = combat::GunState::new(7, 21);
-    }
-
-    if melee_now {
-        let cost = melee.stamina_cost();
-        let tired = vitals.stamina < cost;
-        vitals.stamina = (vitals.stamina - cost).max(0.0);
-        out.melee = Some(if tired { melee.damage * 0.5 } else { melee.damage });
-        game.auto_cd = 0.6;
-    }
-
-    if fire_now {
-        if let Some(dmg) = gun_state.fire(gun, dt) {
-            out.shot = Some(dmg);
-            game.auto_fire_cd = gun.shot_interval().max(0.1);
-        } else {
-            game.auto_fire_cd = 0.12;
-            if auto && gun_state.in_mag == 0 && gun_state.reload_left <= 0.0 {
-                gun_state.reload(gun);
+    match legacy {
+        // Unreplaced hand-written weapon model (ammo/reload/stamina).
+        Some(mut lw) => {
+            let LegacyWeapons { vitals, melee, gun, gun_state } = &mut *lw;
+            // Auto-fight harness: keep the demo supplied so both weapon paths
+            // stay exercised (normal play waits for a real reload).
+            if auto && gun_state.in_mag == 0 && gun_state.reserve == 0 {
+                *gun_state = combat::GunState::new(7, 21);
+            }
+            if melee_now {
+                let cost = melee.stamina_cost();
+                let tired = vitals.stamina < cost;
+                vitals.stamina = (vitals.stamina - cost).max(0.0);
+                out.melee = Some(if tired { melee.damage * 0.5 } else { melee.damage });
+                auto_cd = 0.6;
+            }
+            if fire_now {
+                if let Some(dmg) = gun_state.fire(gun, dt) {
+                    out.shot = Some(dmg);
+                    auto_fire_cd = gun.shot_interval().max(0.1);
+                } else {
+                    auto_fire_cd = 0.12;
+                    if auto && gun_state.in_mag == 0 && gun_state.reload_left <= 0.0 {
+                        gun_state.reload(gun);
+                    }
+                }
+            }
+            if keys.just_pressed(KeyCode::KeyR) && gun_state.reload(gun) {
+                println!("[combat] reloading {} ({}/{})", gun.name, gun_state.in_mag, gun_state.reserve);
+            }
+        }
+        // Default: the original pipeline owns the hit; feed it the shipped
+        // weapon damage and pace the input.
+        None => {
+            if melee_now {
+                out.melee = Some(MELEE_DAMAGE);
+                auto_cd = MELEE_INTERVAL;
+            }
+            if fire_now {
+                out.shot = Some(BULLET_DAMAGE);
+                auto_fire_cd = BULLET_INTERVAL;
             }
         }
     }
 
-    if keys.just_pressed(KeyCode::KeyR) && gun_state.reload(gun) {
-        println!("[combat] reloading {} ({}/{})", gun.name, gun_state.in_mag, gun_state.reserve);
+    if let Some(cs) = combat_state.as_deref_mut() {
+        cs.auto_cd = auto_cd;
+        cs.auto_fire_cd = auto_fire_cd;
     }
-
     if let Some(r) = req.as_deref_mut() {
         *r = out;
     }
 }
 
-/// Legacy proximity damage is retired: zombies now strike through the original
-/// `g_gameRules` hit pipeline in `ai_bridge::combat_step` (with perception,
-/// hit type/material and the recovered damage rules), not this per-`Npc` DPS.
-fn npc_attack(
-    _time: Res<Time>,
-    _menu: Res<MenuRes>,
-    _player: Option<Res<Player>>,
-    _state: Option<ResMut<PlayerState>>,
-    _q: Query<(&Transform, &Npc)>,
-) {
-}
-
-/// Advance the player's stamina/bleed and mirror the authoritative actor health
-/// (written by `ai_bridge::combat_step` through the game-rules pipeline) into
-/// the HUD vitals. The HUD therefore reads `self.actor` health, not the old
-/// separate approximation.
-fn player_vitals(
-    time: Res<Time>,
-    menu: Res<MenuRes>,
-    state: Option<ResMut<PlayerState>>,
-    cry: Option<NonSendMut<cry_bridge::CryHost>>,
-) {
-    if menu.active { return; }
-    let Some(mut state) = state else { return };
+/// Legacy weapon timers: stamina regen, gun cooldown/reload
+/// (`SOD_LEGACY_WEAPONS`).
+fn legacy_weapons_tick(time: Res<Time>, mut w: Option<ResMut<LegacyWeapons>>) {
+    let Some(w) = w.as_deref_mut() else { return };
     let dt = time.delta_secs();
-    state.vitals.tick(dt);
-    state.gun_state.tick(dt);
-    let cry = cry.as_deref();
-    if let Some(cry) = cry {
-        let pid = cry.player;
-        if let Ok(actors) = cry.host.ctx.actors.try_borrow() {
-            if let Some(a) = actors.get(&pid) {
-                state.vitals.max_hp = a.max_health.max(1.0);
-                state.vitals.hp = a.health.clamp(0.0, state.vitals.max_hp);
-            }
-        }
-    }
-    if state.vitals.is_downed() {
-        println!("[game] player downed -> revive");
-        state.vitals.revive();
-        if let Some(cry) = cry {
-            if let Some(a) = cry.host.ctx.actors.borrow_mut().get_mut(&cry.player) {
-                a.max_health = state.vitals.max_hp;
-                a.health = state.vitals.hp;
-            }
-        }
-    }
+    w.vitals.tick(dt);
+    w.gun_state.tick(dt);
 }
 
+/// Legacy container search/loot (`SOD_LEGACY_SEARCH`). No original-driven
+/// inventory/search exists yet.
 fn search_system(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     menu: Res<MenuRes>,
     player: Option<Res<Player>>,
     world: Res<World>,
-    state: Option<ResMut<PlayerState>>,
-    mut game: ResMut<GameState>,
+    mut state: ResMut<LegacySearch>,
+    mut mission: Option<ResMut<LegacyMission>>,
 ) {
     if menu.active { return; }
-    let (Some(player), Some(mut state)) = (player, state) else { return };
+    let Some(player) = player else { return };
     let dt = time.delta_secs();
     let auto = std::env::var("SOD_AUTOSEARCH").is_ok();
-    game.auto_search_cd = (game.auto_search_cd - dt).max(0.0);
-    let search_now = keys.just_pressed(KeyCode::KeyE) || (auto && game.auto_search_cd <= 0.0);
-    if search_now && game.search.is_none() {
+    state.auto_cd = (state.auto_cd - dt).max(0.0);
+    let search_now = keys.just_pressed(KeyCode::KeyE) || (auto && state.auto_cd <= 0.0);
+    if search_now && state.search.is_none() {
         let br = base_rot();
         let pw = br * Vec3::new(player.pos[0], player.pos[1], 0.0);
         let mut best: Option<f32> = None;
@@ -3354,39 +3245,42 @@ fn search_system(
         if best.map_or(false, |d| d < 25.0) {
             let mut ss = inventory::SearchState::new(2.5);
             {
-                let GameState { loot, rng, .. } = &mut *game;
+                let LegacySearch { loot, rng, .. } = &mut *state;
                 ss.roll(loot, rng);
             }
-            game.search = Some(SearchTask { state: ss });
-            game.auto_search_cd = 3.0;
+            state.search = Some(SearchTask { state: ss });
+            state.auto_cd = 3.0;
             println!("[search] started");
         } else {
-            game.auto_search_cd = 1.0;
+            state.auto_cd = 1.0;
             println!("[search] nothing nearby (nearest prop {:.1} m)", best.unwrap_or(f32::INFINITY));
         }
     }
-    if let Some(mut task) = game.search.take() {
+    if let Some(mut task) = state.search.take() {
         if task.state.tick(dt) {
             let loot = std::mem::take(&mut task.state.loot);
-            {
-                let PlayerState { inv, db, .. } = &mut *state;
-                for item in loot {
-                    let id = item.id.clone();
-                    let count = item.count;
-                    let leftover = inv.add_with_db(item, db);
-                    println!("[search] found {} x{} (leftover {})", id, count, leftover);
-                }
+            for item in loot {
+                let id = item.id.clone();
+                let count = item.count;
+                let leftover = {
+                    let LegacySearch { inv, db, .. } = &mut *state;
+                    inv.add_with_db(item, db)
+                };
+                println!("[search] found {} x{} (leftover {})", id, count, leftover);
             }
-            state.vitals.heal(5.0);
-            game.tutorial.notify(&mission::TutorialTrigger::SearchContainer);
+            if let Some(m) = mission.as_deref_mut() {
+                m.tutorial.notify(&mission::TutorialTrigger::SearchContainer);
+            }
             println!("[search] complete");
         } else {
-            game.search = Some(task);
+            state.search = Some(task);
         }
     }
 }
 
-fn tutorial_system(menu: Res<MenuRes>, player: Option<Res<Player>>, mut game: ResMut<GameState>) {
+/// Legacy tutorial objectives (`SOD_LEGACY_MISSION`). No original-driven
+/// mission/objective runtime exists yet.
+fn tutorial_system(menu: Res<MenuRes>, player: Option<Res<Player>>, mut game: ResMut<LegacyMission>) {
     if menu.active { return; }
     let Some(player) = player else { return };
     let p = [player.pos[0], player.pos[1]];
@@ -3402,10 +3296,11 @@ fn tutorial_system(menu: Res<MenuRes>, player: Option<Res<Player>>, mut game: Re
 
 fn hud_update(
     time: Res<Time>,
-    state: Option<Res<PlayerState>>,
-    game: Option<Res<GameState>>,
+    mission: Option<Res<LegacyMission>>,
+    search: Option<Res<LegacySearch>>,
+    weapons: Option<Res<LegacyWeapons>>,
     player: Option<Res<Player>>,
-    npcs: Query<&Npc>,
+    cry: Option<NonSendMut<cry_bridge::CryHost>>,
     hud_res: Option<ResMut<HudRes>>,
     mut hbar: Query<&mut Node, (With<HealthBarFill>, Without<StaminaBarFill>, Without<RadarBlipNode>)>,
     mut sbar: Query<&mut Node, (With<StaminaBarFill>, Without<HealthBarFill>, Without<RadarBlipNode>)>,
@@ -3413,19 +3308,34 @@ fn hud_update(
     mut blips: Query<(&mut Node, &mut BackgroundColor, &RadarBlipNode), (Without<HealthBarFill>, Without<StaminaBarFill>)>,
 ) {
     let Some(mut hud_res) = hud_res else { return };
-    let vitals = state.as_ref().map(|s| s.vitals).unwrap_or_else(|| combat::Vitals::new(100.0, 100.0));
+    // Health is the authoritative actor health from the original combat
+    // pipeline (`ai_bridge::combat_step` -> `cry::actor`); stamina is the
+    // unreplaced legacy value when its flag is on, else a full bar. The HUD no
+    // longer owns a separate player-health approximation.
+    let mut vitals = weapons
+        .as_ref()
+        .map(|w| w.vitals)
+        .unwrap_or_else(|| combat::Vitals::new(combat::PLAYER_MAX_HEALTH, 100.0));
+    if let Some(cry) = cry.as_deref() {
+        let pid = cry.player;
+        if let Ok(actors) = cry.host.ctx.actors.try_borrow() {
+            if let Some(a) = actors.get(&pid) {
+                vitals.max_hp = a.max_health.max(1.0);
+                vitals.hp = a.health.clamp(0.0, vitals.max_hp);
+            }
+        }
+    }
     let (ppos, pyaw) = player
         .as_ref()
         .map(|p| ([p.mstate.pos[0], p.mstate.pos[1], p.mstate.pos[2]], p.mstate.yaw))
         .unwrap_or(([0.0; 3], 0.0));
-    let hud_npcs: Vec<hud::HudNpc> = npcs
-        .iter()
-        .map(|n| hud::HudNpc { pos: n.agent.pos, kind: n.kind as u8, threat: n.agent.alert })
-        .collect();
-    let objective = game.as_ref().and_then(|g| g.tutorial.current().map(|s| s.text.clone()));
+    // Radar blips now come from the native spawn director (ai_bridge); the
+    // HUD consumes them there, so this legacy list is empty.
+    let hud_npcs: Vec<hud::HudNpc> = Vec::new();
+    let objective = mission.as_ref().and_then(|g| g.tutorial.current().map(|s| s.text.clone()));
     {
-        let db = state.as_ref().map(|s| &s.db);
-        let inv = state.as_ref().map(|s| &s.inv);
+        let db = search.as_ref().map(|s| &s.db);
+        let inv = search.as_ref().map(|s| &s.inv);
         let ctx = hud::HudCtx {
             vitals,
             player_pos: ppos,

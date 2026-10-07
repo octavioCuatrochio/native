@@ -9,7 +9,6 @@ pub mod ag_cost;
 pub mod ag_driver;
 pub mod ag_graph;
 pub mod ag_runtime;
-pub mod ai;
 pub mod anim;
 pub mod anim_alias;
 pub mod anim_graph;
@@ -61,6 +60,5 @@ pub mod terrain;
 pub mod tod;
 pub mod vegetation;
 pub mod view_system;
-pub mod zombie_ai;
 
 pub use crypak::{Pak, Vfs};

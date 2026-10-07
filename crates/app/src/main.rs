@@ -83,6 +83,11 @@ struct World {
     ground_albedo: Option<(u32, u32, Vec<u8>)>,
 }
 
+/// Static collision world (CryPhysics replacement): terrain plus the physics
+/// proxies of every placed brush and script-loaded prop.
+#[derive(Resource)]
+struct Collision(sod_core::cry::phys_world::CollisionWorld);
+
 #[derive(Resource)]
 struct PlayerSetup {
     model: DecodedModel,
@@ -618,6 +623,24 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     println!("[world] architecture: {} brush instances / {} models within {:.0}m",
         brushes.len(), unique_brush_models.len(), arch_radius);
 
+    // Collision from the same geometry the renderer draws.
+    let collision = if std::env::var("SOD_NOCOLLIDE").is_ok() {
+        None
+    } else {
+        use sod_core::cry::phys_world::{CollisionWorld, InstanceSpec};
+        let t0 = std::time::Instant::now();
+        let mut specs: Vec<InstanceSpec> = brushes
+            .iter()
+            .map(|(m, p, r, sc)| InstanceSpec { model: m.clone(), pos: *p, rot: *r, scale: [*sc; 3] })
+            .collect();
+        specs.extend(with_models.iter().filter_map(|p| {
+            p.model.as_ref().map(|m| InstanceSpec { model: m.clone(), pos: p.pos, rot: p.rot, scale: p.scale })
+        }));
+        let cw = CollisionWorld::build(Some(ter.clone()), &vfs, &specs);
+        println!("[world] collision: {} instances in {:.0} ms", specs.len(), t0.elapsed().as_secs_f32() * 1000.0);
+        Some(Collision(cw))
+    };
+
     // Trees / bushes (vegetation) from the same octree.
     let veg_radius = 360.0f32;
     let mut vegetation: Vec<(String, [f32; 3], f32, f32)> = Vec::new();
@@ -809,6 +832,9 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .insert_resource(CamLagRes(sod_core::camera::CameraLag::new()))
     .insert_resource(HudRes(hud::HudState::new()))
     .add_systems(Startup, setup_world);
+    if let Some(c) = collision {
+        app.insert_resource(c);
+    }
     if let Some(t) = npc_template {
         app.insert_resource(t);
     }
@@ -1340,6 +1366,7 @@ fn move_player(
     mut player: ResMut<Player>,
     mut game: ResMut<GameState>,
     mut q: Query<&mut Transform, With<PlayerRoot>>,
+    collision: Option<Res<Collision>>,
 ) {
     if menu.active {
         return;
@@ -1373,8 +1400,42 @@ fn move_player(
 
     // 1:1 Class3 controller: CPlayerMovementController::UpdateNormal + CPlayerRotation.
     let input = sod_core::class3_move::MoveInput { forward: fwd_l, strafe: strafe_l, mouse_dx: 0.0, mouse_dy: 0.0, crouch, sprint, dt };
-    let ground = |x: f32, y: f32| height_at(&world.terrain, x, y);
+    use sod_core::class3_physics::{PLAYER_CAPSULE_HEIGHT, PLAYER_CAPSULE_RADIUS, STEP_HEIGHT};
+    let feet_z = player.mstate.pos[2];
+    // Ground = the first surface below the feet, reachable within one step up
+    // (roofs, porches and rocks included), else the terrain.
+    let ground = |x: f32, y: f32| match collision.as_ref() {
+        Some(c) => c
+            .0
+            .raycast([x, y, feet_z + STEP_HEIGHT + 0.05], [0.0, 0.0, -1.0], 60.0)
+            .map(|h| h.point[2])
+            .unwrap_or_else(|| height_at(&world.terrain, x, y)),
+        None => height_at(&world.terrain, x, y),
+    };
+    let before = player.mstate.pos;
     sod_core::class3_move::update_normal(&mut player.mstate, &input, &t, &ground, &[]);
+    // Walls: slide the capsule from the previous position along the move;
+    // keep the controller's grounded height and drop velocity into the wall.
+    if let Some(c) = collision.as_ref() {
+        let after = player.mstate.pos;
+        let delta = [after[0] - before[0], after[1] - before[1], 0.0];
+        let lifted = [before[0], before[1], after[2] + STEP_HEIGHT];
+        let sw = c.0.sweep_capsule(lifted, delta, PLAYER_CAPSULE_RADIUS, PLAYER_CAPSULE_HEIGHT - STEP_HEIGHT);
+        player.mstate.pos[0] = sw.pos[0];
+        player.mstate.pos[1] = sw.pos[1];
+        if let Some(ct) = sw.contact {
+            let n = [ct.normal[0], ct.normal[1]];
+            let nl = (n[0] * n[0] + n[1] * n[1]).sqrt();
+            if nl > 1e-3 {
+                let n = [n[0] / nl, n[1] / nl];
+                let into = player.mstate.vel[0] * n[0] + player.mstate.vel[1] * n[1];
+                if into < 0.0 {
+                    player.mstate.vel[0] -= into * n[0];
+                    player.mstate.vel[1] -= into * n[1];
+                }
+            }
+        }
+    }
     player.pos = [player.mstate.pos[0], player.mstate.pos[1]];
     player.yaw = player.mstate.yaw;
     let speed = (player.mstate.vel[0] * player.mstate.vel[0] + player.mstate.vel[1] * player.mstate.vel[1]).sqrt();

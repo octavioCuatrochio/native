@@ -6,6 +6,7 @@
 //!   `sod-native <game> <model.cgf|.chr>` single asset
 
 mod cry_bridge;
+mod terrain_bridge;
 mod ai_bridge;
 mod char_material;
 mod light_bridge;
@@ -1774,6 +1775,22 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     .insert_resource(CamLagRes(sod_core::camera::CameraLag::new()))
     .insert_resource(HudRes(hud::HudState::new()))
     .add_systems(Startup, setup_world);
+    // Per-frame sector LOD re-selection (CTerrainNode::SetLOD/CheckVis each frame):
+    // rebuild only nodes whose stitching changed and stream the merged mesh back.
+    // Skipped for the A/B uniform / near-far controls and if the quadtree failed to decode.
+    let dynamic_lod = qtree.is_some()
+        && std::env::var("SOD_TERRAIN_STRIDE").ok().and_then(|v| v.parse::<usize>().ok()).is_none()
+        && std::env::var("SOD_TERRAIN_LOD").ok().as_deref() != Some("0");
+    if dynamic_lod {
+        if let Some(root) = qtree {
+            app.insert_resource(terrain_bridge::TerrainLodState::new(
+                root,
+                surface_types.clone(),
+                terrain::TerrainLodParams { camera: start_cry, ..Default::default() },
+            ));
+            app.add_systems(PostUpdate, terrain_bridge::update_terrain_lod);
+        }
+    }
     if let Some((table, skeleton)) = anim_parts {
         app.insert_resource(AnimCtx { table, skeleton, vfs });
     }

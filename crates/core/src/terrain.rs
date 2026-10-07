@@ -53,9 +53,20 @@ const MAX_DEPTH: usize = 64;
 const MAX_TERRAIN_NODES: usize = 5_000_000;
 const MAX_OBJECT_NODES: usize = 5_000_000;
 
-/// Surface id stored for samples that are undefined (`surface_local == 14`) or a
-/// hole (`surface_local == 15`), or whose local index is outside the node palette.
+/// Surface id stored for samples that are undefined (`surface_local == 14`) or
+/// whose local index is outside the node palette.
 pub const SURFACE_UNDEFINED: u8 = 255;
+
+/// Surface id stored for authored terrain **holes** (`surface_local == 15`).
+///
+/// The raw field's low nibble selects the node's `pTypes` palette; local `15`
+/// is `SRangeInfo::e_index_hole` and is the engine's per-sample hole flag (the
+/// node's `bHasHoles` chunk field is set for any node containing one). The
+/// shipping engine cuts the quad whose centre sample is a hole
+/// (`CTerrainNode::BuildIndices`, `Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp`),
+/// so the drawn mesh leaves a real gap there instead of a coloured patch. Kept
+/// distinct from [`SURFACE_UNDEFINED`] so mesh generation can cut it.
+pub const SURFACE_HOLE: u8 = 254;
 
 /// A reconstructed terrain heightmap.
 #[derive(Debug, Clone)]
@@ -367,11 +378,13 @@ fn height_at(lf: &Leaf, x: f64, y: f64) -> Option<f64> {
 }
 
 /// Map a raw sample's low-nibble local palette index to its global
-/// `SurfaceTypeID`. Local `14` (undefined) and `15` (hole), and any index outside
-/// the node palette, map to [`SURFACE_UNDEFINED`].
+/// `SurfaceTypeID`. Local `14` (undefined) and any index outside the node
+/// palette map to [`SURFACE_UNDEFINED`]; local `15` is the authored hole flag
+/// and maps to [`SURFACE_HOLE`].
 fn global_surface(lf: &Leaf, local: u8) -> u8 {
     match local {
-        14 | 15 => SURFACE_UNDEFINED,
+        14 => SURFACE_UNDEFINED,
+        15 => SURFACE_HOLE,
         _ => lf.types.get(local as usize).copied().unwrap_or(SURFACE_UNDEFINED),
     }
 }
@@ -521,6 +534,29 @@ impl Terrain {
         let iy = ((y / self.spacing).round() as isize).clamp(0, self.samples as isize - 1) as usize;
         self.surfaces[iy * self.samples + ix]
     }
+
+    /// Whether the lattice sample at column `i`, row `j` is an authored terrain
+    /// hole (`surface_local == 15`). Out-of-range indices are not holes.
+    #[inline]
+    pub fn is_hole_sample(&self, i: usize, j: usize) -> bool {
+        let s = self.samples;
+        if i >= s || j >= s {
+            return false;
+        }
+        self.surfaces.get(j * s + i).copied() == Some(SURFACE_HOLE)
+    }
+
+    /// Nearest-sample hole test at world `(x, y)`, using the same cell-centre
+    /// index convention as [`Terrain::height_interp`].
+    pub fn hole_at(&self, x: f32, y: f32) -> bool {
+        let s = self.samples;
+        if s == 0 || self.spacing <= 0.0 {
+            return false;
+        }
+        let ix = ((x - self.world_min[0]) / self.spacing - 0.5).round().clamp(0.0, s as f32 - 1.0) as usize;
+        let iy = ((y - self.world_min[1]) / self.spacing - 0.5).round().clamp(0.0, s as f32 - 1.0) as usize;
+        self.is_hole_sample(ix, iy)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,11 +670,21 @@ pub const TERRAIN_LOD_DIST_RATIO_DEFAULT: f32 = 1.0;
 /// 64 m sector of 2 m units).
 const GEOM_LEVELS: usize = 5;
 
+/// `CTerrain::GetSectorSize()` in metres. SoD's header is `nSectorSize_InMeters
+/// = 64`; the shipped exe holds `64` at VA `0x18f7c9c` (read by the SetLOD
+/// prologue below and by the tree-size maths). The engine's near cutoff is
+/// this value (`name + name/4 = 80`), *not* the node's own size, so every
+/// sector within 80 m of the camera is forced to LOD0.
+pub const TERRAIN_SECTOR_SIZE: f32 = 64.0;
+
 /// One node of the serialized `CTerrainNode` quadtree: its world AABB, its
 /// quadtree level, its native heightmap sample shift and the per-LOD geometry
 /// errors the terrain compiler baked into `STerrainNodeChunk.pGeomErrors[5]`.
 #[derive(Debug, Clone)]
 pub struct TerrainSector {
+    /// Stable pre-order identity, unique within one decoded quadtree. Used as
+    /// the per-node LOD mesh cache key.
+    pub id: u32,
     /// World AABB minimum `(x, y, z)` in metres.
     pub min: [f32; 3],
     /// World AABB maximum `(x, y, z)` in metres.
@@ -733,11 +779,14 @@ fn parse_sector(
     sector: f32,
     depth: usize,
     budget: &mut usize,
+    next_id: &mut u32,
 ) -> Option<TerrainSector> {
     if depth > MAX_DEPTH || *budget == 0 {
         return None;
     }
     *budget -= 1;
+    let id = *next_id;
+    *next_id = next_id.wrapping_add(1);
 
     let base = *pos;
     if base.checked_add(TERRAIN_NODE_LEN)? > dat.len() {
@@ -796,6 +845,7 @@ fn parse_sector(
 
     let node_size = (max_x - min_x).max(0.0);
     let mut node = TerrainSector {
+        id,
         min: [min_x, min_y, min_z],
         max: [max_x, max_y, max_z],
         tree_level: sector_tree_level(node_size, sector),
@@ -806,7 +856,7 @@ fn parse_sector(
 
     if size == 0 {
         for _ in 0..4 {
-            let child = parse_sector(dat, &mut p, geom, sector, depth + 1, budget)?;
+            let child = parse_sector(dat, &mut p, geom, sector, depth + 1, budget, next_id)?;
             node.children.push(child);
         }
         node.shift = node.children.iter().map(|c| c.shift).min().unwrap_or(0);
@@ -823,7 +873,8 @@ pub fn decode_quadtree(dat: &[u8]) -> Option<TerrainSector> {
     let start = data_offset(dat)?;
     let mut pos = start;
     let mut budget = MAX_TERRAIN_NODES;
-    parse_sector(dat, &mut pos, hdr.geom_shift, hdr.sector as f32, 0, &mut budget)
+    let mut next_id = 0u32;
+    parse_sector(dat, &mut pos, hdr.geom_shift, hdr.sector as f32, 0, &mut budget, &mut next_id)
 }
 
 /// Shortest distance from a point to a node's world AABB (0 when inside),
@@ -845,9 +896,20 @@ fn point_to_box(p: [f32; 3], s: &TerrainSector) -> f32 {
 }
 
 /// `CTerrainNode::SetLOD`: the mip level a node is drawn at for this camera.
+///
+/// Recovered from SoD's own exe (CE 3.x), not CRYENGINE 5:
+/// * near cutoff `fDist < CTerrain::GetSectorSize() + (GetSectorSize() >> 2)`,
+///   i.e. 80 m: the prologue at `0x568893` loads the 64 at `0x18f7c9c`, shifts
+///   right by 2 and adds it back before `comiss`/`jbe`. Unlike CRYENGINE 5 this
+///   is the *global* sector size, so it does not scale with `m_nTreeLevel`.
+/// * `fAllowedError = (zoom * e_TerrainLodRatio * fDist) / 180 * 2.5`: at
+///   `0x5688d1` it loads `e_TerrainLodRatio` (`[C3DEngine+0x624]`), multiplies
+///   by the `1.0` at `0x18f77cc` (the baked zoom), by `fDist`, then by the
+///   `1/180` at `0x172c354` and the `2.5` at `0x172d828`.
+/// * `m_cNewGeomMML = min(nGeomMML, int(fDist / 32))`: the `1/32` at
+///   `0x17201f4` is multiplied in at `0x568915` before `cvttss2si`/`cmovl`.
 fn sector_lod(s: &TerrainSector, dist: f32, p: &TerrainLodParams) -> u32 {
-    let size = s.size();
-    if dist < size + size * 0.25 {
+    if dist < TERRAIN_SECTOR_SIZE + TERRAIN_SECTOR_SIZE * 0.25 {
         return 0;
     }
     // fAllowedError = (zoom * e_TerrainLodRatio * fDist) / 180 * 2.5
@@ -1030,6 +1092,198 @@ pub fn build_quadtree_lod(
     }
 
     TerrainLod { positions, indices, sectors: rendered.len(), max_lod }
+}
+
+// ---------------------------------------------------------------------------
+// per-frame visible-sector set and per-node chunk meshes
+// ---------------------------------------------------------------------------
+//
+// A moving camera must be able to re-run `CTerrainNode::CheckVis`/`SetLOD`
+// every frame and only rebuild the nodes whose level changed. [`TerrainVis`]
+// is the per-frame result of that recursion: the rendered nodes with their
+// chosen LODs plus the occupancy map the crack fix needs. The caller (the app)
+// keeps a cache keyed by [`TerrainSector::id`], and only calls [`TerrainVis::build_at`]
+// when [`TerrainVis::signature_at`] changes, so height sampling for unchanged
+// nodes is skipped entirely.
+
+/// One rendered sector's geometry; indices are node-local.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
+/// The rendered sector set for one camera position, with the coarse-occupancy
+/// map used to snap fine borders onto coarser neighbours (`AddIndexAliased`).
+pub struct TerrainVis<'a> {
+    /// `(node, chosen LOD)` for each node the recursion rendered.
+    pub nodes: Vec<(&'a TerrainSector, u32)>,
+    spacing: f32,
+    base: f32,
+    cells: usize,
+    occupancy: Vec<u8>,
+}
+
+impl<'a> TerrainVis<'a> {
+    /// Run `CheckVis`/`SetLOD` for `params.camera` and build the neighbour
+    /// lookup used for stitching.
+    pub fn new(t: &Terrain, root: &'a TerrainSector, params: &TerrainLodParams) -> Self {
+        let mut nodes = Vec::new();
+        collect_sectors(root, params, &mut nodes);
+        let base = min_leaf_size(root).max(t.spacing).max(1.0);
+        let world = ((root.max[0] - root.min[0]).max(root.max[1] - root.min[1])).max(1.0);
+        let cells = (world / base).round().max(1.0) as usize;
+        if cells > 8192 {
+            // A macho guard for absurd input; the real world is 4096/64 = 64.
+            return TerrainVis { nodes, spacing: t.spacing, base, cells: 0, occupancy: Vec::new() };
+        }
+        let mut occupancy = vec![u8::MAX; cells * cells];
+        let cell_of = |v: f32| -> i32 { ((v - root.min[0]) / base).floor() as i32 };
+        for (s, lod) in &nodes {
+            let x0 = cell_of(s.min[0]).max(0);
+            let y0 = cell_of(s.min[1]).max(0);
+            let x1 = cell_of(s.max[0]).min(cells as i32);
+            let y1 = cell_of(s.max[1]).min(cells as i32);
+            for cy in y0..y1 {
+                for cx in x0..x1 {
+                    occupancy[cy as usize * cells + cx as usize] = *lod as u8;
+                }
+            }
+        }
+        TerrainVis { nodes, spacing: t.spacing, base, cells, occupancy }
+    }
+
+    fn neighbour_lod(&self, root: &TerrainSector, x: f32, y: f32, fallback: u32) -> u32 {
+        if self.cells == 0 {
+            return fallback;
+        }
+        let cx = ((x - root.min[0]) / self.base).floor() as i32;
+        let cy = ((y - root.min[1]) / self.base).floor() as i32;
+        if cx < 0 || cy < 0 || cx >= self.cells as i32 || cy >= self.cells as i32 {
+            return fallback;
+        }
+        let v = self.occupancy[cy as usize * self.cells + cx as usize];
+        if v == u8::MAX { fallback } else { v as u32 }
+    }
+
+    /// The four border neighbour-LOD arrays (`left, right, bottom, top`) for a
+    /// node, exactly as used to snap that node's border indices.
+    fn border_lods(
+        &self,
+        root: &TerrainSector,
+        s: &TerrainSector,
+        lod: u32,
+        count: usize,
+        step: f32,
+    ) -> [Vec<u32>; 4] {
+        let b = self.base;
+        let mut out: [Vec<u32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for j in 0..=count {
+            let y = s.min[1] + j as f32 * step + 0.5;
+            out[0].push(self.neighbour_lod(root, s.min[0] - b * 0.5, y, lod));
+            out[1].push(self.neighbour_lod(root, s.max[0] + b * 0.5, y, lod));
+        }
+        for i in 0..=count {
+            let x = s.min[0] + i as f32 * step + 0.5;
+            out[2].push(self.neighbour_lod(root, x, s.min[1] - b * 0.5, lod));
+            out[3].push(self.neighbour_lod(root, x, s.max[1] + b * 0.5, lod));
+        }
+        out
+    }
+
+    /// Cache key for one rendered node: its own LOD plus the neighbour LODs all
+    /// along its four borders. Two calls with the same signature produce the
+    /// same geometry, so the app can reuse its cached mesh.
+    pub fn signature_at(&self, root: &TerrainSector, idx: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let (s, lod) = self.nodes[idx];
+        let step = self.spacing * (1u32 << lod) as f32;
+        let count = (s.size() / step).round() as usize;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        lod.hash(&mut h);
+        count.hash(&mut h);
+        let [l, r, b, t] = self.border_lods(root, s, lod, count, step);
+        l.hash(&mut h);
+        r.hash(&mut h);
+        b.hash(&mut h);
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    /// Build the mesh for rendered node `idx`, cutting authored holes and
+    /// snapping borders to coarser neighbours.
+    pub fn build_at(&self, t: &Terrain, root: &TerrainSector, idx: usize) -> NodeMesh {
+        let (s, lod) = self.nodes[idx];
+        let step = t.spacing * (1u32 << lod) as f32;
+        let count = (s.size() / step).round() as usize;
+        if count == 0 || t.samples == 0 {
+            return NodeMesh::default();
+        }
+        let nv = count + 1;
+        let [left, right, bottom, top] = self.border_lods(root, s, lod, count, step);
+
+        let pos_of = |ki: usize, kj: usize| -> [f32; 3] {
+            let x = s.min[0] + ki as f32 * step + t.spacing * 0.5;
+            let y = s.min[1] + kj as f32 * step + t.spacing * 0.5;
+            [x, y, t.height_interp(x, y)]
+        };
+
+        let mut positions = Vec::with_capacity(nv * nv);
+        for kj in 0..=count {
+            for ki in 0..=count {
+                positions.push(pos_of(ki, kj));
+            }
+        }
+
+        let snapped = |ki: usize, kj: usize| -> u32 {
+            let mut xi = ki;
+            let mut yj = kj;
+            if ki == 0 {
+                yj = snap_index(yj, lod, left[kj]);
+            }
+            if ki == count {
+                yj = snap_index(yj, lod, right[kj]);
+            }
+            if kj == 0 {
+                xi = snap_index(xi, lod, bottom[ki]);
+            }
+            if kj == count {
+                xi = snap_index(xi, lod, top[ki]);
+            }
+            (yj * nv + xi) as u32
+        };
+
+        // Native sample stride between vertices at this LOD.
+        let stride = (step / t.spacing).round().max(1.0) as isize;
+        let base_i = ((s.min[0] - t.world_min[0]) / t.spacing).round() as isize;
+        let base_j = ((s.min[1] - t.world_min[1]) / t.spacing).round() as isize;
+        let quad_is_hole = |ci: usize, cj: usize| -> bool {
+            let i0 = base_i + ci as isize * stride;
+            let j0 = base_j + cj as isize * stride;
+            for (i, j) in [(i0, j0), (i0 + stride, j0), (i0, j0 + stride), (i0 + stride, j0 + stride)] {
+                if i >= 0 && j >= 0 && t.is_hole_sample(i as usize, j as usize) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        let mut indices = Vec::with_capacity(count * count * 6);
+        for cj in 0..count {
+            for ci in 0..count {
+                if quad_is_hole(ci, cj) {
+                    continue;
+                }
+                let a = snapped(ci, cj);
+                let b = snapped(ci + 1, cj);
+                let c = snapped(ci + 1, cj + 1);
+                let d = snapped(ci, cj + 1);
+                indices.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+
+        NodeMesh { positions, indices }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,7 +1747,7 @@ mod tests {
         };
         assert_eq!(surface_global_at(&lf, 0.0, 0.0), Some(12)); // raw[0], local 2
         assert_eq!(surface_global_at(&lf, 0.0, 2.0), Some(SURFACE_UNDEFINED)); // local 14
-        assert_eq!(surface_global_at(&lf, 0.0, 4.0), Some(SURFACE_UNDEFINED)); // local 15
+        assert_eq!(surface_global_at(&lf, 0.0, 4.0), Some(SURFACE_HOLE)); // local 15
         assert_eq!(surface_global_at(&lf, 2.0, 0.0), Some(11)); // raw[3], local 1
         assert_eq!(surface_global_at(&lf, 2.0, 2.0), Some(SURFACE_UNDEFINED)); // local 7 OOR
     }
@@ -1637,6 +1891,7 @@ mod tests {
         assert!(decode_quadtree(&[0u8; 64]).is_none());
         let empty = Terrain { samples: 0, spacing: 2.0, world_min: [0.0; 3], heights: vec![], surfaces: vec![], min: 0.0, max: 0.0 };
         let root = decode_quadtree(&[0u8; 64]).unwrap_or_else(|| TerrainSector {
+            id: 0,
             min: [0.0; 3],
             max: [0.0; 3],
             tree_level: 0,
@@ -1646,5 +1901,121 @@ mod tests {
         });
         let lod = build_quadtree_lod(&empty, &root, &TerrainLodParams::default());
         assert!(lod.positions.is_empty());
+    }
+
+    /// The chunked (per-frame) builder must tile exactly the same surface as
+    /// the whole-mesh builder; it only differs by cutting authored holes.
+    #[test]
+    fn class3_chunked_lod_matches_merged() {
+        let Some(dat) = load(CLASS3) else { return };
+        let t = decode_terrain_hires(&dat).expect("hires");
+        let root = decode_quadtree(&dat).expect("quadtree");
+        let params = TerrainLodParams { camera: [3246.8, 3256.2, 217.2], ..Default::default() };
+        let merged = build_quadtree_lod(&t, &root, &params);
+        let vis = TerrainVis::new(&t, &root, &params);
+        assert_eq!(vis.nodes.len(), merged.sectors);
+
+        let mut all_pos: Vec<[f32; 3]> = Vec::new();
+        let mut index_count = 0usize;
+        for i in 0..vis.nodes.len() {
+            let m = vis.build_at(&t, &root, i);
+            for &x in &m.indices {
+                assert!((x as usize) < m.positions.len());
+            }
+            index_count += m.indices.len();
+            all_pos.extend_from_slice(&m.positions);
+        }
+        assert_eq!(all_pos.len(), merged.positions.len());
+        // Holes only remove triangles, never vertices.
+        assert!(index_count <= merged.indices.len());
+
+        let key = |p: [f32; 3]| {
+            ((p[0] * 4.0).round() as i64, (p[1] * 4.0).round() as i64, (p[2] * 4.0).round() as i64)
+        };
+        let mut a: Vec<_> = all_pos.iter().map(|&p| key(p)).collect();
+        let mut b: Vec<_> = merged.positions.iter().map(|&p| key(p)).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "chunked mesh must cover the same lattice as the merged mesh");
+    }
+
+    /// Re-selecting LOD for a moving camera changes which nodes are drawn and
+    /// at what level, and the foreground stays at LOD0 (native samples).
+    #[test]
+    fn class3_lod_reselects_as_camera_moves() {
+        let Some(dat) = load(CLASS3) else { return };
+        let t = decode_terrain_hires(&dat).expect("hires");
+        let root = decode_quadtree(&dat).expect("quadtree");
+        let start = [3246.8, 3256.2, 217.2];
+        let far = [1200.0, 1200.0, 150.0];
+        let va = TerrainVis::new(&t, &root, &TerrainLodParams { camera: start, ..Default::default() });
+        let vb = TerrainVis::new(&t, &root, &TerrainLodParams { camera: far, ..Default::default() });
+        let sa: Vec<(u32, u32)> = va.nodes.iter().map(|(s, l)| (s.id, *l)).collect();
+        let sb: Vec<(u32, u32)> = vb.nodes.iter().map(|(s, l)| (s.id, *l)).collect();
+        assert_ne!(sa, sb, "moving the camera must change the rendered sector set");
+
+        // For each camera the foreground is full detail, drawn from the 2 m
+        // samples, and every node's mesh is finite with in-range indices.
+        for (vis, cam) in [(&va, start), (&vb, far)] {
+            let mut near = 0usize;
+            for i in 0..vis.nodes.len() {
+                let m = vis.build_at(&t, &root, i);
+                for &x in &m.indices {
+                    assert!((x as usize) < m.positions.len());
+                }
+                for p in &m.positions {
+                    assert!(p.iter().all(|c| c.is_finite()));
+                    let d = ((p[0] - cam[0]).powi(2) + (p[1] - cam[1]).powi(2)).sqrt();
+                    if d < 60.0 {
+                        near += 1;
+                        let gi = |v: f32| -> usize {
+                            ((v / t.spacing) - 0.5).round().clamp(0.0, t.samples as f32 - 1.0) as usize
+                        };
+                        let ix = gi(p[0]);
+                        let iy = gi(p[1]);
+                        assert!((p[2] - t.heights[iy * t.samples + ix]).abs() < 1e-3);
+                    }
+                }
+            }
+            assert!(near > 100, "expected full detail near the camera, got {near}");
+        }
+    }
+
+    /// An authored hole (`surface_local == 15`) removes the quads whose corner
+    /// samples touch it, exactly like `CTerrainNode::BuildIndices`.
+    #[test]
+    fn authored_hole_is_cut_from_lod_mesh() {
+        let mut surfaces = vec![1u8; 16];
+        surfaces[1 * 4 + 1] = SURFACE_HOLE;
+        let t = Terrain {
+            samples: 4,
+            spacing: 2.0,
+            world_min: [0.0, 0.0, 0.0],
+            heights: vec![0.0; 16],
+            surfaces,
+            min: 0.0,
+            max: 0.0,
+        };
+        assert!(t.is_hole_sample(1, 1));
+        assert!(t.hole_at(3.0, 3.0)); // cell centre of sample (1,1)
+        assert!(!t.hole_at(11.0, 11.0));
+
+        let root = TerrainSector {
+            id: 0,
+            min: [0.0, 0.0, 0.0],
+            max: [8.0, 8.0, 0.0],
+            tree_level: 0,
+            shift: 0,
+            geom_errors: [0.0; GEOM_LEVELS],
+            children: Vec::new(),
+        };
+        let params = TerrainLodParams { camera: [4.0, 4.0, 10.0], ..Default::default() };
+        let vis = TerrainVis::new(&t, &root, &params);
+        assert_eq!(vis.nodes.len(), 1);
+        let m = vis.build_at(&t, &root, 0);
+        // 4x4 quads -> 96 indices; the hole sits on one lattice corner, so the
+        // four quads around it are cut: 96 - 4*6 = 72.
+        assert_eq!(m.indices.len(), 72, "hole quads must be cut");
+        assert_eq!(m.positions.len(), 25);
     }
 }

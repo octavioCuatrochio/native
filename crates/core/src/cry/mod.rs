@@ -3,6 +3,7 @@
 //! re-written here; it runs from the original scripts loaded at runtime.
 
 pub mod actor;
+pub mod binds_audio;
 pub mod ai;
 pub mod ai_data;
 pub mod ai_loader;
@@ -17,6 +18,7 @@ pub mod events;
 pub mod gamerules;
 pub mod host;
 pub mod mission;
+pub mod navmesh;
 pub mod phys_proxy;
 pub mod phys_world;
 pub mod render;

@@ -785,6 +785,11 @@ impl SoundSystem {
     }
 
     /// The owner token a live voice was started with, if any.
+    /// Whether the sound is still an active voice (not stopped or finished).
+    pub fn is_playing(&self, id: SoundId) -> bool {
+        self.voices.iter().any(|v| v.id == id)
+    }
+
     pub fn voice_owner(&self, id: SoundId) -> Option<u64> {
         self.voices
             .iter()

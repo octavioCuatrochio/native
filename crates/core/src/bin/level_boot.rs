@@ -41,6 +41,9 @@ fn main() {
 
     let mut host = ScriptHost::new(vfs.clone()).expect("script host");
     host.boot().expect("boot");
+    // A sound system with no output device: counts what the scripts play.
+    let sound = std::sync::Arc::new(std::sync::Mutex::new(sod_core::audio_play::SoundSystem::new(48_000)));
+    host.attach_audio(sound.clone());
     let rules = host.spawn_game_rules().expect("game rules");
     println!("[rules] GameRules id {rules} instance={}", host.ctx.instance(rules).is_some());
     println!("[boot] scripts loaded: {}  errors: {}", host.ctx.loaded_scripts.borrow().len(), host.ctx.errors.borrow().len());
@@ -104,6 +107,23 @@ fn main() {
     }
     println!("[areas] {} volumes, player inside {areas_entered} at end", host.areas.borrow().len());
     println!("[events] delivered: {:?}", host.ctx.delivered.borrow());
+    {
+        let a = host.ctx.audio.borrow();
+        let mut played: Vec<_> = a.played.iter().collect();
+        played.sort_by(|x, y| y.1.cmp(x.1));
+        println!("[sound] fev events {} | started {} sounds ({} distinct), {} voices active now",
+            a.fev.event_count(), played.iter().map(|p| *p.1).sum::<u32>(), played.len(),
+            sound.lock().map(|s| s.voice_count()).unwrap_or(0));
+        for (k, n) in played.iter().take(8) {
+            println!("    {n:4}  {k}");
+        }
+        let mut failed: Vec<_> = a.failed.iter().collect();
+        failed.sort_by(|x, y| y.1.cmp(x.1));
+        println!("[sound] {} requests failed ({} distinct)", failed.iter().map(|p| *p.1).sum::<u32>(), failed.len());
+        for (k, n) in failed.iter().take(10) {
+            println!("    {n:4}  {k}");
+        }
+    }
 
     {
         // What scripts drew vs. what the level XML names as `object_Model`.

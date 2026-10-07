@@ -127,6 +127,9 @@ pub struct Ctx {
     pub actors: Rc<RefCell<HashMap<EntityId, super::actor::ActorState>>>,
     /// Game-rules registries (`self.game` on the rules entity).
     pub game_rules: Rc<RefCell<super::gamerules::GameRulesState>>,
+    /// Script sound handles, the FMOD event database and the attached sound
+    /// system (`binds_audio`).
+    pub audio: Rc<RefCell<super::binds_audio::AudioState>>,
     /// Per-sound state set by `Sound.*` (playback not implemented yet).
     pub sounds: Rc<RefCell<HashMap<u64, super::binds_sound::SoundState>>>,
     pub master_volume: Rc<RefCell<f32>>,
@@ -560,6 +563,7 @@ impl ScriptHost {
             actors: Default::default(),
             game_rules: Default::default(),
             sounds: Default::default(),
+            audio: Default::default(),
             master_volume: Rc::new(RefCell::new(1.0)),
             echo_log: std::env::var("SOD_LUA_LOG").is_ok(),
         };
@@ -611,6 +615,8 @@ impl ScriptHost {
         super::actor::install(&host.lua, &host.ctx)?;
         super::gamerules::install(&host.lua, &host.ctx)?;
         super::binds_sound::install(&host.lua, &host.ctx)?;
+        // Real playback replaces the state-only Sound.* / PlaySoundEvent binds.
+        super::binds_audio::install(&host.lua, &host.ctx)?;
         super::ai::install(&host.lua, &host.ctx)?;
         host.load_class_registry();
         for (class, script) in ACTOR_CLASSES {
@@ -910,6 +916,12 @@ impl ScriptHost {
             area: None,
         };
         self.spawn_level_entity(&le)
+    }
+
+    /// Attach the sound system scripts play through (the app creates it at
+    /// the audio device's rate).
+    pub fn attach_audio(&self, system: std::sync::Arc<std::sync::Mutex<crate::audio_play::SoundSystem>>) {
+        self.ctx.audio.borrow_mut().system = Some(system);
     }
 
     /// Register an entity whose movement triggers areas.

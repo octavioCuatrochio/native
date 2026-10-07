@@ -40,9 +40,9 @@ pub struct CryStats {
     pub missing_binds: usize,
 }
 
-pub struct CryPlugin {
-    pub game_dir: String,
-    pub spawn: [f32; 3],
+/// Whether the script layer is enabled (`SOD_CRY=0` disables it).
+pub fn enabled() -> bool {
+    !std::env::var("SOD_CRY").map(|v| v == "0").unwrap_or(false)
 }
 
 fn collect_paks(root: &Path, out: &mut Vec<PathBuf>) {
@@ -98,18 +98,12 @@ pub fn build_host(game_dir: &str, spawn: [f32; 3]) -> Option<CryHost> {
     Some(CryHost { host, player })
 }
 
-impl Plugin for CryPlugin {
-    fn build(&self, app: &mut App) {
-        if std::env::var("SOD_CRY").map(|v| v == "0").unwrap_or(false) {
-            return;
-        }
-        app.init_resource::<CryPlayerPos>().init_resource::<CryStats>();
-        if let Some(h) = build_host(&self.game_dir, self.spawn) {
-            app.insert_non_send_resource(h);
-            app.configure_sets(Update, (CrySet::Sync, CrySet::Tick).chain());
-            app.add_systems(Update, cry_tick.in_set(CrySet::Tick));
-        }
-    }
+/// Register the booted host and its per-frame systems with the app.
+pub fn install(app: &mut App, host: CryHost) {
+    app.init_resource::<CryPlayerPos>().init_resource::<CryStats>();
+    app.insert_non_send_resource(host);
+    app.configure_sets(Update, (CrySet::Sync, CrySet::Tick).chain());
+    app.add_systems(Update, cry_tick.in_set(CrySet::Tick));
 }
 
 fn cry_tick(

@@ -49,6 +49,7 @@ fn main() {
         .iter()
         .find_map(|p| vfs.read(p))
         .expect("mission_mission0.xml not found in VFS");
+    let xml_bytes = xml.clone();
     let ents = parse_level_entities(&xml);
     println!("[level] {} entities", ents.len());
 
@@ -100,6 +101,39 @@ fn main() {
     }
     println!("[areas] {} volumes, player inside {areas_entered} at end", host.areas.borrow().len());
     println!("[events] delivered: {:?}", host.ctx.delivered.borrow());
+
+    {
+        // What scripts drew vs. what the level XML names as `object_Model`.
+        use std::collections::BTreeMap;
+        let w = host.ctx.world.borrow();
+        let norm = |m: &str| m.replace('\\', "/").to_ascii_lowercase();
+        let mut scripted: BTreeMap<String, usize> = BTreeMap::new();
+        for p in sod_core::cry::render::static_placements(&w) {
+            *scripted.entry(norm(p.model.as_deref().unwrap_or(""))).or_default() += 1;
+        }
+        let mut xml: BTreeMap<String, usize> = BTreeMap::new();
+        for p in sod_core::level::parse_mission(&xml_bytes) {
+            if p.is_entity {
+                if let Some(m) = &p.model {
+                    *xml.entry(norm(m)).or_default() += 1;
+                }
+            }
+        }
+        let s_total: usize = scripted.values().sum();
+        let x_total: usize = xml.values().sum();
+        println!("[render] static slots drawn by scripts: {s_total}  level-XML object_Model entities: {x_total}");
+        let mut diffs = 0;
+        for k in scripted.keys().chain(xml.keys()).collect::<std::collections::BTreeSet<_>>() {
+            let (a, b) = (scripted.get(k).copied().unwrap_or(0), xml.get(k).copied().unwrap_or(0));
+            if a != b {
+                diffs += 1;
+                if diffs <= 15 {
+                    println!("  diff {k}: scripts {a} vs xml {b}");
+                }
+            }
+        }
+        println!("[render] models that differ: {diffs}");
+    }
 
     let w = host.ctx.world.borrow();
     let active = w.entities.values().filter(|e| e.active).count();

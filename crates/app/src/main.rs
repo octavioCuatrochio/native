@@ -568,9 +568,29 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
     println!("[world] placements: {} total, {} tag points; Mt. Tanner start {:?}",
         total, tag_points.as_ref().map(|t| t.len()).unwrap_or(0), start_cry);
 
+    // Boot the original scripts on the native entity world. What gets drawn
+    // for entities is what their scripts loaded (`LoadObject`/`DrawSlot`/
+    // `Hide`), as in the original renderer; `SOD_CRY=0` falls back to the
+    // level XML's `object_Model` attributes.
+    let cry_host = if play && cry_bridge::enabled() { cry_bridge::build_host(game, start_cry) } else { None };
+    let source: Vec<Placement> = match &cry_host {
+        Some(h) => {
+            let mut v = sod_core::cry::render::static_placements(&h.host.ctx.world.borrow());
+            // Non-entity objects (decals, etc.) still come from the level file.
+            v.extend(placements_all.iter().filter(|p| !p.is_entity).cloned());
+            v
+        }
+        None => placements_all.clone(),
+    };
+
     // Keep only props in the tutorial zone (covers the Ranger Station at ~166 m).
     let zone_radius = 400.0f32;
-    let with_models: Vec<Placement> = placements_all
+    let xml_in_zone = placements_all
+        .iter()
+        .filter(|p| p.model.is_some())
+        .filter(|p| (p.pos[0] - start_cry[0]).powi(2) + (p.pos[1] - start_cry[1]).powi(2) <= zone_radius * zone_radius)
+        .count();
+    let with_models: Vec<Placement> = source
         .iter()
         .filter(|p| p.model.is_some())
         .filter(|p| {
@@ -580,7 +600,8 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         })
         .cloned()
         .collect();
-    println!("[world] {} props within {:.0}m of Mt. Tanner", with_models.len(), zone_radius);
+    println!("[world] {} props within {:.0}m of Mt. Tanner (script-driven: {}; level XML would give {})",
+        with_models.len(), zone_radius, cry_host.is_some(), xml_in_zone);
 
     // Static architecture (buildings/walls/rocks) around the zone.
     let arch_radius = 360.0f32;
@@ -795,8 +816,10 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
         app.insert_resource(t);
     }
     if play {
-        app.add_plugins(cry_bridge::CryPlugin { game_dir: game.to_string(), spawn: start_cry });
-        app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));
+        if let Some(h) = cry_host {
+            cry_bridge::install(&mut app, h);
+            app.add_systems(Update, cry_sync_player.after(move_player).in_set(cry_bridge::CrySet::Sync));
+        }
         app.insert_resource(player_state);
         app.insert_resource(game_state);
         app.add_systems(Update, (

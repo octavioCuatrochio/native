@@ -48,27 +48,36 @@ pub enum HomeTier {
     Large,
 }
 
-/// Stockpile capacity per resource for a home tier. The recovered table gives a
-/// single cap for most resources with Food doubled on the larger tiers; Storage
-/// facilities add +20 to every resource. Best-effort where the exact per-resource
-/// table was not fully pinned.
+/// Stockpile capacity per resource for a home tier, taken verbatim from the
+/// shipped `RTS/HomeSiteLimits.xml` (`libs/class3/rts/homesitelimits.xml`).
+///
+/// The runtime reads the same table natively: `NSHome` indexes a stride-0x34
+/// record table at `DAT_0190dc10` (base `+0x04` = Ammo cap, `+0x08` = Food,
+/// `+0x0C` = Fuel, `+0x10` = Materials, `+0x14` = Medicine; see
+/// `notes/community.md` §3.2 / §7 and `notes/ghidra/rts-sim.md` §3.3). The
+/// earlier port wrongly doubled Food on every tier above RV and left Materials
+/// undoubled. Storage facilities add +20 to every resource on top of these caps.
+///
+/// Values:
+/// ```text
+///          Ammo Food Fuel Materials Medicine
+/// RV         25   25   25        25       25
+/// Tiny       25   25   25        50       25
+/// Small      50   50   50       100       50
+/// Medium     80   80   80       160       80
+/// Large     100  100  100       200      100
+/// ```
+/// The real-data test `home_tier_caps_match_homesitelimits_xml` re-parses the
+/// shipped XML through the VFS and asserts this table matches field-for-field.
 pub fn home_tier_caps(tier: HomeTier) -> [f32; RESOURCE_COUNT] {
-    let food_mult = match tier {
-        HomeTier::Rv => 1.0,
-        HomeTier::Tiny => 2.0,
-        HomeTier::Small => 2.0,
-        HomeTier::Medium => 2.0,
-        HomeTier::Large => 2.0,
-    };
-    let base = match tier {
-        HomeTier::Rv => 25.0,
-        HomeTier::Tiny => 25.0,
-        HomeTier::Small => 50.0,
-        HomeTier::Medium => 80.0,
-        HomeTier::Large => 100.0,
-    };
-    // Order: Ammo, Food, Fuel, Materials, Medicine
-    [base, base * food_mult, base, base, base]
+    // Order: Ammo, Food, Fuel, Materials, Medicine (canonical C++ stockpile order).
+    match tier {
+        HomeTier::Rv => [25.0, 25.0, 25.0, 25.0, 25.0],
+        HomeTier::Tiny => [25.0, 25.0, 25.0, 50.0, 25.0],
+        HomeTier::Small => [50.0, 50.0, 50.0, 100.0, 50.0],
+        HomeTier::Medium => [80.0, 80.0, 80.0, 160.0, 80.0],
+        HomeTier::Large => [100.0, 100.0, 100.0, 200.0, 100.0],
+    }
 }
 
 /// A community stockpile with clamped add/remove.
@@ -221,6 +230,114 @@ mod tests {
     fn storage_bonus_raises_caps() {
         let mut s = Stockpile::new(HomeTier::Tiny);
         s.apply_storage_bonus(20.0);
-        assert_eq!(s.caps[Resource::Food.index()], 70.0); // 25*2 + 20
+        // `homesitelimits.xml`: Tiny Food cap = 25 (not doubled); Storage adds +20.
+        assert_eq!(s.caps[Resource::Food.index()], 45.0);
+        assert_eq!(s.caps[Resource::Materials.index()], 70.0); // 50 + 20
+    }
+
+    #[test]
+    fn home_tier_caps_are_the_shipped_table() {
+        // Hard-coded expectation mirroring `libs/class3/rts/homesitelimits.xml`.
+        assert_eq!(home_tier_caps(HomeTier::Rv), [25.0, 25.0, 25.0, 25.0, 25.0]);
+        assert_eq!(home_tier_caps(HomeTier::Tiny), [25.0, 25.0, 25.0, 50.0, 25.0]);
+        assert_eq!(home_tier_caps(HomeTier::Small), [50.0, 50.0, 50.0, 100.0, 50.0]);
+        assert_eq!(home_tier_caps(HomeTier::Medium), [80.0, 80.0, 80.0, 160.0, 80.0]);
+        assert_eq!(home_tier_caps(HomeTier::Large), [100.0, 100.0, 100.0, 200.0, 100.0]);
+    }
+
+    /// Real-data parity: read `homesitelimits.xml` through the VFS and assert the
+    /// parsed `Max{Ammo,Food,Fuel,Materials,Medicine}` match `home_tier_caps`
+    /// exactly for all five tiers. Skipped when the (gitignored) extraction is
+    /// not checked out next to the repo so the suite stays self-contained.
+    #[test]
+    fn home_tier_caps_match_homesitelimits_xml() {
+        use crate::Vfs;
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted-game/gamedata");
+        if !root.join("libs/class3/rts/homesitelimits.xml").is_file() {
+            return;
+        }
+        let mut vfs = Vfs::new();
+        vfs.set_loose_root(&root);
+        let bytes = vfs
+            .read("libs/class3/rts/homesitelimits.xml")
+            .expect("homesitelimits.xml via VFS");
+
+        let mut reader = Reader::from_reader(bytes.as_slice());
+        let mut buf = Vec::new();
+        let mut size: Option<String> = None;
+        let mut field: Option<String> = None;
+        // size-name -> [ammo, food, fuel, materials, medicine]
+        let mut parsed: Vec<(String, [f32; RESOURCE_COUNT])> = Vec::new();
+        let mut cur = [0.0f32; RESOURCE_COUNT];
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => match e.name().as_ref() {
+                    b"HomeSiteLimit" => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"Size" {
+                                size = Some(String::from_utf8_lossy(&a.value).into_owned());
+                            }
+                        }
+                        cur = [0.0; RESOURCE_COUNT];
+                    }
+                    b"MaxAmmo" | b"MaxFood" | b"MaxFuel" | b"MaxMaterials" | b"MaxMedicine" => {
+                        field = Some(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                    }
+                    _ => {}
+                },
+                Ok(Event::Text(t)) => {
+                    if size.is_some() {
+                        if let Some(field) = field.as_deref() {
+                            let v: f32 = t.unescape().unwrap().trim().parse().unwrap();
+                            let idx = match field {
+                                "MaxAmmo" => 0,
+                                "MaxFood" => 1,
+                                "MaxFuel" => 2,
+                                "MaxMaterials" => 3,
+                                "MaxMedicine" => 4,
+                                _ => unreachable!(),
+                            };
+                            cur[idx] = v;
+                        }
+                    }
+                }
+                Ok(Event::End(e)) => match e.name().as_ref() {
+                    b"MaxAmmo" | b"MaxFood" | b"MaxFuel" | b"MaxMaterials" | b"MaxMedicine" => {
+                        field = None;
+                    }
+                    b"HomeSiteLimit" => {
+                        if let Some(s) = size.take() {
+                            parsed.push((s, cur));
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("homesitelimits.xml parse error: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        let tier_of = |name: &str| match name {
+            "RV" => HomeTier::Rv,
+            "Tiny" => HomeTier::Tiny,
+            "Small" => HomeTier::Small,
+            "Medium" => HomeTier::Medium,
+            "Large" => HomeTier::Large,
+            other => panic!("unknown home size {other}"),
+        };
+        assert_eq!(parsed.len(), 5, "five HomeSiteLimit rows");
+        for (name, caps) in &parsed {
+            assert_eq!(
+                home_tier_caps(tier_of(name)),
+                *caps,
+                "tier {name} caps must match homesitelimits.xml"
+            );
+        }
     }
 }

@@ -814,7 +814,9 @@ pub fn camera_deadzone(stick: [f32; 2], linear: f32, radius: f32) -> [f32; 2] {
 pub const DEFAULT_LAG_SCALE: f32 = 0.15;
 
 /// Exponential-smoothing blend fraction for one frame. `lag_scale` is the time
-/// constant in seconds (`spec+0x4b8`); `<= 0` snaps.
+/// constant in seconds; `<= 0` snaps. (Camera `+0x4b8` is NOT this: it holds
+/// the input device scale, read live at `0x15ea59c`. The default is checked
+/// against retail telemetry instead: tau ~0.19 s at run speed.)
 #[inline]
 pub fn lag_alpha(dt: f32, lag_scale: f32) -> f32 {
     if !dt.is_finite() || dt <= 0.0 {

@@ -1543,7 +1543,10 @@ fn follow_camera(
     // CryEngine camera lag/smoothing (FUN_015ea260) so the camera trails the
     // target instead of snapping.
     let cam_pos = match lag {
-        Some(mut l) => l.0.step(cs.0.pos, cs.0.yaw, cs.0.pitch, 12.0, time.delta_secs()).0,
+        // Time constant in seconds: retail captures show the focal point
+        // trailing ~0.75 m at 4 m/s run (tau ~0.19 s) and settling within
+        // ~0.4 s of stopping (notes/telemetry/dyn.csv), matching the default.
+        Some(mut l) => l.0.step(cs.0.pos, cs.0.yaw, cs.0.pitch, camera::DEFAULT_LAG_SCALE, time.delta_secs()).0,
         None => cs.0.pos,
     };
     let base_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);

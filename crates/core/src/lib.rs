@@ -53,6 +53,8 @@ pub mod script;
 pub mod skin;
 pub mod sm_payload;
 pub mod sm_runtime;
+pub mod sm_triggers_a;
+pub mod sm_triggers_b;
 pub mod sm_tables;
 pub mod statemachine;
 pub mod tuning;

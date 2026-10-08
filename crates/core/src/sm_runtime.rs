@@ -543,10 +543,20 @@ pub enum SmCommand {
 /// `(state, output)`; the engine keeps this inline at each descriptor
 /// instance.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Persist {
-    t: f32,
-    flags: u8,
-    i: i32,
+pub struct Persist {
+    pub t: f32,
+    pub flags: u8,
+    pub i: i32,
+}
+
+/// What a ported trigger evaluator may read: time in the current state
+/// (`actor+0x1360`), the condition outputs of this tick (the global flag table
+/// `0x1ee3170`), per-(state, output) persistent storage and the file endianness.
+pub struct TriggerCtx<'a> {
+    pub state_time: f32,
+    pub outputs: &'a [bool],
+    pub persist: &'a mut Persist,
+    pub big_endian: bool,
 }
 
 /// A running state-machine instance for one character.
@@ -804,6 +814,21 @@ impl<'a> SmInstance<'a> {
             return v;
         }
         let kind = trigger_kind(t.type_id);
+        if matches!(kind, TriggerKind::Raw) {
+            // Types ported from their exe evaluators (registration table at
+            // 0x169e1e0 calls) live in sm_triggers_a / sm_triggers_b.
+            let mut ctx = TriggerCtx {
+                state_time: self.state_time,
+                outputs: &self.outputs,
+                persist: self.persist.entry((self.state, out)).or_default(),
+                big_endian: self.sm.big_endian,
+            };
+            if let Some(v) = crate::sm_triggers_a::eval(t.type_id, operand, &mut ctx, env)
+                .or_else(|| crate::sm_triggers_b::eval(t.type_id, operand, &mut ctx, env))
+            {
+                return v;
+            }
+        }
         match kind {
             TriggerKind::ConstTrue => true,
             TriggerKind::ConstFalse => false,

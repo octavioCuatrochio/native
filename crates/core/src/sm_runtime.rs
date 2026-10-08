@@ -98,6 +98,8 @@ pub enum TriggerKind {
     EdgeLatch,
     /// Type 5: timed hysteresis window gated by a condition.
     TimerWindow,
+    /// Type 65 (0x16a00b0): |input vector|^2 >= one of three thresholds.
+    InputMagnitude,
     /// Type 6: accumulator limit gated by a condition.
     TimerGate,
     /// Type 9: frame-delta window.
@@ -125,6 +127,7 @@ pub fn trigger_kind(id: u8) -> TriggerKind {
         18 => TriggerKind::EngineFlag { bit: 4 },
         71 => TriggerKind::EngineFlag { bit: 3 },
         62 => TriggerKind::ActorFlagWord,
+        65 => TriggerKind::InputMagnitude,
         40 => TriggerKind::QuerySlot,
         41 => TriggerKind::QuerySlotState,
         63 => TriggerKind::CounterCompare,
@@ -170,6 +173,12 @@ pub trait SmEnv {
     /// Actor counter array value `actor+0x1254[slot]` (type 63).
     fn counter(&self, slot: u8) -> i32 {
         0
+    }
+    /// Input vectors read by type 65: `which` 1 = movement input
+    /// (`actor+0x12c8/0x12cc`), 0 = the other stick (`actor+0x12d8/0x12dc`).
+    fn input_vector(&self, which: u8) -> [f32; 2] {
+        let _ = which;
+        [0.0, 0.0]
     }
     /// A float actor field, `which` selecting `+0x12d0` (0) or `+0x12d4` (1)
     /// (type 66).
@@ -909,6 +918,16 @@ impl<'a> SmInstance<'a> {
                 }
                 _ => self.raw(env, t, out),
             },
+            TriggerKind::InputMagnitude => match raw(t) {
+                Some(b) if !b.is_empty() => {
+                    // 0x16a00b0: bit 0 picks the vector, bits 1-2 the squared
+                    // threshold (0x1915788 / 0x191578c / 0x1915790).
+                    let v = env.input_vector(b[0] & 1);
+                    let thr = match (b[0] >> 1) & 3 { 0 => 1.0e-4, 1 => 0.16, _ => 0.5625 };
+                    v[0] * v[0] + v[1] * v[1] >= thr
+                }
+                _ => self.raw(env, t, out),
+            },
             TriggerKind::TimerWindow => {
                 if let SmTriggerOperand::TimerWindow {
                     min,
@@ -917,15 +936,34 @@ impl<'a> SmInstance<'a> {
                     cond,
                 } = &t.operand
                 {
-                    let dt = env.delta_seconds().max(0.0);
-                    let key = (self.state, out);
-                    let p = self.persist.entry(key).or_default();
+                    // 0x169e7f0 (registered for type 5 at 0x169d4e6): `t` is the
+                    // time in the current state (actor+0x1360). The gate output
+                    // is latched while min <= t < max (the latch clears when t
+                    // goes backwards, i.e. the state was re-entered); the result
+                    // is the latch while fire_from <= t < max, or once when a
+                    // frame steps past max from below fire_from/max. `rate` is
+                    // the operand's third float (`fire_from`).
+                    let now = self.state_time;
                     let gate = *cond == 0xffff
                         || self.outputs.get(*cond as usize).copied().unwrap_or(false);
-                    if gate {
-                        p.t = (p.t + dt * *rate).min(*max);
+                    let key = (self.state, out);
+                    let p = self.persist.entry(key).or_default();
+                    if p.t > now {
+                        p.t = 0.0;
+                        p.flags &= !1;
                     }
-                    p.t >= *min
+                    let prev = p.t;
+                    let crossing = *rate > prev && *max > prev;
+                    p.t = now;
+                    if *min <= now && now < *max && gate {
+                        p.flags |= 1;
+                    }
+                    let latch = p.flags & 1 != 0;
+                    if *rate <= now && now < *max {
+                        latch
+                    } else {
+                        crossing && now >= *max && latch
+                    }
                 } else {
                     self.raw(env, t, out)
                 }
@@ -947,13 +985,10 @@ impl<'a> SmInstance<'a> {
             }
             TriggerKind::FrameWindow => {
                 if let SmTriggerOperand::Window { lo, hi, flag } = &t.operand {
-                    let dt = env.delta_seconds();
-                    let inside = dt >= *lo && dt <= *hi;
-                    if *flag & 1 != 0 {
-                        !inside
-                    } else {
-                        inside
-                    }
+                    // 0x169e930 (type 9): time in the current state (actor+0x1360)
+                    // strictly inside (lo, hi); flag bit 0 also accepts t == lo / hi.
+                    let t = self.state_time;
+                    (*lo < t && t < *hi) || (*flag & 1 != 0 && (t == *lo || t == *hi))
                 } else {
                     self.raw(env, t, out)
                 }

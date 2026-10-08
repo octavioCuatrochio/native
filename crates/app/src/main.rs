@@ -585,6 +585,8 @@ struct PlayerSmEnv {
     /// Frame each input slot was last active, -1 = never (`actor+0x1254`,
     /// read by type 63 at 0x169ffa0; stamped by 0x15910c0).
     counters: [i32; 37],
+    /// Movement input (strafe, forward), magnitude 0..1 (`actor+0x12c8`).
+    move_input: [f32; 2],
 }
 
 impl SmEnv for PlayerSmEnv {
@@ -605,6 +607,9 @@ impl SmEnv for PlayerSmEnv {
     }
     fn counter(&self, slot: u8) -> i32 {
         self.counters.get(slot as usize).copied().unwrap_or(-1)
+    }
+    fn input_vector(&self, which: u8) -> [f32; 2] {
+        if which == 1 { self.move_input } else { [0.0, 0.0] }
     }
     fn animation_phase(&self) -> f32 {
         self.phase
@@ -699,7 +704,11 @@ struct Player {
     /// Decompiled locomotion state machine (idle/walk/run/sprint transitions).
     ploco: player_locomotion::PlayerLocomotion,
     /// Per-graph-state resolved animation (workerA2b), keyed by state index.
-    anim_cache: HashMap<usize, Option<LoadedAnim>>,
+    /// Resolved graph-state animations keyed by (state, stance, item): templated
+    /// states (`X_[Stance]_Run_[Item]`) resolve to different clips per stance/item.
+    anim_cache: HashMap<(usize, String, String), Option<LoadedAnim>>,
+    /// Stance/item the graph inputs currently carry (selects the cache entry).
+    anim_key: (String, String),
     /// Parsed `.caf` per path.
     caf_cache: HashMap<String, anim::Caf>,
     /// Current animation layer (the graph's current state).
@@ -2320,7 +2329,7 @@ fn setup_world(
         });
         let mut mstate = sod_core::class3_move::MoveState::new([ps.spawn[0], ps.spawn[1], ps.spawn[2]]);
         mstate.yaw = yaw;
-        commands.insert_resource(Player { yaw, pos: [ps.spawn[0], ps.spawn[1]], parts, skeleton: ps.skeleton.clone(), caf: ps.caf.clone(), time: 0.0, moving: false, rate: 1.0, bank: ps.bank.clone(), loc: anim::Locomotion::Idle, mstate, ploco: player_locomotion::PlayerLocomotion::with_decoupled(tuning::default_movement(), true), anim_cache: HashMap::new(), caf_cache: HashMap::new(), cur_layer: None, prev_layer: None, blend: 1.0, blend_dur: 0.0, anim_finished: false, anim_state: None });
+        commands.insert_resource(Player { yaw, pos: [ps.spawn[0], ps.spawn[1]], parts, skeleton: ps.skeleton.clone(), caf: ps.caf.clone(), time: 0.0, moving: false, rate: 1.0, bank: ps.bank.clone(), loc: anim::Locomotion::Idle, mstate, ploco: player_locomotion::PlayerLocomotion::with_decoupled(tuning::default_movement(), true), anim_cache: HashMap::new(), anim_key: ("relaxed".into(), String::new()), caf_cache: HashMap::new(), cur_layer: None, prev_layer: None, blend: 1.0, blend_dur: 0.0, anim_finished: false, anim_state: None });
         // Start the camera behind the player and re-seed the lag so it snaps.
         if let Some(mut cs) = cam_state {
             cs.0.yaw = yaw;
@@ -2754,17 +2763,20 @@ fn deform_parts(parts: &[AnimPart], skin_m: &[skin::Mat4], meshes: &mut Assets<M
 impl Player {
     /// Resolve and cache a graph state's animation (motion + clips).
     fn ensure_state_anim(&mut self, graph: &sod_core::ag_runtime::Graph, ctx: &AnimCtx, state: usize, stance: &str, item: &str) {
-        if self.anim_cache.contains_key(&state) {
+        self.anim_key = (stance.to_string(), item.to_string());
+        let key = (state, stance.to_string(), item.to_string());
+        if self.anim_cache.contains_key(&key) {
             return;
         }
         let loaded = build_state_anim(graph, state, ctx, stance, item, &mut self.caf_cache, &self.bank);
-        self.anim_cache.insert(state, loaded);
+        self.anim_cache.insert(key, loaded);
     }
 
     /// Switch the current animation to a graph state, crossfading from the
     /// previous one over the link `transitionTime`.
     fn switch_state(&mut self, state: usize, trans: f32) {
-        let Some(anim) = self.anim_cache.get(&state).and_then(|a| a.clone()) else { return };
+        let key = (state, self.anim_key.0.clone(), self.anim_key.1.clone());
+        let Some(anim) = self.anim_cache.get(&key).and_then(|a| a.clone()) else { return };
         self.switch_anim(anim, trans);
         self.anim_state = Some(state);
     }
@@ -2876,7 +2888,19 @@ type Phase = (&'static str, &'static [&'static str], &'static [&'static str], f3
 
 fn move_script_phases(which: &str) -> Vec<Phase> {
     let mut v: Vec<Phase> = vec![("idle", &[], &[], 2.0, 0.0)];
-    if which == "3" {
+    if which == "4" {
+        // Animation-transition checks; same table as game_probe.py scenario_anim.
+        v.extend_from_slice(&[
+            ("run", &["w"], &[], 1.5, 0.0), ("run_crouch", &["w", "c"], &[], 2.0, 0.0), ("idle", &[], &[], 1.5, 0.0),
+            ("attack_idle", &[], &["lmb"], 1.5, 0.0), ("attack_idle2", &[], &["lmb"], 1.5, 0.0),
+            ("walk_attack_pre", &["w"], &[], 1.0, 0.0), ("walk_attack", &["w"], &["lmb"], 1.5, 0.0), ("idle", &[], &[], 1.5, 0.0),
+            ("sprint_attack_pre", &["leftshift", "w"], &[], 1.2, 0.0), ("sprint_attack", &["leftshift", "w"], &["lmb"], 1.5, 0.0), ("idle", &[], &[], 1.5, 0.0),
+            ("strafe_a", &["a"], &[], 0.6, 0.0), ("strafe_d", &["d"], &[], 0.6, 0.0), ("strafe_a2", &["a"], &[], 0.6, 0.0), ("strafe_d2", &["d"], &[], 0.6, 0.0), ("idle", &[], &[], 1.5, 0.0),
+            ("fwd", &["w"], &[], 0.8, 0.0), ("back", &["s"], &[], 0.8, 0.0), ("fwd2", &["w"], &[], 0.8, 0.0), ("idle", &[], &[], 1.5, 0.0),
+            ("sprint", &["leftshift", "w"], &[], 2.0, 0.0), ("sprint_stop", &[], &[], 1.5, 0.0),
+            ("run_turn", &["w"], &[], 2.5, 1500.0), ("idle", &[], &[], 1.5, 0.0),
+        ]);
+    } else if which == "3" {
         // Melee: three clicks, 2.5 s apart.
         v.extend_from_slice(&[("attack1", &[], &["lmb"], 2.5, 0.0), ("attack2", &[], &["lmb"], 2.5, 0.0), ("attack3", &[], &["lmb"], 2.5, 0.0)]);
     } else if which == "2" {
@@ -3121,6 +3145,10 @@ fn move_player(
                     smr.counters[slot] = stamp;
                 }
             };
+            // Slot 1 = releasing `cover` (C): the stealth states stand up through
+            // it (conds 605/756). The press itself is the jump into stealth below;
+            // a press-frame slot 1 would leave stealth on the entry frame.
+            set(1, keys.just_released(KeyCode::KeyC));
             set(21, mouse.just_pressed(MouseButton::Left));
             set(4, keys.just_pressed(KeyCode::ControlLeft));
             set(19, keys.just_pressed(KeyCode::Space));
@@ -3133,6 +3161,13 @@ fn move_player(
         // The entry name comes from the .sm; the native caller was not traced.
         if jump.is_none() && mouse.just_pressed(MouseButton::Left) && smr.inst.is_graph_driven() {
             jump = smr.inst.find_state("Combat.Unarmed.Logic.Jump.Evaluate");
+        }
+        // Sneak (C): no graph state leads into `Stealth.Basic.*`, so the game
+        // jumps there - straight into the crouch walk when moving, otherwise
+        // through the stand-to-crouch clip. Leaving is the machine's own
+        // transition on the C release (slot 1).
+        if jump.is_none() && keys.just_pressed(KeyCode::KeyC) && smr.inst.is_graph_driven() {
+            jump = smr.inst.find_state(if speed > 0.3 { "Stealth.Basic.Movement.Walk" } else { "Stealth.Basic.Idle.FromStand" });
         }
         if let Some(idx) = jump {
             smr.inst.go_to(idx);
@@ -3147,6 +3182,12 @@ fn move_player(
             signals,
             input_mask,
             counters: smr.counters,
+            move_input: {
+                let f = if keys.pressed(KeyCode::KeyW) { 1.0 } else if keys.pressed(KeyCode::KeyS) { -1.0 } else { 0.0 };
+                let st = if keys.pressed(KeyCode::KeyD) { 1.0 } else if keys.pressed(KeyCode::KeyA) { -1.0 } else { 0.0 };
+                let m = ((f * f + st * st) as f32).sqrt().max(1.0);
+                [st / m, f / m]
+            },
         };
         smr.inst.tick(&env);
         if dbg {
@@ -3219,6 +3260,9 @@ fn move_player(
             aiming: if aiming { 1.0 } else { 0.0 },
             ..Default::default()
         };
+        // Stance/item before this frame: a change re-queues the current
+        // templated state's animation (e.g. C while running -> crouch clip).
+        let prev_key = player.anim_key.clone();
         // Resolve every candidate state's animation once (cached per state).
         {
             let values = sod_core::ag_driver::graph_inputs(&g.0.graph, &snap);
@@ -3227,7 +3271,7 @@ fn move_player(
                 player.ensure_state_anim(&g.0.graph, &ctx, i, &snap.stance, &snap.item);
             }
         }
-        let motion_of = |i: usize| player.anim_cache.get(&i).and_then(|a| a.as_ref()).map(|a| a.motion);
+        let motion_of = |i: usize| player.anim_cache.get(&(i, player.anim_key.0.clone(), player.anim_key.1.clone())).and_then(|a| a.as_ref()).map(|a| a.motion);
         let before = g.0.current_name().map(str::to_string);
         let idx_before = g.0.inst.current;
         // A one-shot transition state holds until its clip finishes; steady
@@ -3271,7 +3315,8 @@ fn move_player(
         let idx_now = g.0.inst.current;
         // While the machine owns the pose the graph keeps running (so its
         // inputs stay warm) but must not steal the layer from the fragment.
-        if !machine_driven && (idx_now != idx_before || returning_to_graph) {
+        let key_changed = prev_key != (snap.stance.clone(), snap.item.clone());
+        if !machine_driven && (idx_now != idx_before || returning_to_graph || key_changed) {
             if let Some(i) = idx_now {
                 player.ensure_state_anim(&g.0.graph, &ctx, i, &snap.stance, &snap.item);
                 let trans = if returning_to_graph { g.0.inst.blend.max(0.12) } else { g.0.inst.blend };

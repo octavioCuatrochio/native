@@ -2861,7 +2861,10 @@ type Phase = (&'static str, &'static [&'static str], &'static [&'static str], f3
 
 fn move_script_phases(which: &str) -> Vec<Phase> {
     let mut v: Vec<Phase> = vec![("idle", &[], &[], 2.0, 0.0)];
-    if which == "2" {
+    if which == "3" {
+        // Melee: three clicks, 2.5 s apart.
+        v.extend_from_slice(&[("attack1", &[], &["lmb"], 2.5, 0.0), ("attack2", &[], &["lmb"], 2.5, 0.0), ("attack3", &[], &["lmb"], 2.5, 0.0)]);
+    } else if which == "2" {
         v.extend_from_slice(&[
             ("run_start", &["w"], &[], 3.0, 0.0), ("run_stop", &[], &[], 2.5, 0.0),
             ("sprint_start", &["leftshift", "w"], &[], 3.0, 0.0), ("sprint_stop", &[], &[], 2.5, 0.0),
@@ -2918,10 +2921,10 @@ fn run_move_script(
     let (name, holds, taps, _, mouse) = phases[i];
     if i != ms.phase {
         for k in ms.held.drain(..).collect::<Vec<_>>() {
-            if k == "rmb" { buttons.release(MouseButton::Right); } else if let Some(c) = script_key(&k) { keys.release(c); }
+            if k == "rmb" { buttons.release(MouseButton::Right); } else if k == "lmb" { buttons.release(MouseButton::Left); } else if let Some(c) = script_key(&k) { keys.release(c); }
         }
         for k in holds.iter().chain(taps.iter()) {
-            if *k == "rmb" { buttons.press(MouseButton::Right); } else if let Some(c) = script_key(k) { keys.press(c); }
+            if *k == "rmb" { buttons.press(MouseButton::Right); } else if *k == "lmb" { buttons.press(MouseButton::Left); } else if let Some(c) = script_key(k) { keys.press(c); }
         }
         ms.held = holds.iter().map(|s| s.to_string()).collect();
         ms.phase = i;
@@ -2929,7 +2932,10 @@ fn run_move_script(
         eprintln!("[moves] phase {i} {name} t={:.3}", ms.t);
     } else {
         // Taps are released one frame after they were pressed.
-        for k in taps.iter() { if let Some(c) = script_key(k) { if !holds.contains(k) { keys.release(c); } } }
+        for k in taps.iter() {
+            if *k == "lmb" { buttons.release(MouseButton::Left); }
+            else if let Some(c) = script_key(k) { if !holds.contains(k) { keys.release(c); } }
+        }
     }
 }
 
@@ -3081,6 +3087,17 @@ fn move_player(
             smr.released = true;
             smr.next_release_frame = frame + 45;
         }
+        // Melee (left mouse = `ul_melee_attack`): the game jumps the player
+        // machine to the equipped weapon class's `Combat.<class>.Logic.Jump.Evaluate`
+        // entry, whose own conditions pick the attack. With no weapon that is
+        // the Unarmed entry, which leads to the push-kicks (states 160-163).
+        // The entry name comes from the .sm; the native caller was not traced.
+        // Off by default until the actor input counters (actor+0x1254, init -1 at
+        // 0x15903d7, stamped at 0x15910e0) feed the machine: without them the
+        // combat states loop in Dodge. SOD_MELEE_SM=1 enables it for that work.
+        if jump.is_none() && std::env::var("SOD_MELEE_SM").is_ok() && mouse.just_pressed(MouseButton::Left) && smr.inst.is_graph_driven() {
+            jump = smr.inst.find_state("Combat.Unarmed.Logic.Jump.Evaluate");
+        }
         if let Some(idx) = jump {
             smr.inst.go_to(idx);
             smr.armed = true;
@@ -3094,6 +3111,13 @@ fn move_player(
             signals,
         };
         smr.inst.tick(&env);
+        if dbg {
+            static LAST_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+            if LAST_STATE.swap(smr.inst.state, std::sync::atomic::Ordering::Relaxed) != smr.inst.state {
+                let via = smr.inst.last_transition.as_ref().map(|t| format!(" via cond {} (type {})", t.condition, t.trigger_type)).unwrap_or_default();
+                eprintln!("[sm] f{frame} state [{}] {}{via}", smr.inst.state, smr.inst.state_name());
+            }
+        }
         let in_machine = !smr.inst.is_graph_driven();
         for cmd in smr.inst.take_commands() {
             match cmd {

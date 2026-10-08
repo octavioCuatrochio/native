@@ -868,14 +868,12 @@ impl<'a> SmInstance<'a> {
             },
             TriggerKind::CounterCompare => match raw(t) {
                 Some(b) if b.len() >= 5 => {
-                    let v = |s: u8| -> i32 {
-                        if s == 0x1d {
-                            env.counter(0).saturating_add(1)
-                        } else {
-                            env.counter(s)
-                        }
-                    };
-                    let base = v(b[0]);
+                    // 0x169ffa0: base = counter[b0]; an operand of 0x1d stands
+                    // for base + 1 (so that comparison fails); result is the
+                    // AND of base >= each operand. Counters hold the frame an
+                    // input slot was last active (-1 = never), see the app env.
+                    let base = env.counter(b[0]);
+                    let v = |s: u8| -> i32 { if s == 0x1d { base.saturating_add(1) } else { env.counter(s) } };
                     (1..5).all(|k| base >= v(b[k]))
                 }
                 _ => self.raw(env, t, out),

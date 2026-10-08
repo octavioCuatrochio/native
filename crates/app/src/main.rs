@@ -529,6 +529,9 @@ struct PlayerSm {
     was_graph_driven: bool,
     /// `SOD_SMDBG=1`: log state-machine transitions.
     dbg: bool,
+    /// Per-slot frame of last activity (`actor+0x1254`), initialised to -1
+    /// as at 0x15903d7.
+    counters: [i32; 37],
 }
 
 impl PlayerSm {
@@ -577,6 +580,11 @@ struct PlayerSmEnv {
     phase: f32,
     /// Engine signals forced true this frame by the debug driver.
     signals: Vec<u16>,
+    /// Input slots active this frame (`actor+0x1250`, read by type 62).
+    input_mask: u32,
+    /// Frame each input slot was last active, -1 = never (`actor+0x1254`,
+    /// read by type 63 at 0x169ffa0; stamped by 0x15910c0).
+    counters: [i32; 37],
 }
 
 impl SmEnv for PlayerSmEnv {
@@ -591,6 +599,12 @@ impl SmEnv for PlayerSmEnv {
     }
     fn signal(&self, id: u16) -> bool {
         self.signals.contains(&id)
+    }
+    fn actor_flag_word(&self) -> u32 {
+        self.input_mask
+    }
+    fn counter(&self, slot: u8) -> i32 {
+        self.counters.get(slot as usize).copied().unwrap_or(-1)
     }
     fn animation_phase(&self) -> f32 {
         self.phase
@@ -1750,6 +1764,7 @@ fn run_world(game: &str, vfs: Vfs, play: bool) {
                     released: false,
                     was_graph_driven: true,
                     dbg: std::env::var("SOD_SMDBG").is_ok(),
+                    counters: [-1; 37],
                 }
             })
     } else {
@@ -3087,15 +3102,36 @@ fn move_player(
             smr.released = true;
             smr.next_release_frame = frame + 45;
         }
+        // Input slots, as the player update does each frame (0x158cfbc): clear
+        // the active mask, then for each active action set its bit and stamp
+        // the slot with the frame. Slot map from the machine's own type-63
+        // usage: 21 melee attack, 4 dodge/roll, 19 jump/vault, 17 use item.
+        // Engine signal 358 (`[102,1]`, e.g. cond 448 -> GraphDriven.Observer):
+        // raised when the machine's one-shot fragment has finished playing, so
+        // attack/reaction states hand control back to the graph.
+        if !smr.inst.is_graph_driven() && player.anim_finished && !signals.contains(&358) {
+            signals.push(358);
+        }
+        let mut input_mask = 0u32;
+        {
+            let stamp = frame as i32;
+            let mut set = |slot: usize, on: bool| {
+                if on {
+                    input_mask |= 1 << slot;
+                    smr.counters[slot] = stamp;
+                }
+            };
+            set(21, mouse.just_pressed(MouseButton::Left));
+            set(4, keys.just_pressed(KeyCode::ControlLeft));
+            set(19, keys.just_pressed(KeyCode::Space));
+            set(17, keys.just_pressed(KeyCode::KeyF));
+        }
         // Melee (left mouse = `ul_melee_attack`): the game jumps the player
         // machine to the equipped weapon class's `Combat.<class>.Logic.Jump.Evaluate`
         // entry, whose own conditions pick the attack. With no weapon that is
         // the Unarmed entry, which leads to the push-kicks (states 160-163).
         // The entry name comes from the .sm; the native caller was not traced.
-        // Off by default until the actor input counters (actor+0x1254, init -1 at
-        // 0x15903d7, stamped at 0x15910e0) feed the machine: without them the
-        // combat states loop in Dodge. SOD_MELEE_SM=1 enables it for that work.
-        if jump.is_none() && std::env::var("SOD_MELEE_SM").is_ok() && mouse.just_pressed(MouseButton::Left) && smr.inst.is_graph_driven() {
+        if jump.is_none() && mouse.just_pressed(MouseButton::Left) && smr.inst.is_graph_driven() {
             jump = smr.inst.find_state("Combat.Unarmed.Logic.Jump.Evaluate");
         }
         if let Some(idx) = jump {
@@ -3109,6 +3145,8 @@ fn move_player(
             speed,
             phase: player.cur_layer.as_ref().map(|l| l.phase).unwrap_or(0.0),
             signals,
+            input_mask,
+            counters: smr.counters,
         };
         smr.inst.tick(&env);
         if dbg {

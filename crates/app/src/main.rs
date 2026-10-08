@@ -627,6 +627,25 @@ impl SmEnv for PlayerSmEnv {
     // its neutral trait default. Type 114 reads `actor_flags()` (bit 6) and is
     // therefore already live through the existing `actor_flags` field.
     // --- end batch B ---
+
+    // --- batch A env ---
+    //
+    // The batch-A trigger evaluators (sm_triggers_a) read actor fields this
+    // env does not carry yet:
+    //   focus/target id `actor+0x14dc` (types 12), the 128-byte context tag
+    //   mask `actor+0x12e0` (20), the `actor+0x14` i32 slot array (24), a
+    //   nearby-entity count query (25), the animation action target
+    //   `actor+0x1518`/`0x151c` (30/36), velocity `actor+0x1420..0x1428`
+    //   (79/98), entity-slot positions `actor+0x8c..` (98), equipment slots
+    //   `actor+0x11a0`/`+0x230` (69), the input-slot state
+    //   `actor+0x1234`/`0x11c8` (94), the packed stat test (96), the held item
+    //   `actor+0x14a4`/`0x14a8` (111) and ground height `actor+0x1560`
+    //   (113). None has a source in the current player state, so every method
+    //   keeps its neutral trait default. Type 75 reads `actor_flags()` (bit 7)
+    //   and types 52/92 only need `delta_seconds()` + the persist block, so
+    //   those are already live through the existing fields.
+    // --- end batch A ---
+
 }
 
 /// Player AnimationGraph resolution context: the character's animation-name

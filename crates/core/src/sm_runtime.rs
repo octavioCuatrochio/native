@@ -329,6 +329,109 @@ pub trait SmEnv {
         false
     }
     // --- end batch B ---
+
+    // --- batch A env ---
+    /// Animation focus/target id `actor+0x14dc`; `-1` = none (type 12,
+    /// `0x169ea00`). Written by the animation-target subsystem at `0x13851d3`.
+    fn focus_target_id(&self) -> i32 {
+        -1
+    }
+    /// The actor's 128-byte context tag mask at `actor+0x12e0` (the same set
+    /// type 19 tests by id). Type 20 (`0x16a0250` / `FUN_01376a60`) tests that
+    /// it contains every bit set in the operand.
+    fn actor_context_mask(&self) -> [u8; 128] {
+        [0u8; 128]
+    }
+    /// Actor integer slot `actor+0x14 + slot*4` (type 24, `0x169f0c0`).
+    fn actor_i32_slot(&self, slot: u8) -> i32 {
+        let _ = slot;
+        0
+    }
+    /// A nearby-entity count query at the actor's position with query mask
+    /// `mask` (type 25, `0x169f050`; `radius` is the operand f32). The engine
+    /// calls `FUN_013298d0`'s vtable `+0x64` with mask `0x1e00`.
+    fn nearby_count(&self, radius: f32, mask: u32) -> i32 {
+        let _ = (radius, mask);
+        0
+    }
+    /// Current animation action/target id `actor+0x1518`; `-1` = none (types
+    /// 30/36, `0x169f2e0` / `0x169f380`).
+    fn action_target_id(&self) -> i32 {
+        -1
+    }
+    /// Animation action/target flags `actor+0x151c` (type 30, `0x169f2e0`).
+    fn action_target_flags(&self) -> u32 {
+        0
+    }
+    /// Actor velocity `actor+0x1420`/`0x1424`/`0x1428` (types 79/98,
+    /// `0x16a0760`).
+    fn actor_velocity(&self) -> [f32; 3] {
+        [0.0; 3]
+    }
+    /// Position of the actor entity slot `actor+0x8c + slot*0x30` (translation
+    /// at `+0xc`/`+0x1c`/`+0x2c`, resolved by `FUN_01698940`); `None` when the
+    /// slot is empty (type 98, `0x16a0f90`).
+    fn actor_slot_position(&self, slot: u8) -> Option<[f32; 3]> {
+        let _ = slot;
+        None
+    }
+    /// Equipment / attachment slot flag `actor+0x11a0 + slot` bit 0 (type 69,
+    /// `0x16a0250`).
+    fn equipment_slot_active(&self, slot: u8) -> bool {
+        let _ = slot;
+        false
+    }
+    /// Whether equipment / attachment slot `slot` holds item `name` (type 69).
+    fn equipment_slot_matches(&self, slot: u8, name: &str) -> bool {
+        let _ = (slot, name);
+        false
+    }
+    /// World point/ray query at equipment slot `slot`'s position, returning the
+    /// engine query id or `-1` (type 69, `0x14150c0`).
+    fn equipment_slot_query(&self, slot: u8) -> i32 {
+        let _ = slot;
+        -1
+    }
+    /// Result of a world query id (`0x1414e10`, type 69).
+    fn world_query_result(&self, id: i32) -> bool {
+        let _ = id;
+        false
+    }
+    /// Height above ground `actor+0x1560 - actor+0x140c` (type 113,
+    /// `0x16a1a80`); the evaluator clamps it at 0.
+    fn height_above_ground(&self) -> f32 {
+        0.0
+    }
+    /// Whether a held/equipped item exists at `actor+0x14a4` (type 111,
+    /// `0x16a1a30`).
+    fn equipped_item_present(&self) -> bool {
+        false
+    }
+    /// Held/equipped item id `actor+0x14a8`; `0xffff` = none (type 111).
+    fn equipped_item_id(&self) -> u16 {
+        0xffff
+    }
+    /// Input slot pressed flag `actor+0x1234[slot]` bit 0 (type 94,
+    /// `0x16a0ec0` / `FUN_015910f0`).
+    fn input_slot_pressed(&self, slot: u8) -> bool {
+        let _ = slot;
+        false
+    }
+    /// Input slot analog value `actor+0x11c8[slot]` (type 94).
+    fn input_slot_value(&self, slot: u8) -> f32 {
+        let _ = slot;
+        0.0
+    }
+    /// Type 96 (`0x16a0f00`): the global game object's vtable `+0x10` test over
+    /// the packed id in the operand and the mode bit `(operand[4]>>1)&1`
+    /// (`FUN_013958b0` resolves the packed id). The resolver internals are
+    /// engine-global, so the environment answers the combined test.
+    fn stat_test(&self, packed: u32, mode: bool) -> bool {
+        let _ = (packed, mode);
+        false
+    }
+    // --- end batch A ---
+
 }
 
 /// The engine's transition-selection RNG (`0x1ee28ec` / `0x1ee28f0`).

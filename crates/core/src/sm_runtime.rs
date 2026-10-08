@@ -226,6 +226,109 @@ pub trait SmEnv {
     fn eval_trigger(&self, state: u32, output: u32, type_id: u8, operand: &[u8]) -> Option<bool> {
         None
     }
+
+    // --- batch B env ---
+    /// Type 43 (`0x169f560`): the query-slot result handle at
+    /// `actor+0x48 + slot*4`; `0` is the empty handle. The evaluator compares
+    /// two of these for equality.
+    fn query_slot_handle(&self, slot: u8) -> i32 {
+        let _ = slot;
+        0
+    }
+    /// Types 45 / 47 (`0x169f5d0` / `0x169f630`): whether the actor's handle
+    /// slot `which` (0 = `actor+0x1490`, 1 = `actor+0x1494`) references the
+    /// named entity (a weapon / item / character name from the operand). The
+    /// real evaluator resolves the name through the entity registry and
+    /// compares it to the actor's handle; an environment with no registry
+    /// returns `false`.
+    fn actor_handle_named(&self, which: u8, name: &str) -> bool {
+        let _ = (which, name);
+        false
+    }
+    /// Types 45 / 47: the empty-name branch — whether the actor's handle slot
+    /// `which` is non-null.
+    fn actor_handle_nonzero(&self, which: u8) -> bool {
+        let _ = which;
+        false
+    }
+    /// Type 74 (`0x16a05f0`): `actor+0x8`, a monotonically-changing id (the
+    /// evaluator latches it in the per-trigger persist and fires once per new
+    /// value while a referenced condition output is set).
+    fn actor_change_id(&self) -> i32 {
+        0
+    }
+    /// Type 77 (`0x16a0720`): the actor `f32` field `actor+0x142c`.
+    fn actor_float_142c(&self) -> f32 {
+        0.0
+    }
+    /// Type 78 (`0x16a0740`): the actor flags byte `actor+0x1365` (bit 0).
+    fn actor_flags2(&self) -> u32 {
+        0
+    }
+    /// Type 86 (`0x16a0c50`): whether the actor pointer `actor+0x1554` is
+    /// non-null (an attached/interacting object).
+    fn actor_flag_1554(&self) -> bool {
+        false
+    }
+    /// Type 97 (`0x16a0f50`): resolve transform source `source` (the
+    /// per-instance transform-source array) and evaluate the registered
+    /// predicate `predicate` on it (`FUN_01698940` / `FUN_01697c60`). Returns
+    /// `None` when the environment has no transform sources, so the caller can
+    /// fall back to [`SmEnv::eval_raw_trigger`].
+    fn source_predicate(&self, source: u16, predicate: u16) -> Option<bool> {
+        let _ = (source, predicate);
+        None
+    }
+    /// Types 97 / 99: the world position of transform source `slot`, or `None`
+    /// if the slot is empty.
+    fn transform_source_pos(&self, slot: u16) -> Option<[f32; 3]> {
+        let _ = slot;
+        None
+    }
+    /// Type 99 (`0x16a1090`): the actor's world position (`actor+0x1404`).
+    fn actor_position(&self) -> [f32; 3] {
+        [0.0, 0.0, 0.0]
+    }
+    /// Type 15 (`0x169eb80`): scan the actor's nearby-target slots
+    /// (`actor+0x1da0` count, stride `0xd0`), keeping candidates whose distance
+    /// falls in `[min, max]` and whose kind matches `mode`; `flag` selects the
+    /// loose/tight comparison. Returns whether at least one candidate matched.
+    fn scan_nearby_targets(&self, min: f32, max: f32, mode: u8, flag: u8) -> bool {
+        let _ = (min, max, mode, flag);
+        false
+    }
+    /// Type 14 (`0x169ea80`): the number of entities matching the query
+    /// referenced by `cond` (`FUN_0169d220`); compared against a `[u8, u8]`
+    /// range in the operand.
+    fn query_match_count(&self, cond: u16) -> i32 {
+        let _ = cond;
+        0
+    }
+    /// Type 49 (`0x169f600` / `0x169f690`): the integer metric the entity
+    /// relationship helpers (`0x13e5db0`) produce for the referenced entity
+    /// `handle` (a global entity handle cached at operand+0). `None` when the
+    /// environment cannot resolve the handle.
+    fn entity_ref_metric(&self, handle: i32) -> Option<i32> {
+        let _ = handle;
+        None
+    }
+    /// Type 60 (`0x169fee0`): the environment `z`/up term (`obj+0xe0` from the
+    /// world query at `ctx+8`), compared against `cos(angle)` in the operand.
+    fn environment_cos(&self) -> f32 {
+        1.0
+    }
+    /// Type 61 (`0x169ff20`): whether the entity-source slot `slot` (the
+    /// SM instance array `+0x24 + slot*4`) resolves to a live, related entity.
+    fn entity_slot_present(&self, slot: u16) -> bool {
+        let _ = slot;
+        false
+    }
+    /// Type 83 (`0x16a0c20`): the linked-entity query at `ctx+8`
+    /// (`FUN_01501880`), answering the object's predicate.
+    fn linked_entity_flag(&self) -> bool {
+        false
+    }
+    // --- end batch B ---
 }
 
 /// The engine's transition-selection RNG (`0x1ee28ec` / `0x1ee28f0`).

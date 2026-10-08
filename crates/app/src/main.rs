@@ -614,6 +614,19 @@ impl SmEnv for PlayerSmEnv {
     fn animation_phase(&self) -> f32 {
         self.phase
     }
+
+    // --- batch B env ---
+    //
+    // The batch-B trigger evaluators (sm_triggers_b) read weapon/item handles
+    // (types 45/47, actor+0x1490/0x1494), query-slot handles (43), the
+    // transform-source array (97/99), the nearby-target scan (15), entity
+    // relationship metrics (49), the environment up term (60), entity slots
+    // (61/83) and a few actor flag fields (77/78/86). `PlayerSmEnv` currently
+    // carries only dt/time/actor_flags/speed/phase/signals/input_mask/counters/
+    // move_input, so none of these have a source here and every method keeps
+    // its neutral trait default. Type 114 reads `actor_flags()` (bit 6) and is
+    // therefore already live through the existing `actor_flags` field.
+    // --- end batch B ---
 }
 
 /// Player AnimationGraph resolution context: the character's animation-name

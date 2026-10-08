@@ -90,6 +90,9 @@ struct Group {
     entity: Entity,
     texture: Option<Handle<Image>>,
     material: Handle<StandardMaterial>,
+    /// One mesh per group, rewritten in place each frame (a fresh asset per
+    /// frame churned the render slab allocator: use-after-free errors).
+    mesh: Handle<Mesh>,
 }
 
 /// All renderer state. The simulation is `None` until the library loads.
@@ -459,17 +462,26 @@ fn update_particles(
                     cull_mode: None,
                     ..default()
                 });
-                let e = commands.spawn((Transform::default(), Visibility::Inherited)).id();
-                v.insert(Group { entity: e, texture: tex, material: mat.clone() });
+                let mesh = meshes.add(build_group_mesh(&quads, right, up));
+                let e = commands
+                    .spawn((Transform::default(), Visibility::Inherited, Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone())))
+                    .id();
+                v.insert(Group { entity: e, texture: tex, material: mat.clone(), mesh });
                 e
             }
         };
-        let mat = render.groups.get(&key).unwrap().material.clone();
+        let g = render.groups.get(&key).unwrap();
+        let (mat, mesh) = (g.material.clone(), g.mesh.clone());
         quads.sort_by(|a, b| b.dist2.total_cmp(&a.dist2));
-        let handle = meshes.add(build_group_mesh(&quads, right, up));
-        commands
-            .entity(entity)
-            .insert((Mesh3d(handle), MeshMaterial3d(mat), Visibility::Inherited));
+        // Never leave a zero-vertex mesh for the renderer: hide the group instead.
+        if quads.is_empty() {
+            commands.entity(entity).insert(Visibility::Hidden);
+            continue;
+        }
+        if let Some(mut m) = meshes.get_mut(&mesh) {
+            *m = build_group_mesh(&quads, right, up);
+        }
+        commands.entity(entity).insert((MeshMaterial3d(mat), Visibility::Inherited));
     }
 
     // --- stats -------------------------------------------------------------

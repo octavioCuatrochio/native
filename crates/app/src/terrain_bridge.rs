@@ -176,7 +176,6 @@ pub fn update_terrain_lod(
         let Some((e, m, mat)) = terrain_q.iter().next() else { return };
         // Drop the setup-time mesh from the entity (an attribute-less mesh would
         // break the shadow/prepass pipeline); the entity stays as the parent.
-        meshes.remove(&m.0);
         commands.entity(e).remove::<Mesh3d>();
         *terrain = Some((e, mat.0.clone()));
     }
@@ -220,7 +219,6 @@ pub fn update_terrain_lod(
             let handle = meshes.add(sector_mesh(m.positions, normals, colors, uvs, m.indices));
             if let Some(old) = cache.remove(&s.id) {
                 commands.entity(old.entity).despawn();
-                meshes.remove(&old.mesh);
             }
             let entity = commands
                 .spawn((Mesh3d(handle.clone()), MeshMaterial3d(terrain_mat.clone()), Transform::default(), TerrainSectorTag, ChildOf(terrain_e)))
@@ -238,7 +236,6 @@ pub fn update_terrain_lod(
         for id in stale {
             if let Some(old) = cache.remove(&id) {
                 commands.entity(old.entity).despawn();
-                meshes.remove(&old.mesh);
             }
         }
         changed = true;

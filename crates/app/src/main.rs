@@ -587,6 +587,32 @@ struct PlayerSmEnv {
     counters: [i32; 37],
     /// Movement input (strafe, forward), magnitude 0..1 (`actor+0x12c8`).
     move_input: [f32; 2],
+
+    // --- batch B live actor fields (workerS3) ---
+    /// Actor world position `actor+0x1404` (CryEngine Z-up).
+    pos: [f32; 3],
+    /// Actor body yaw (radians, 0 -> +X), the facing the sector scan uses.
+    yaw: f32,
+    /// Actor velocity `actor+0x1420..0x1428`.
+    vel: [f32; 3],
+    /// Live hostile actors relative to the player: `(bearing, distance)` with
+    /// the bearing wrapped to `[-pi, pi)`. Built from the script-host actors
+    /// (`cry::host.ctx`), which is where `ai_bridge` pushes every live
+    /// zombie's world position each frame (`ai_bridge.rs` `set_pos`).
+    nearby: Vec<(f32, f32)>,
+    /// Resolved equipped-item names for the two handle slots (types 45 / 47):
+    /// slot 0 = `actor+0x1490`, slot 1 = `actor+0x1494`. Both are resolved
+    /// from item names in the actor update (`0x158d636` / `0x158d652`); the
+    /// native player carries a melee and a firearm, mapped to the two slots.
+    item_names: [String; 2],
+    /// `actor+0x8` class-id / change counter (type 74).
+    change_id: i32,
+    /// `actor+0x142c` movement-state scalar (type 77).
+    f142c: f32,
+    /// `actor+0x1365` byte (bit 0 read by type 78).
+    flags2: u32,
+    /// `actor+0x1554` carried-object pointer non-null (type 86).
+    flag_1554: bool,
 }
 
 impl SmEnv for PlayerSmEnv {
@@ -617,15 +643,76 @@ impl SmEnv for PlayerSmEnv {
 
     // --- batch B env ---
     //
-    // The batch-B trigger evaluators (sm_triggers_b) read weapon/item handles
-    // (types 45/47, actor+0x1490/0x1494), query-slot handles (43), the
-    // transform-source array (97/99), the nearby-target scan (15), entity
-    // relationship metrics (49), the environment up term (60), entity slots
-    // (61/83) and a few actor flag fields (77/78/86). `PlayerSmEnv` currently
-    // carries only dt/time/actor_flags/speed/phase/signals/input_mask/counters/
-    // move_input, so none of these have a source here and every method keeps
-    // its neutral trait default. Type 114 reads `actor_flags()` (bit 6) and is
-    // therefore already live through the existing `actor_flags` field.
+    // Live implementations from the native player state (workerS3). The
+    // recovered meanings and writers are in `crates/core/src/sm_runtime.rs`
+    // (batch-B trait docs) and `/tmp/opencode-s3/REPORT.md`.
+    fn query_slot_handle(&self, _slot: u8) -> i32 {
+        // No blackboard markup-query system is ported yet, so every
+        // `actor+0x48 + slot*4` slot reads as the empty handle (0). This is the
+        // faithful value for an actor with no markup results.
+        0
+    }
+    fn actor_handle_named(&self, which: u8, name: &str) -> bool {
+        // `actor+0x1490`/`+0x1494` resolve from item names (0x158d636/0x158d652)
+        // and are compared to the operand's resolved handle. We match the name
+        // against the player's equipped item directly.
+        let slot = self.item_names.get(which as usize);
+        !name.is_empty()
+            && slot
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+    }
+    fn actor_handle_nonzero(&self, which: u8) -> bool {
+        self.item_names
+            .get(which as usize)
+            .map(|n| !n.is_empty() && n != "(none)")
+            .unwrap_or(false)
+    }
+    fn actor_change_id(&self) -> i32 {
+        // `actor+0x8` is the entity class id / change counter (constant for the
+        // player), so type 74 fires at most once while its gate holds.
+        self.change_id
+    }
+    fn actor_float_142c(&self) -> f32 {
+        self.f142c
+    }
+    fn actor_flags2(&self) -> u32 {
+        self.flags2
+    }
+    fn actor_flag_1554(&self) -> bool {
+        self.flag_1554
+    }
+    fn actor_position(&self) -> [f32; 3] {
+        self.pos
+    }
+    fn scan_nearby_targets(&self, min: f32, max: f32, _mode: u8, _flag: u8) -> bool {
+        // `min`/`max` are a bearing window in radians. Reproduce the engine's
+        // wrapped range test `FUN_016ccfb0` (adds 2*pi when the interval or the
+        // angle crosses zero) and match any live target inside it.
+        const TAU: f32 = std::f32::consts::TAU;
+        self.nearby.iter().any(|&(bearing, _dist)| {
+            let mut hi = max;
+            let mut a = bearing;
+            if hi - min < 0.0 {
+                hi += TAU;
+            }
+            if a - min < 0.0 {
+                a += TAU;
+            }
+            min == hi || (min <= a && a <= hi)
+        })
+    }
+    fn query_match_count(&self, _cond: u16) -> i32 {
+        // `FUN_0169d220` counts the actor's tracked targets; the native
+        // equivalent is the live hostile list.
+        self.nearby.len() as i32
+    }
+    // The remaining batch-B inputs have no native source yet and keep the
+    // neutral trait defaults: `source_predicate` / `transform_source_pos`
+    // (types 97/99; no per-instance transform-source runtime), `entity_ref_metric`
+    // (49; no entity-handle registry), `environment_cos` (60; flat ground),
+    // `entity_slot_present` (61; no SM entity sources) and `linked_entity_flag`
+    // (83; no linked-entity graph).
     // --- end batch B ---
 
     // --- batch A env ---
@@ -645,7 +732,6 @@ impl SmEnv for PlayerSmEnv {
     //   and types 52/92 only need `delta_seconds()` + the persist block, so
     //   those are already live through the existing fields.
     // --- end batch A ---
-
 }
 
 /// Player AnimationGraph resolution context: the character's animation-name
@@ -3024,6 +3110,7 @@ fn move_player(
     graph: Option<ResMut<PlayerGraph>>,
     anim_ctx: Option<Res<AnimCtx>>,
     sm: Option<ResMut<PlayerSm>>,
+    cry: Option<NonSend<cry_bridge::CryHost>>,
 ) {
     if menu.active {
         return;
@@ -3205,6 +3292,34 @@ fn move_player(
             smr.inst.go_to(idx);
             smr.armed = true;
         }
+        // Live actor fields for the batch-B trigger evaluators (workerS3). The
+        // hostile list comes from the script host, where `ai_bridge` pushes
+        // every live zombie's world position each frame (`world.set_pos`).
+        let ppos = player.mstate.pos;
+        let pyaw = player.mstate.yaw;
+        let mut nearby: Vec<(f32, f32)> = Vec::new();
+        let mut item_names = [String::new(), String::new()];
+        if let Some(cry) = cry.as_ref() {
+            if let (Ok(actors), Ok(world)) =
+                (cry.host.ctx.actors.try_borrow(), cry.host.ctx.world.try_borrow())
+            {
+                for (&id, a) in actors.iter() {
+                    if a.is_player || a.health <= 0.0 {
+                        continue;
+                    }
+                    let p = world.world_pos(id);
+                    let dx = p[0] - ppos[0];
+                    let dy = p[1] - ppos[1];
+                    let dz = p[2] - ppos[2];
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                    nearby.push((wrap_angle(dy.atan2(dx) - pyaw), dist));
+                }
+            }
+            if let Some(a) = cry.host.ctx.actors.borrow().get(&cry.player) {
+                item_names[0] = a.weapons.melee_name().to_string();
+                item_names[1] = a.weapons.gun_name().to_string();
+            }
+        }
         let env = PlayerSmEnv {
             dt,
             time: smr.inst.time,
@@ -3220,6 +3335,24 @@ fn move_player(
                 let m = ((f * f + st * st) as f32).sqrt().max(1.0);
                 [st / m, f / m]
             },
+            pos: ppos,
+            yaw: pyaw,
+            vel: player.mstate.vel,
+            nearby,
+            item_names,
+            // `actor+0x8` is the entity class id (constant for the player), so
+            // type 74's edge latches after its first evaluation.
+            change_id: 0,
+            // `actor+0x142c` tracks the movement-state scalar; the horizontal
+            // speed is the closest live equivalent (type 77 tests `> 0.0`).
+            f142c: speed,
+            // `actor+0x1365` bit 0 copies the movement-state `+0x82` bit 0
+            // (`0x158dc67`). That flag's identity is not resolved and mapping
+            // it to the airborne flag forces the SM's `Environmental.Fall.*`
+            // chain on spawn, so it keeps the neutral value.
+            flags2: 0,
+            // No carry/grab system is ported, so `actor+0x1554` stays null.
+            flag_1554: false,
         };
         smr.inst.tick(&env);
         if dbg {

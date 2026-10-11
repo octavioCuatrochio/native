@@ -76,8 +76,12 @@ pub fn eval(type_id: u8, operand: &[u8], ctx: &mut TriggerCtx, env: &dyn SmEnv) 
             Some(gate && count >= min && count <= max)
         }
 
-        // 0x169eb80 (size 44): nearby-target scan. `f32 min @0`, `f32 max @4`,
-        // `u8 mode @8`, `u8 countA @9`, `u8 countB @10`, `u8 flag @11`.
+        // 0x169eb80 (size 44, `TriggerEval_CombatCollisionGotHit`): scan the
+        // actor's incoming-collision list for a hit whose bearing lies in the
+        // `[min, max]` angle window. `f32 min @0`, `f32 max @4`, `u8 mode @8`
+        // (string-match kind), `u8 countA @9`, `u8 countB @10`, then a
+        // NUL-terminated source name at `@0xb` (its first byte is the
+        // "name present" flag the env receives).
         15 => Some(env.scan_nearby_targets(
             rf32(operand, 0),
             rf32(operand, 4),

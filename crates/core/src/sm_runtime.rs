@@ -228,45 +228,52 @@ pub trait SmEnv {
     }
 
     // --- batch B env ---
-    /// Type 43 (`0x169f560`): the query-slot result handle at
-    /// `actor+0x48 + slot*4`; `0` is the empty handle. The evaluator compares
-    /// two of these for equality.
+    /// Type 43 (`0x169f560`): the blackboard markup-slot handle at
+    /// `actor+0x48 + slot*4`; `0` is the empty handle. Slots are written by the
+    /// SM markup-query action (`0x159027b`) and cleared by
+    /// `SmIntBlackboardMarkupClear` (`0x158fdb0`); the evaluator compares two
+    /// slots for equality.
     fn query_slot_handle(&self, slot: u8) -> i32 {
         let _ = slot;
         0
     }
-    /// Types 45 / 47 (`0x169f5d0` / `0x169f630`): whether the actor's handle
-    /// slot `which` (0 = `actor+0x1490`, 1 = `actor+0x1494`) references the
-    /// named entity (a weapon / item / character name from the operand). The
-    /// real evaluator resolves the name through the entity registry and
-    /// compares it to the actor's handle; an environment with no registry
-    /// returns `false`.
+    /// Types 45 / 47 (`0x169f5d0` / `0x169f630`): whether the actor's equipped
+    /// handle slot `which` (0 = `actor+0x1490`, 1 = `actor+0x1494`) references
+    /// the named entity. Both slots are resolved from item names in the actor
+    /// update (`FUN_014499f0` at `0x158d636` / `0x158d652`); a non-zero
+    /// operand[0] is a name, resolved to a handle by `0x5a04a0` and compared.
     fn actor_handle_named(&self, which: u8, name: &str) -> bool {
         let _ = (which, name);
         false
     }
-    /// Types 45 / 47: the empty-name branch — whether the actor's handle slot
-    /// `which` is non-null.
+    /// Types 45 / 47: the empty-name branch — whether the actor's equipped
+    /// handle slot `which` is non-null.
     fn actor_handle_nonzero(&self, which: u8) -> bool {
         let _ = which;
         false
     }
-    /// Type 74 (`0x16a05f0`): `actor+0x8`, a monotonically-changing id (the
-    /// evaluator latches it in the per-trigger persist and fires once per new
-    /// value while a referenced condition output is set).
+    /// Type 74 (`0x16a05f0`): `actor+0x8`, the entity's class-id / change
+    /// counter (see `notes/ghidra/player.md` §2). The evaluator latches it in
+    /// the per-trigger persist and fires once per new value while a referenced
+    /// condition output is set.
     fn actor_change_id(&self) -> i32 {
         0
     }
-    /// Type 77 (`0x16a0720`): the actor `f32` field `actor+0x142c`.
+    /// Type 77 (`0x16a0720`): the actor `f32` field `actor+0x142c`, copied
+    /// from the movement-state object's `+0x4` in the character update
+    /// (`0x158dd1f`).
     fn actor_float_142c(&self) -> f32 {
         0.0
     }
-    /// Type 78 (`0x16a0740`): the actor flags byte `actor+0x1365` (bit 0).
+    /// Type 78 (`0x16a0740`): the actor flags byte `actor+0x1365` (bit 0),
+    /// copied from the movement-state object's `+0x82` bit 0 (`0x158dc67`).
     fn actor_flags2(&self) -> u32 {
         0
     }
-    /// Type 86 (`0x16a0c50`): whether the actor pointer `actor+0x1554` is
-    /// non-null (an attached/interacting object).
+    /// Type 86 (`0x16a0c50`): whether `actor+0x1554` is non-null. It is set to
+    /// the global grabbed-object pointer `0x1e5afe0` by the carry system
+    /// (`0x145e64f`) and cleared on release (`0x14543fd`), so it means "the
+    /// actor is carrying a heavy object".
     fn actor_flag_1554(&self) -> bool {
         false
     }
@@ -289,16 +296,21 @@ pub trait SmEnv {
     fn actor_position(&self) -> [f32; 3] {
         [0.0, 0.0, 0.0]
     }
-    /// Type 15 (`0x169eb80`): scan the actor's nearby-target slots
-    /// (`actor+0x1da0` count, stride `0xd0`), keeping candidates whose distance
-    /// falls in `[min, max]` and whose kind matches `mode`; `flag` selects the
-    /// loose/tight comparison. Returns whether at least one candidate matched.
+    /// Type 15 (`0x169eb80`, `TriggerEval_CombatCollisionGotHit`): scan the
+    /// actor's incoming-collision list (`actor+0x1578` count, entries at
+    /// `actor+0x1580`, stride `0xd0`), keeping records whose stored hit bearing
+    /// `entry+0xc8` (wrapped by `FUN_016cce00`) lies in the `[min, max]` angle
+    /// range (`FUN_016ccfb0`, 2π wrap). A non-empty operand name at `@0xb`
+    /// additionally matches the record's source name (`entry+0xc0`), with
+    /// `mode@8` selecting the string comparison. Returns whether a record
+    /// matched.
     fn scan_nearby_targets(&self, min: f32, max: f32, mode: u8, flag: u8) -> bool {
         let _ = (min, max, mode, flag);
         false
     }
     /// Type 14 (`0x169ea80`): the number of entities matching the query
-    /// referenced by `cond` (`FUN_0169d220`); compared against a `[u8, u8]`
+    /// referenced by `cond` (`FUN_0169d220` walks the actor's `+0x25c8` list
+    /// and tests each entry with `FUN_01697a20`); compared against a `[u8, u8]`
     /// range in the operand.
     fn query_match_count(&self, cond: u16) -> i32 {
         let _ = cond;
@@ -431,7 +443,6 @@ pub trait SmEnv {
         false
     }
     // --- end batch A ---
-
 }
 
 /// The engine's transition-selection RNG (`0x1ee28ec` / `0x1ee28f0`).
